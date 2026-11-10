@@ -1,6 +1,7 @@
 #include <huxerui/richeditor/format.h>
 #include <huxerui/richeditor/extension.h>
-#include <huxerui/richeditor/math.h>
+
+#include "../examples/preview/src/formula.h"
 
 #include <algorithm>
 #include <iostream>
@@ -8,6 +9,8 @@
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
+using folio::LatexBlock;
+using folio::LatexInline;
 
 namespace {
 
@@ -62,7 +65,7 @@ void RoundTrip() {
 }
 
 void InlineObjectCodecs() {
-  const auto& codec = MarkdownCodec({.inline_math = true, .inline_images = true});
+  const auto& codec = folio::DocumentMarkdown();
   const auto imported = codec.Import("A🙂 $x^2$ 中文 ![map](attachments/map.png) and [**$y$**](https://example.org).");
   Check(imported.document.has_value() && imported.issues.empty(), "Import math and images embedded in text");
   const auto& paragraph = imported.document->Blocks().front().Data();
@@ -291,23 +294,56 @@ void CustomBlockCodecs() {
 
   const auto& markdown = MarkdownCodec();
   const auto strict = markdown.Export(document);
-  Check(!strict.text && strict.issues.size() == 1 && strict.issues[0].code == "markdown.math" &&
+  Check(!strict.text && strict.issues.size() == 1 && strict.issues[0].code == "markdown.custom_block" &&
             strict.issues[0].block_path == std::vector<std::size_t>{0}, "CommonMark reports formula loss");
   const auto lossy = markdown.Export(document, LossPolicy::AllowLoss);
   Check(lossy.text && markdown.Import(*lossy.text).document->Blocks()[0].Data().text == source &&
             !lossy.issues.empty(), "AllowLoss exports literal source and diagnostics");
 
-  const auto& math = MarkdownCodec({.display_math = true});
+  const auto& math = folio::DocumentMarkdown();
+  const auto from_span = math.Import("$$\n" + std::string(source) + "\n$$");
+  Check(from_span.document == document, "Folio imports a display span using the existing formula type");
   const auto encoded = math.Export(document);
-  Check(encoded.text && encoded.text->starts_with("$$\n") && math.Import(*encoded.text).document == document,
-        "Opt-in display math round trips through the Markdown parser");
+  Check(encoded.text && encoded.text->starts_with("~~~ math\n") && math.Import(*encoded.text).document == document,
+        "Display math exports as a fence and round trips through the Markdown parser");
   const auto multiline = LatexBlock("x + y % note\n+ z");
   const auto multi = RichDocument::Create({Block(BlockData{.kind = BlockKind::Custom, .custom = multiline})});
   const auto fenced = math.Export(multi);
-  Check(fenced.text && fenced.text->starts_with("~~~math\n") && math.Import(*fenced.text).document == multi,
+  Check(fenced.text && fenced.text->starts_with("~~~ math\n") && math.Import(*fenced.text).document == multi,
         "Math fences preserve line breaks that affect the meaning of LaTeX source");
-  Check(!math.Import("Text $x$ and more.").document && math.Import("Text $x$ and more.", LossPolicy::AllowLoss).document,
-        "The opt-in codec reports unsupported inline math");
+  const auto legacy = json.Import(R"json({"version":1,"blocks":[
+    {"type":"custom","custom_type":"huxerui.latex","version":1,"payload":"x^2","fallback_text":"x^2"},
+    {"type":"paragraph","text":"A\uFFFC","inline_objects":[
+      {"offset":1,"type":"huxerui.latex","version":1,"payload":"y","fallback_text":"y"}]}
+  ]})json");
+  Check(legacy.document && json.Import(*json.Export(*legacy.document).text).document == legacy.document,
+        "Old formula data round trips in JSON without a registered extension");
+  const auto legacy_export = math.Export(*legacy.document);
+  Check(legacy_export.text && math.Import(*legacy_export.text).document == legacy.document,
+        "Folio's registered mappings can export previously saved formula objects");
+  auto block_math = folio::MarkdownMath();
+  block_math.inline_object.reset();
+  const MarkdownCodec block_only({.extensions = {block_math}});
+  const auto missing_inline = block_only.Import("Text $x$ and more.");
+  const auto plain_inline = block_only.Import("Text $x$ and more.", LossPolicy::AllowLoss);
+  Check(!missing_inline.document && missing_inline.issues[0].code == "markdown.extension_missing" &&
+            plain_inline.document && plain_inline.document->Blocks()[0].Data().text == "Text x and more.",
+        "The shared parser flag does not enable an unregistered inline mapping");
+  auto inline_math = folio::MarkdownMath();
+  inline_math.block.reset();
+  const MarkdownCodec inline_only({.extensions = {inline_math}});
+  const auto missing_display = inline_only.Import("$$\nx\n$$");
+  Check(!missing_display.document && missing_display.issues[0].code == "markdown.extension_missing" &&
+            inline_only.Import("$$\nx\n$$", LossPolicy::AllowLoss).document,
+        "The shared parser flag does not enable an unregistered block mapping");
+  block_math.block->encode = [](const CustomBlockData& block) {
+    return MarkdownObjectText{MarkdownObjectSyntax::DoubleDollarBlock(), block.payload};
+  };
+  const MarkdownCodec dollar_display({.extensions = {block_math}});
+  const auto dollar_export = dollar_display.Export(document);
+  Check(dollar_export.text && dollar_export.text->starts_with("$$\n") &&
+            dollar_display.Import(*dollar_export.text).document == document,
+        "An extension can choose display math instead of a fence for the same object");
   const auto currency = math.Import("A price of \\$5 and \\$10.");
   Check(currency.document && math.Export(*currency.document).text, "Literal dollars stay literal with math enabled");
 
@@ -316,6 +352,96 @@ void CustomBlockCodecs() {
   Check(json.Import(*json.Export(custom).text).document == custom && !math.Export(custom).text &&
             math.Export(custom, LossPolicy::AllowLoss).issues[0].code == "markdown.custom_block",
         "Unknown custom types preserve their version and payload and report Markdown loss");
+}
+
+void MarkdownObjectMappings() {
+  const auto diagram_fence = MarkdownObjectSyntax::FencedBlock("diagram flow");
+  const auto diagram = MarkdownExtension{
+      .block = MarkdownObjectMapping<CustomBlockData>{
+          .type = "example.diagram",
+          .syntax = {diagram_fence},
+          .decode = [](const MarkdownObjectText& source) -> std::optional<CustomBlockData> {
+            if (!source.text.starts_with("graph ")) {
+              return std::nullopt;
+            }
+            return CustomBlockData{"example.diagram", 1, source.text, "Diagram"};
+          },
+          .encode = [diagram_fence](const CustomBlockData& data) -> std::optional<MarkdownObjectText> {
+            if (data.version != 1) {
+              return std::nullopt;
+            }
+            return MarkdownObjectText{diagram_fence, data.payload};
+          },
+      },
+  };
+  const MarkdownCodec base;
+  const MarkdownCodec codec({.extensions = {diagram, folio::MarkdownMath()}});
+  constexpr auto source = "~~~~diagram flow\ngraph A\n~~~\nB\n\n~~~~";
+  const auto code = base.Import(source);
+  const auto imported = codec.Import(source);
+  Check(code.document && code.document->Blocks()[0].Data().kind == BlockKind::CodeBlock &&
+            imported.document && imported.document->Blocks()[0].Data().custom ==
+                CustomBlockData{"example.diagram", 1, "graph A\n~~~\nB\n", "Diagram"},
+        "A codec claims only its own exact fence info and preserves the literal body");
+  const auto exported = codec.Export(*imported.document);
+  Check(exported.text && codec.Import(*exported.text).document == imported.document,
+        "The codec chooses a fence longer than a run inside the body");
+  Check(codec.Import("~~~diagram\ngraph A\n~~~").document->Blocks()[0].Data().kind == BlockKind::CodeBlock,
+        "A language prefix alone does not match the registered fence info");
+  Check(!codec.Export(*code.document).text &&
+            codec.Export(*code.document).issues[0].code == "markdown.extension_conflict",
+        "Strict refuses to serialize a regular code block that would reopen as an object");
+  const auto plain_code = codec.Export(*code.document, LossPolicy::AllowLoss);
+  const auto reopened = plain_code.text ? codec.Import(*plain_code.text).document : std::nullopt;
+  Check(reopened && reopened->Blocks()[0].Data().kind == BlockKind::CodeBlock &&
+            reopened->Blocks()[0].Data().text == code.document->Blocks()[0].Data().text &&
+            reopened->Blocks()[0].Data().fence_info.empty(),
+        "AllowLoss drops the conflicting info and keeps the code text");
+
+  const auto declined = codec.Import("~~~diagram flow\nunsupported\n~~~");
+  const auto declined_lossy = codec.Import("~~~diagram flow\nunsupported\n~~~", LossPolicy::AllowLoss);
+  Check(!declined.document && declined.issues[0].code == "markdown.extension_import" &&
+            declined_lossy.document && declined_lossy.document->Blocks()[0].Data().kind == BlockKind::CodeBlock,
+        "A declined decode reports a loss and preserves the original code under AllowLoss");
+  const auto nested = codec.Import("> ~~~diagram flow\n> graph A\n> ~~~");
+  Check(!nested.document && nested.issues[0].code == "markdown.extension_placement",
+        "Nested fences cannot become top-level custom objects");
+
+  const auto mismatched = RichDocument::Create({
+      Block(BlockData{.kind = BlockKind::Custom,
+          .custom = CustomBlockData{"example.diagram", 1, "graph A", "Unmapped label"}}),
+      imported.document->Blocks()[0],
+      Block(BlockData{.kind = BlockKind::Custom,
+          .custom = CustomBlockData{"example.diagram", 1, "graph B", "Another label"}}),
+  });
+  const auto lossy = codec.Export(mismatched, LossPolicy::AllowLoss);
+  const auto lossy_document = lossy.text ? codec.Import(*lossy.text).document : std::nullopt;
+  Check(!codec.Export(mismatched).text && lossy_document && lossy_document->Blocks().size() == 3 &&
+            lossy_document->Blocks()[0].Data().text == "Unmapped label" &&
+            lossy_document->Blocks()[1] == imported.document->Blocks()[0] &&
+            lossy_document->Blocks()[2].Data().text == "Another label" && lossy.issues.size() == 2 &&
+            lossy.issues[0].block_path == std::vector<std::size_t>{0} &&
+            lossy.issues[1].block_path == std::vector<std::size_t>{2},
+        "AllowLoss degrades mismatched blocks while retaining valid objects in other blocks");
+
+  const auto invalid_registration = [](MarkdownOptions options) {
+    try {
+      (void)MarkdownCodec(std::move(options));
+      return false;
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+  };
+  auto conflict = diagram;
+  conflict.block->type = "other.diagram";
+  Check(invalid_registration({.extensions = {diagram, conflict}}), "A syntax can only have one owner");
+  conflict = diagram;
+  conflict.block->syntax = {MarkdownObjectSyntax::FencedBlock("other")};
+  Check(invalid_registration({.extensions = {diagram, conflict}}), "Each block type has one mapping");
+  conflict.block->syntax = {MarkdownObjectSyntax::DollarSpan()};
+  Check(invalid_registration({.extensions = {conflict}}), "A block mapping cannot claim inline syntax");
+  conflict.block->syntax = {MarkdownObjectSyntax::FencedBlock("")};
+  Check(invalid_registration({.extensions = {conflict}}), "A fenced-block mapping requires nonempty info");
 }
 
 } // namespace
@@ -330,6 +456,7 @@ int main() {
     TableCodecs();
     ImageCodecs();
     CustomBlockCodecs();
+    MarkdownObjectMappings();
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

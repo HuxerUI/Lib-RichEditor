@@ -1,20 +1,119 @@
 #include <huxerui/richeditor/format.h>
-#include <huxerui/richeditor/math.h>
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 
 #include <huxerui/markdown/document.h>
 
 #include "document_internal.h"
 
 namespace huxerui::richeditor {
+
+enum class MarkdownObjectSyntax::Kind { DollarSpan, DoubleDollarBlock, FencedBlock };
+
+MarkdownObjectSyntax::MarkdownObjectSyntax(Kind kind, std::string_view fence_info)
+    : kind_(kind), fence_info_(fence_info) {}
+
+MarkdownObjectSyntax MarkdownObjectSyntax::DollarSpan() {
+  return MarkdownObjectSyntax(Kind::DollarSpan);
+}
+
+MarkdownObjectSyntax MarkdownObjectSyntax::DoubleDollarBlock() {
+  return MarkdownObjectSyntax(Kind::DoubleDollarBlock);
+}
+
+MarkdownObjectSyntax MarkdownObjectSyntax::FencedBlock(std::string_view fence_info) {
+  return MarkdownObjectSyntax(Kind::FencedBlock, fence_info);
+}
+
+namespace detail {
+
+struct MarkdownObjectSyntaxAccess {
+  using Kind = MarkdownObjectSyntax::Kind;
+
+  static Kind GetKind(const MarkdownObjectSyntax& syntax) { return syntax.kind_; }
+  static std::string_view FenceInfo(const MarkdownObjectSyntax& syntax) { return syntax.fence_info_; }
+};
+
+} // namespace detail
+
 namespace {
 
 using markdown::MarkdownNode;
 using markdown::NodeKind;
 using detail::BlockPath;
+using SyntaxAccess = detail::MarkdownObjectSyntaxAccess;
+using SyntaxKind = SyntaxAccess::Kind;
+
+template<class Data>
+using MappingMember = std::optional<MarkdownObjectMapping<Data>> MarkdownExtension::*;
+
+template<class Data, class Predicate>
+const MarkdownObjectMapping<Data>* FindMapping(const MarkdownOptions& options, MappingMember<Data> member,
+                                               Predicate matches) {
+  for (const auto& extension : options.extensions) {
+    if (const auto& mapping = extension.*member; mapping && matches(*mapping)) {
+      return &*mapping;
+    }
+  }
+  return nullptr;
+}
+
+template<class Data>
+const MarkdownObjectMapping<Data>* FindSyntax(const MarkdownOptions& options, MappingMember<Data> member,
+                                              const MarkdownObjectSyntax& syntax) {
+  return FindMapping(options, member, [&](const auto& mapping) {
+    return std::ranges::find(mapping.syntax, syntax) != mapping.syntax.end();
+  });
+}
+
+bool ValidLiteral(std::string_view text) {
+  if (text.find('\0') != text.npos || text.find('\r') != text.npos) {
+    return false;
+  }
+  try {
+    (void)AttributedText(std::string(text));
+    return true;
+  } catch (const std::invalid_argument&) {
+    return false;
+  }
+}
+
+template<class Data>
+void ValidateMappings(const MarkdownOptions& options, MappingMember<Data> member) {
+  std::vector<std::string_view> types;
+  std::vector<MarkdownObjectSyntax> syntax;
+  for (const auto& extension : options.extensions) {
+    const auto& mapping = extension.*member;
+    if (!mapping) {
+      continue;
+    }
+    if (!detail::ValidCustomData({.type = mapping->type}) || !mapping->decode || !mapping->encode ||
+        mapping->syntax.empty()) {
+      throw std::invalid_argument("Incomplete Markdown object mapping");
+    }
+    constexpr bool block = std::is_same_v<Data, CustomBlockData>;
+    if ((!block && mapping->type == inline_image_type) || std::ranges::find(types, mapping->type) != types.end()) {
+      throw std::invalid_argument("Conflicting Markdown object type: " + mapping->type);
+    }
+    types.push_back(mapping->type);
+    for (const auto& entry : mapping->syntax) {
+      const auto info = SyntaxAccess::FenceInfo(entry);
+      const auto kind = SyntaxAccess::GetKind(entry);
+      const bool valid = kind == SyntaxKind::FencedBlock
+          ? block && !info.empty() && info.find('\n') == info.npos &&
+              info.find_first_not_of(" \t") == 0 && info.find_last_not_of(" \t") == info.size() - 1 && ValidLiteral(info)
+          : kind == (block ? SyntaxKind::DoubleDollarBlock : SyntaxKind::DollarSpan);
+      if (!valid || std::ranges::find(syntax, entry) != syntax.end()) {
+        throw std::invalid_argument("Invalid or conflicting Markdown object syntax");
+      }
+      syntax.push_back(entry);
+    }
+  }
+}
 
 struct InlineBuilder {
   BlockData& block;
@@ -36,14 +135,15 @@ struct InlineBuilder {
 
 class MarkdownImport {
 public:
-  explicit MarkdownImport(MarkdownOptions options) : options_(options) {}
+  explicit MarkdownImport(const MarkdownOptions& options) : options_(options) {}
 
   ImportResult Run(std::string_view source, LossPolicy policy) {
     auto options = markdown::ParseOptions::CommonMark();
     options.tables = true;
     options.task_lists = true;
     options.strikethrough = true;
-    options.math = options_.display_math || options_.inline_math;
+    options.math = FindSyntax(options_, &MarkdownExtension::block, MarkdownObjectSyntax::DoubleDollarBlock()) ||
+        FindSyntax(options_, &MarkdownExtension::inline_object, MarkdownObjectSyntax::DollarSpan());
     try {
       const auto parsed = markdown::ParseMarkdown(source, options);
       auto blocks = ConvertChildren(parsed.Root());
@@ -61,6 +161,21 @@ public:
 private:
   void Report(std::string code, std::string message) {
     issues_.push_back({std::move(code), path_, {}, std::move(message)});
+  }
+
+  template<class Data>
+  std::optional<Data> Decode(const MarkdownObjectMapping<Data>* mapping, const MarkdownObjectText& source,
+                             bool (*valid)(const Data&)) {
+    if (!mapping) {
+      Report("markdown.extension_missing", "Markdown object syntax has no registered mapping");
+      return std::nullopt;
+    }
+    auto data = mapping->decode(source);
+    if (data && data->type == mapping->type && valid(*data)) {
+      return data;
+    }
+    Report("markdown.extension_import", "Markdown object could not be decoded as " + mapping->type);
+    return std::nullopt;
   }
 
   void Inline(const MarkdownNode& node, InlineBuilder& builder, Mark marks, bool in_table = false) {
@@ -105,14 +220,18 @@ private:
       }
       return;
     }
-    case NodeKind::InlineMath:
-      if (options_.inline_math) {
-        builder.AppendObject(LatexInline(node.text), marks);
-        return;
+    case NodeKind::InlineMath: {
+      const MarkdownObjectText source{MarkdownObjectSyntax::DollarSpan(), detail::NormalizeLineEndings(node.text)};
+      if (auto data = Decode(FindSyntax(options_, &MarkdownExtension::inline_object, source.syntax), source,
+                             detail::ValidInlineData)) {
+        builder.AppendObject(std::move(*data), marks);
+      } else {
+        builder.Append(source.text, marks);
       }
-      [[fallthrough]];
+      return;
+    }
     case NodeKind::DisplayMath:
-      Report("markdown.math", "Formula converted to text because this Markdown math syntax is disabled or unsupported here");
+      Report("markdown.extension_placement", "Display math here cannot be imported as a top-level custom block");
       builder.Append(node.text, marks);
       return;
     default:
@@ -215,13 +334,15 @@ private:
     case NodeKind::Paragraph: {
       if (node.kind == NodeKind::Paragraph && path_.size() == 1 && node.children.size() == 1 &&
           node.children.front().kind == NodeKind::DisplayMath) {
-        auto source = detail::NormalizeLineEndings(node.children.front().text);
-        if (source.starts_with(' ') && source.ends_with(' ') && source.size() >= 2) {
-          // Lib-Markdown folds line breaks around a display span into spaces.
-          source = source.substr(1, source.size() - 2);
+        MarkdownObjectText source{MarkdownObjectSyntax::DoubleDollarBlock(),
+                                  detail::NormalizeLineEndings(node.children.front().text)};
+        if (auto data = Decode(FindSyntax(options_, &MarkdownExtension::block, source.syntax), source,
+                               detail::ValidCustomData)) {
+          block.kind = BlockKind::Custom;
+          block.custom = std::move(data);
+        } else {
+          block.text = std::move(source.text);
         }
-        block.kind = BlockKind::Custom;
-        block.custom = LatexBlock(std::move(source));
         break;
       }
       if (node.kind == NodeKind::Paragraph && path_.size() == 1 && node.children.size() == 1 &&
@@ -273,12 +394,16 @@ private:
         block.text.pop_back();
       }
       block.fence_info = detail::NormalizeLineEndings(node.fence_info);
-      if (options_.display_math && block.fence_info == "math") {
-        if (path_.size() == 1) {
-          block = BlockData{.kind = BlockKind::Custom, .custom = LatexBlock(std::move(block.text))};
-          break;
+      if (!block.fence_info.empty()) {
+        const auto syntax = MarkdownObjectSyntax::FencedBlock(block.fence_info);
+        if (const auto* mapping = FindSyntax(options_, &MarkdownExtension::block, syntax)) {
+          if (path_.size() != 1) {
+            Report("markdown.extension_placement", "Mapped code fence kept as code outside the document root");
+          } else if (auto data = Decode(mapping, {syntax, block.text}, detail::ValidCustomData)) {
+            block = BlockData{.kind = BlockKind::Custom, .custom = std::move(data)};
+            break;
+          }
         }
-        Report("markdown.math", "Nested display math converted to a code block");
       }
       if (block.fence_info.find('\n') != std::string::npos) {
         Report("markdown.fence_info", "Line breaks in code fence info replaced by spaces");
@@ -302,7 +427,7 @@ private:
 
   BlockPath path_;
   std::vector<ConversionIssue> issues_;
-  MarkdownOptions options_;
+  const MarkdownOptions& options_;
 };
 
 std::string EscapeText(std::string_view text, bool protect) {
@@ -363,9 +488,49 @@ std::size_t LongestRun(std::string_view text, char delimiter) {
   return longest;
 }
 
-std::string MathFence(std::string_view source) {
+std::string WriteFence(std::string_view source, std::string_view info) {
   const std::string fence(std::max<std::size_t>(3, LongestRun(source, '~') + 1), '~');
-  return fence + "math\n" + std::string(source) + "\n" + fence;
+  auto text = fence;
+  if (!info.empty()) {
+    text += ' ';
+    text += EscapeAttribute(info);
+  }
+  text += '\n';
+  if (!source.empty()) {
+    text += source;
+    text += '\n';
+  }
+  return text + fence;
+}
+
+template<class Data>
+std::optional<std::string> EncodeObject(const MarkdownOptions& options, MappingMember<Data> member,
+                                        const Data& data, bool in_table = false) {
+  const auto* mapping = FindMapping(options, member, [&](const auto& entry) { return entry.type == data.type; });
+  if (!mapping) {
+    return std::nullopt;
+  }
+  const auto encoded = mapping->encode(data);
+  if (!encoded || std::ranges::find(mapping->syntax, encoded->syntax) == mapping->syntax.end() ||
+      !ValidLiteral(encoded->text)) {
+    return std::nullopt;
+  }
+  const auto& text = encoded->text;
+  switch (SyntaxAccess::GetKind(encoded->syntax)) {
+  case SyntaxKind::FencedBlock:
+    return WriteFence(text, SyntaxAccess::FenceInfo(encoded->syntax));
+  case SyntaxKind::DoubleDollarBlock:
+    if (!text.empty() && text.find_first_of("$\n") == text.npos) {
+      return "$$\n" + text + "\n$$";
+    }
+    break;
+  case SyntaxKind::DollarSpan:
+    if (!text.empty() && text.find_first_of(in_table ? "$\n|" : "$\n") == text.npos) {
+      return '$' + text + '$';
+    }
+    break;
+  }
+  return std::nullopt;
 }
 
 std::string CodeSpan(std::string text, bool in_table) {
@@ -409,9 +574,35 @@ constexpr std::array markdown_marks{
 
 class MarkdownWriter {
 public:
-  explicit MarkdownWriter(MarkdownOptions options) : options_(options) {}
+  explicit MarkdownWriter(const MarkdownOptions& options) : options_(options) {}
 
   ExportResult Run(const RichDocument& document, LossPolicy policy) {
+    auto result = WriteOnce(document, policy);
+    if (policy == LossPolicy::AllowLoss) {
+      // Bound full-document retries and keep objects in unrelated blocks intact.
+      constexpr unsigned max_fallback_retries = 4;
+      for (unsigned retry = 0; mismatch_ && retry < max_fallback_retries; ++retry) {
+        if (FallbackAt(*mismatch_)) {
+          break;
+        }
+        const auto dropped = dropped_encodable_;
+        fallback_paths_.push_back(*mismatch_);
+        auto fallback = WriteOnce(document, policy);
+        if (dropped_encodable_ == dropped) {
+          break;
+        }
+        result = std::move(fallback);
+      }
+    }
+    return result;
+  }
+
+private:
+  ExportResult WriteOnce(const RichDocument& document, LossPolicy policy) {
+    issues_.clear();
+    mismatch_.reset();
+    protect_ = false;
+    dropped_encodable_ = 0;
     auto projected = RichDocument::Create(Project(document.Blocks()));
     auto text = Write(projected);
     auto round_trip = MarkdownImport(options_).Run(text, LossPolicy::Strict);
@@ -425,26 +616,12 @@ public:
         round_trip = std::move(protected_round_trip);
       }
     }
-    if (round_trip.document != projected && policy == LossPolicy::AllowLoss && !drop_inline_at_) {
-      BlockPath mismatch;
-      if (round_trip.document) {
-        FindMismatch(projected.Blocks(), round_trip.document->Blocks(), mismatch);
-      } else if (!round_trip.issues.empty()) {
-        mismatch = round_trip.issues.front().block_path;
-      }
-      MarkdownWriter fallback(options_);
-      fallback.drop_inline_at_ = std::move(mismatch);
-      auto result = fallback.Run(document, policy);
-      if (fallback.dropped_encodable_) {
-        return result;
-      }
-    }
     if (!round_trip.document) {
-      issues_.push_back({"markdown.round_trip", {}, {}, "Generated Markdown could not be re-imported without loss"});
+      mismatch_ = round_trip.issues.empty() ? BlockPath{} : round_trip.issues.front().block_path;
+      issues_.push_back({"markdown.round_trip", *mismatch_, {}, "Generated Markdown could not be re-imported without loss"});
     } else if (projected != *round_trip.document) {
-      BlockPath mismatch;
-      FindMismatch(projected.Blocks(), round_trip.document->Blocks(), mismatch);
-      issues_.push_back({"markdown.round_trip", std::move(mismatch), {},
+      FindMismatch(projected.Blocks(), round_trip.document->Blocks(), mismatch_.emplace());
+      issues_.push_back({"markdown.round_trip", *mismatch_, {},
                          "This structure, text, or mark combination has no faithful encoding in the Markdown subset"});
     }
     if (issues_.empty() || policy == LossPolicy::AllowLoss) {
@@ -453,7 +630,12 @@ public:
     return {.issues = std::move(issues_)};
   }
 
-private:
+  bool FallbackAt(const BlockPath& path) const {
+    return std::ranges::any_of(fallback_paths_, [&](const BlockPath& prefix) {
+      return path.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), path.begin());
+    });
+  }
+
   std::string Write(const RichDocument& document) const {
     auto text = Blocks(document.Blocks());
     if (!text.empty()) {
@@ -495,12 +677,18 @@ private:
       }
       if (data.custom) {
         const auto& custom = *data.custom;
-        const bool latex = custom.type == latex_block_type && custom.version == 1;
-        if (!(latex && options_.display_math && custom == LatexBlock(custom.payload))) {
-          issues_.push_back({latex ? "markdown.math" : "markdown.custom_block", path_, {},
+        const bool representable = EncodeObject(options_, &MarkdownExtension::block, custom).has_value();
+        if (!representable || FallbackAt(path_)) {
+          dropped_encodable_ += representable;
+          issues_.push_back({"markdown.custom_block", path_, {},
                              "This block has no faithful Markdown encoding. AllowLoss writes its fallback text."});
           data = BlockData{.text = custom.fallback_text};
         }
+      } else if (data.kind == BlockKind::CodeBlock && !data.fence_info.empty() &&
+                 FindSyntax(options_, &MarkdownExtension::block, MarkdownObjectSyntax::FencedBlock(data.fence_info))) {
+        issues_.push_back({"markdown.extension_conflict", path_, {},
+                           "The fence info is claimed by a Markdown extension. AllowLoss keeps the code without it."});
+        data.fence_info.clear();
       }
       ProjectInlineObjects(data, in_cell);
       auto marks = std::move(data.marks);
@@ -534,7 +722,6 @@ private:
     TextOffset shift = 0;
     for (const auto& object : data.inline_objects) {
       const auto& value = object.data;
-      const bool latex = value.type == latex_block_type;
       const auto image = ReadInlineImage(value);
       const bool code = std::ranges::any_of(data.marks, [&](const MarkRange& mark) {
         return mark.range.start <= object.offset && object.offset < mark.range.end &&
@@ -543,19 +730,16 @@ private:
       const bool standalone_image = path_.size() == 1 && data.kind == BlockKind::Paragraph &&
           body.Length() == 1 && data.marks.empty() && data.links.empty();
       const bool representable = !code &&
-          ((latex && options_.inline_math && value == LatexInline(value.payload) && !value.payload.empty() &&
-            value.payload.find_first_of(in_cell ? "$\n|" : "$\n") == value.payload.npos) ||
-           (options_.inline_images && image && !image->width && value == InlineImage(*image) && !standalone_image));
-      const bool fallback = drop_inline_at_ && path_.size() >= drop_inline_at_->size() &&
-          std::equal(drop_inline_at_->begin(), drop_inline_at_->end(), path_.begin());
-      if (representable && !fallback) {
+          ((options_.inline_images && image && !image->width && value == InlineImage(*image) && !standalone_image) ||
+           EncodeObject(options_, &MarkdownExtension::inline_object, value, in_cell).has_value());
+      if (representable && !FallbackAt(path_)) {
         auto copy = object;
         copy.offset += shift;
         retained.push_back(std::move(copy));
         continue;
       }
-      dropped_encodable_ |= representable;
-      issues_.push_back({latex ? "markdown.math" : "markdown.inline_object", path_,
+      dropped_encodable_ += representable;
+      issues_.push_back({"markdown.inline_object", path_,
                          TextRange{object.offset, object.offset + 1},
                          "This inline object has no faithful Markdown encoding. AllowLoss writes its fallback text."});
       text += body.TextInRange({start, object.offset});
@@ -582,18 +766,6 @@ private:
     std::erase_if(data.links, [](const LinkRange& link) { return link.range.IsCollapsed(); });
     data.inline_objects = std::move(retained);
     data.text = std::move(text);
-  }
-
-  std::string WriteMath(const CustomBlockData& custom) const {
-    if (custom.payload.find('\n') == std::string::npos) {
-      const auto span = "$$\n" + custom.payload + "\n$$";
-      const auto imported = MarkdownImport(options_).Run(span, LossPolicy::Strict);
-      if (imported.document && imported.document->Blocks().size() == 1 &&
-          imported.document->Blocks().front().Data().custom == custom) {
-        return span;
-      }
-    }
-    return MathFence(custom.payload);
   }
 
   static void FindMismatch(std::span<const Block> expected, std::span<const Block> actual, BlockPath& path) {
@@ -623,14 +795,14 @@ private:
       auto object = std::ranges::lower_bound(objects, start, {}, &InlineObject::offset);
       for (; object != objects.end() && object->offset < range.end; ++object) {
         text += EscapeText(body.TextInRange({start, object->offset}), protect_);
-        if (object->data.type == latex_block_type) {
-          text += "$" + object->data.payload + "$";
-        } else if (const auto image = ReadInlineImage(object->data)) {
+        if (const auto image = ReadInlineImage(object->data)) {
           text += "![" + EscapeText(image->alt_text, protect_) + "](<" + EscapeAttribute(image->source, in_table) + ">";
           if (!image->title.empty()) {
             text += " \"" + EscapeAttribute(image->title, in_table) + '"';
           }
           text += ')';
+        } else {
+          text += EncodeObject(options_, &MarkdownExtension::inline_object, object->data, in_table).value();
         }
         start = object->offset + 1;
       }
@@ -733,7 +905,7 @@ private:
         break;
       }
       case BlockKind::Custom:
-        out += WriteMath(*data.custom);
+        out += EncodeObject(options_, &MarkdownExtension::block, *data.custom).value();
         break;
       case BlockKind::Paragraph:
         out += TextWithLinks(blocks[i]);
@@ -745,20 +917,9 @@ private:
           out += TextWithLinks(blocks[i]);
         }
         break;
-      case BlockKind::CodeBlock: {
-        const std::string fence(std::max<std::size_t>(3, LongestRun(data.text, '~') + 1), '~');
-        out += fence;
-        if (!data.fence_info.empty()) {
-          out += ' ';
-          out += EscapeAttribute(data.fence_info);
-        }
-        out += '\n';
-        if (!data.text.empty()) {
-          out += data.text + '\n';
-        }
-        out += fence;
+      case BlockKind::CodeBlock:
+        out += WriteFence(data.text, data.fence_info);
         break;
-      }
       case BlockKind::Quote:
         PrefixLines(out, Blocks(data.children), "> ", "> ");
         break;
@@ -789,39 +950,38 @@ private:
   BlockPath path_;
   std::vector<ConversionIssue> issues_;
   bool protect_ = false;
-  std::optional<BlockPath> drop_inline_at_;
-  bool dropped_encodable_ = false;
-  MarkdownOptions options_;
-};
-
-class MarkdownDocumentCodec final : public DocumentCodec {
-public:
-  explicit MarkdownDocumentCodec(MarkdownOptions options) : options_(options) {}
-
-  ImportResult Import(std::string_view source, LossPolicy policy) const override {
-    return MarkdownImport(options_).Run(source, policy);
-  }
-
-  ExportResult Export(const RichDocument& document, LossPolicy policy) const override {
-    return MarkdownWriter(options_).Run(document, policy);
-  }
-
-private:
-  MarkdownOptions options_;
+  std::vector<BlockPath> fallback_paths_;
+  std::optional<BlockPath> mismatch_;
+  std::size_t dropped_encodable_ = 0;
+  const MarkdownOptions& options_;
 };
 
 } // namespace
 
-const DocumentCodec& MarkdownCodec(MarkdownOptions options) {
-  static const std::array codecs{
-      MarkdownDocumentCodec({}), MarkdownDocumentCodec({.display_math = true}),
-      MarkdownDocumentCodec({.inline_math = true}), MarkdownDocumentCodec({.display_math = true, .inline_math = true}),
-      MarkdownDocumentCodec({.inline_images = true}),
-      MarkdownDocumentCodec({.display_math = true, .inline_images = true}),
-      MarkdownDocumentCodec({.inline_math = true, .inline_images = true}),
-      MarkdownDocumentCodec({.display_math = true, .inline_math = true, .inline_images = true}),
-  };
-  return codecs[options.display_math + 2 * options.inline_math + 4 * options.inline_images];
+MarkdownCodec::MarkdownCodec(MarkdownOptions options) : options_(std::move(options)) {
+  if (std::ranges::any_of(options_.extensions, [](const auto& extension) {
+        return !extension.block && !extension.inline_object;
+      })) {
+    throw std::invalid_argument("Empty Markdown extension");
+  }
+  ValidateMappings(options_, &MarkdownExtension::block);
+  ValidateMappings(options_, &MarkdownExtension::inline_object);
+}
+
+ImportResult MarkdownCodec::Import(std::string_view source, LossPolicy policy) const {
+  return MarkdownImport(options_).Run(source, policy);
+}
+
+ExportResult MarkdownCodec::Export(const RichDocument& document, LossPolicy policy) const {
+  try {
+    return MarkdownWriter(options_).Run(document, policy);
+  } catch (const std::logic_error& error) {
+    return {.issues = {{"markdown.invalid", {}, {}, error.what()}}};
+  } catch (const std::runtime_error& error) {
+    return {.issues = {{"markdown.invalid", {}, {}, error.what()}}};
+  } catch (const std::bad_optional_access&) {
+    return {.issues = {{"markdown.invalid", {}, {}, "Markdown mapping changed during export"}}};
+  }
 }
 
 } // namespace huxerui::richeditor

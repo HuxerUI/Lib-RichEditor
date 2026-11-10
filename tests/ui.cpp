@@ -1,7 +1,6 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/richeditor.h>
 #include <huxerui/richeditor/format.h>
-#include <huxerui/richeditor/math.h>
 #include <huxerui/testing/ui_test.h>
 
 #include <algorithm>
@@ -12,11 +11,15 @@
 #include <stdexcept>
 #include <thread>
 
+#include "../examples/preview/src/formula.h"
 #include "../src/editor_session.h"
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
 using namespace huxerui::testing;
+using folio::LatexBlock;
+using folio::LatexInline;
+using folio::latex_type;
 
 namespace {
 
@@ -520,7 +523,7 @@ void PresentationExtensions() {
   static unsigned renders = 0;
   static const auto custom_renderer = std::make_shared<const CustomBlockRenderer>(
       [](const CustomBlockData& block, Color, float) -> std::optional<CustomBlockGraphic> {
-        Check(block.type == latex_block_type, "Custom presenter receives the persistent block");
+        Check(block.type == latex_type, "Custom presenter receives the persistent block");
         ++renders;
         return std::nullopt;
       });
@@ -532,7 +535,7 @@ void PresentationExtensions() {
       },
   });
   const Application app([]() -> View {
-    static const auto initial = MarkdownCodec({.display_math = true}).Import(
+    static const auto initial = folio::DocumentMarkdown().Import(
         "A🙂 content\n\n$$\nx^2\n$$\n\n~~~NT keep\na\n~~~\n");
     Check(initial.document.has_value(), "Presentation fixture imports");
     const auto editor = UseRichEditor(*initial.document);
@@ -540,7 +543,7 @@ void PresentationExtensions() {
     decorations = state;
     controller = editor;
     return RichEditor(editor, {.extensions = {.code_blocks = code_blocks, .decorations = state.Get(),
-                                              .custom_blocks = {{std::string(latex_block_type), custom_renderer}}}});
+                                              .custom_blocks = {{std::string(latex_type), custom_renderer}}}});
   }, {.show_debug_overlay = false});
   UiTest ui(app, {.viewport = {320.0F, 440.0F}});
   const auto initial = controller->Document();
@@ -1230,9 +1233,9 @@ void InlineObjectWorkflow() {
   static unsigned renders = 0;
   activation.reset();
   renders = 0;
-  const auto& markdown = MarkdownCodec({.inline_math = true, .inline_images = true});
+  const auto& markdown = folio::DocumentMarkdown();
   const Application app([]() -> View {
-    static const auto initial = MarkdownCodec({.inline_math = true}).Import("A🙂 $x^2$ 中文 with `code`.\n\nOther.").document;
+    static const auto initial = folio::DocumentMarkdown().Import("A🙂 $x^2$ 中文 with `code`.\n\nOther.").document;
     static const auto renderer = std::make_shared<const InlineObjectRenderer>(
         [](InlineObjectData data, InlineObjectRenderContext context) -> Task<std::optional<InlineObjectGraphic>> {
           ++renders;
@@ -1243,7 +1246,7 @@ void InlineObjectWorkflow() {
     const auto editor = UseRichEditor(*initial);
     controller = editor;
     return RichEditor(editor, {.style = {.inline_code_horizontal_padding = 4.0F},
-                               .extensions = {.inline_objects = {{std::string(latex_block_type), renderer}}}})
+                               .extensions = {.inline_objects = {{std::string(latex_type), renderer}}}})
         .On<RichEditorEvents::InlineObjectActivated>([](const InlineObjectSelection& event) {
           activation = event;
         });

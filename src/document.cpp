@@ -1,7 +1,5 @@
 #include "document_internal.h"
 
-#include <huxerui/richeditor/math.h>
-
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -36,18 +34,6 @@ std::span<const Block> RichDocument::Blocks() const noexcept { return storage_->
 
 bool RichDocument::operator==(const RichDocument& other) const {
   return storage_ == other.storage_ || storage_->blocks == other.storage_->blocks;
-}
-
-CustomBlockData LatexBlock(std::string source) {
-  source = detail::NormalizeLineEndings(source);
-  return {std::string(latex_block_type), 1, source, source};
-}
-
-InlineObjectData LatexInline(std::string source) {
-  source = detail::NormalizeLineEndings(source);
-  auto fallback = source;
-  std::ranges::replace(fallback, '\n', ' ');
-  return {std::string(latex_block_type), 1, std::move(source), std::move(fallback)};
 }
 
 namespace detail {

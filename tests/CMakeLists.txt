@@ -1,9 +1,10 @@
-add_executable(richeditor_core_tests core.cpp)
+set(folio_formula_source ../examples/preview/src/formula.cpp)
+add_executable(richeditor_core_tests core.cpp ${folio_formula_source})
 target_link_libraries(richeditor_core_tests PRIVATE HuxerUI::RichEditor)
 add_test(NAME richeditor.core COMMAND richeditor_core_tests)
 
 if (TARGET HuxerUI::testing)
-    add_executable(richeditor_ui_tests ui.cpp)
+    add_executable(richeditor_ui_tests ui.cpp ${folio_formula_source})
     target_link_libraries(richeditor_ui_tests PRIVATE HuxerUI::RichEditor HuxerUI::testing)
     add_test(NAME richeditor.ui COMMAND richeditor_ui_tests)
 else ()

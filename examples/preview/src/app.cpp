@@ -1,7 +1,6 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/richeditor.h>
 #include <huxerui/richeditor/format.h>
-#include <huxerui/richeditor/math.h>
 
 #include <algorithm>
 #include <array>
@@ -18,6 +17,9 @@
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
+using folio::LatexBlock;
+using folio::LatexInline;
+using folio::latex_type;
 
 namespace {
 
@@ -583,9 +585,9 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       editor.GetCommandState(InsertImage{{.source = "attachments/image.jpg"}}).enabled;
   const auto custom = editor.SelectedCustomBlock();
   const auto inline_object = editor.SelectedInlineObject();
-  const bool inline_formula = inline_object && inline_object->data.type == latex_block_type &&
+  const bool inline_formula = inline_object && inline_object->data.type == latex_type &&
       inline_object->data.version == 1;
-  const bool formula_selected = inline_formula || (custom && custom->type == latex_block_type && custom->version == 1);
+  const bool formula_selected = inline_formula || (custom && custom->type == latex_type && custom->version == 1);
   const bool can_insert_formula = editor.GetCommandState(InsertCustomBlock{LatexBlock("x")}).enabled;
   const bool can_insert_inline_formula = editor.GetCommandState(InsertInlineObject{LatexInline("x")}).enabled;
   const bool can_insert_inline_image = can_pick_images && editor.GetCommandState(
@@ -825,7 +827,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
 
 [[huxerui::composable]]
 View Preview() {
-  static const auto imported = MarkdownCodec({.display_math = true, .inline_math = true, .inline_images = true}).Import(sample_markdown);
+  static const auto imported = folio::DocumentMarkdown().Import(sample_markdown);
   const auto editor = UseRichEditor(imported.document.value_or(RichDocument{}));
   const auto focus = UseViewHandle();
   const auto find_focus = UseViewHandle();
@@ -979,9 +981,8 @@ View Preview() {
   };
 
   const auto export_markdown = [=] {
-    const auto* codec = &MarkdownCodec({.display_math = true, .inline_math = true, .inline_images = true});
     const auto snapshot = editor.Document();
-    auto strict = codec->Export(snapshot);
+    auto strict = folio::DocumentMarkdown().Export(snapshot);
     const SaveFileOptions options{
         .suggested_name = "article.md",
         .filter = {.name = "Markdown", .extensions = {"md"}, .content_types = {"text/markdown"}}};
@@ -990,7 +991,7 @@ View Preview() {
       return;
     }
     dialog.Show("Export Markdown with loss?", IssueMessage(strict.issues), "Export with loss", "Cancel", [=] {
-      save_document(snapshot, codec->Export(snapshot, LossPolicy::AllowLoss), options);
+      save_document(snapshot, folio::DocumentMarkdown().Export(snapshot, LossPolicy::AllowLoss), options);
     });
   };
 
@@ -1119,10 +1120,10 @@ View Preview() {
     FormattingBar(editor, focus, !working, picker->CanOpenFiles(), pick_image),
     RichEditor(editor, {.style = StudioEditorStyle(theme, compact), .document_directory = directory,
                         .extensions = {.decorations = std::move(decoration_providers),
-                                       .custom_blocks = {{std::string(latex_block_type), folio::FormulaRenderer()}},
+                                       .custom_blocks = {{std::string(latex_type), folio::FormulaRenderer()}},
                                        .inline_objects = {folio::InlineFormulaExtension()}}})
         .On<RichEditorEvents::InlineObjectActivated>([=](const InlineObjectSelection& object) {
-          if (object.data.type == latex_block_type && object.data.version == 1) {
+          if (object.data.type == latex_type && object.data.version == 1) {
             dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true, .object = object});
           }
         })

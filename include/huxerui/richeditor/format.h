@@ -7,6 +7,7 @@
 /// Applications can implement DocumentCodec for their own formats.
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -15,6 +16,10 @@
 #include <huxerui/richeditor/document.h>
 
 namespace huxerui::richeditor {
+
+namespace detail {
+struct MarkdownObjectSyntaxAccess;
+}
 
 /// @brief Controls what a codec may return when the target representation cannot express the input.
 enum class LossPolicy {
@@ -87,20 +92,77 @@ public:
 /// @return A reference to the built-in codec with process lifetime.
 const DocumentCodec& JsonCodec();
 
-/// @brief Controls opt-in Markdown syntax without changing the default CommonMark codec.
+/// @brief Identifies a Markdown spelling that an object mapping can import and export.
+class MarkdownObjectSyntax {
+public:
+  /// @brief Matches a dollar-delimited span in a paragraph, heading, or table cell.
+  static MarkdownObjectSyntax DollarSpan();
+
+  /// @brief Matches a double-dollar span occupying an entire top-level paragraph.
+  static MarkdownObjectSyntax DoubleDollarBlock();
+
+  /// @brief Matches a fenced code block by its complete info string.
+  /// @param fence_info Exact UTF-8 info string to copy. Registration requires a nonempty single line
+  /// without leading or trailing spaces or tabs.
+  static MarkdownObjectSyntax FencedBlock(std::string_view fence_info);
+
+  /// Compares the Markdown spelling, including the complete info string for a fenced block.
+  bool operator==(const MarkdownObjectSyntax&) const = default;
+
+private:
+  enum class Kind;
+  explicit MarkdownObjectSyntax(Kind kind, std::string_view fence_info = {});
+
+  Kind kind_;
+  std::string fence_info_;
+
+  friend struct detail::MarkdownObjectSyntaxAccess;
+};
+
+/// @brief The syntax and literal body of one Markdown object.
+struct MarkdownObjectText {
+  MarkdownObjectSyntax syntax; ///< Syntax matched by the parser or selected by the encoder.
+  /// UTF-8 body with LF line endings, without delimiters or the fence's final line terminator.
+  /// On import, math spans follow the parser's whitespace rules.
+  std::string text;
+};
+
+/// @brief Bidirectional mapping between a Markdown object and persistent document data.
+///
+/// Callbacks execute synchronously during conversion and may be called again during round-trip validation.
+/// Return an empty value for unsupported input. Keep results deterministic for the codec's lifetime.
+/// Callbacks shared across threads must be safe to invoke concurrently.
+/// @tparam Data CustomBlockData for block mappings or InlineObjectData for inline mappings.
+template<class Data>
+struct MarkdownObjectMapping {
+  /// Persistent type identifier. The decoder must return this type and valid document data.
+  std::string type;
+  /// Accepted input syntax. The encoder must select one of these entries.
+  std::vector<MarkdownObjectSyntax> syntax;
+  /// Converts one recognized object to persistent data, with its own version and fallback text.
+  std::function<std::optional<Data>(const MarkdownObjectText&)> decode;
+  /// Encodes persistent data. The codec writes delimiters and validates the result in context.
+  std::function<std::optional<MarkdownObjectText>(const Data&)> encode;
+};
+
+/// @brief Registers Markdown conversions for a custom block, an inline object, or both.
+struct MarkdownExtension {
+  /// Optional mapping for one top-level custom block type.
+  std::optional<MarkdownObjectMapping<CustomBlockData>> block;
+  /// Optional mapping for one atomic inline object type.
+  std::optional<MarkdownObjectMapping<InlineObjectData>> inline_object;
+};
+
+/// @brief Opt-in syntax and object mappings for a Markdown codec instance.
 struct MarkdownOptions {
-  /// Recognize standalone top-level display math and fenced code with the exact info string "math" as LaTeX.
-  /// Display spans use the parser's whitespace rules. Fences preserve multiline source, including line breaks.
-  /// Nested display math reports a conversion loss. Export verifies that the source re-imports faithfully.
-  bool display_math = false;
-  /// Import inline dollar-delimited math as editable LaTeX objects and export representable objects in that form.
-  bool inline_math = false;
   /// Import and export inline images. A standalone image in a top-level paragraph remains an image block.
   /// Markdown image syntax preserves the reference, alternative text and title.
   bool inline_images = false;
+  /// Registrations owned by the codec. Types are unique per placement and input syntax has one owner.
+  std::vector<MarkdownExtension> extensions;
 };
 
-/// @brief Returns a shared CommonMark codec with GFM strikethrough and top-level table support.
+/// @brief CommonMark codec with GFM strikethrough, top-level tables, and optional object mappings.
 ///
 /// Import maps paragraphs, headings, lists, quotes, code, emphasis, and links to editable content. Soft breaks
 /// become spaces in paragraphs and hard breaks become LF. Raw HTML is stored as literal text. Tables follow the
@@ -112,8 +174,23 @@ struct MarkdownOptions {
 /// Export writes canonical Markdown and checks that re-import preserves the document. Strict withholds output
 /// when content or styling such as a missing table header, a cell line break, underline, highlight, or a
 /// preferred image width cannot be represented. AllowLoss returns Markdown with issues describing the losses.
-/// @param options Opt-in syntax for import and export. Omitting this argument leaves all extensions disabled.
-/// @return A reference to the built-in codec for these options with process lifetime.
-const DocumentCodec& MarkdownCodec(MarkdownOptions options = {});
+/// Registered object mappings participate in both directions and in the round-trip check. An unclaimed fence
+/// remains a code block. Export reports a loss if a regular code block uses info claimed by a mapping.
+class MarkdownCodec final : public DocumentCodec {
+public:
+  /// @brief Constructs a codec that owns its configuration.
+  /// @param options Opt-in syntax for import and export.
+  /// @throws std::invalid_argument If a registration is incomplete, incompatible with its placement,
+  /// or conflicts with another registration.
+  explicit MarkdownCodec(MarkdownOptions options = {});
+
+  /// @copydoc DocumentCodec::Import
+  ImportResult Import(std::string_view source, LossPolicy policy = LossPolicy::Strict) const override;
+  /// @copydoc DocumentCodec::Export
+  ExportResult Export(const RichDocument& document, LossPolicy policy = LossPolicy::Strict) const override;
+
+private:
+  MarkdownOptions options_;
+};
 
 } // namespace huxerui::richeditor

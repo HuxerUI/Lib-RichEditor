@@ -109,13 +109,13 @@ Choose `DecorationScope::Document` for analysis that needs context across blocks
 
 A top-level `Custom` block stores a namespaced type, payload version, UTF-8 payload, and fallback text. JSON v1 preserves these fields even when no renderer is registered. Register a `CustomBlockExtension` per type to display an image or vector asset. Use `InsertCustomBlock`, `SelectedCustomBlock()` and `ReplaceCustomBlock` to build application controls for its content. Edits and removal are undoable.
 
-`LatexBlock(source)` creates a standalone formula. Folio offers source editing and copying LaTeX from the formatting bar. Its optional RaTeX renderer runs locally on macOS and Android when the corresponding Rust target is installed. Unsupported expressions and builds without the renderer display editable source. The renderer is a Folio dependency. Applications using Lib-RichEditor can supply their own renderer.
+Folio uses a custom block for standalone LaTeX and offers source editing and copying LaTeX from the formatting bar. Its optional RaTeX renderer runs locally on macOS and Android when the corresponding Rust target is installed. Unsupported expressions and builds without the renderer display editable source. Applications can use the same custom block API with their own types and renderers.
 
 ## Inline objects
 
 Paragraphs and headings, including text in lists, quotes and table cells, can contain atomic inline objects. Each object occupies one UTF-16 U+FFFC in the editing projection. The document stores its type, version, payload, fallback text and optional named attachment references. Undo and redo restore objects with their edited context. An inline object target remains valid when the object moves within the open document.
 
-Use `InsertInlineObject{LatexInline(source)}` or `InsertInlineObject{InlineImage(image)}` to insert an object. `SelectedInlineObject()` returns the captured target and data for `ReplaceInlineObject`. Bind `RichEditorEvents::InlineObjectActivated` with `.On<...>()` to open an application editor. Control-click or Command-click, the corresponding Enter shortcut when an object is selected, and semantic activation emit the same event.
+Use `InsertInlineObject` with application-defined object data or the result of `InlineImage(image)`. `SelectedInlineObject()` returns the captured target and data for `ReplaceInlineObject`. Bind `RichEditorEvents::InlineObjectActivated` with `.On<...>()` to open an application editor. Control-click or Command-click, the corresponding Enter shortcut when an object is selected, and semantic activation emit the same event.
 
 Register an `InlineObjectExtension` per type for custom async rendering. The renderer supplies an image or vector with baseline dimensions. A missing or unresolved renderer shows fallback text. The built-in inline image presentation uses the same resolver and document directory as image blocks. Folio resolves local PNG and JPEG files from `attachments/` and migrates structured references alongside the document.
 
@@ -129,9 +129,34 @@ Markdown import converts the Lib-Markdown syntax tree to editable content. The s
 
 Markdown export checks semantic round trips with the same parser. Both import and export default to `LossPolicy::Strict`. Use `LossPolicy::AllowLoss` to receive a conversion with reported losses such as omitted underline or highlight, a synthesized header row, or cell line breaks replaced by spaces. Each issue carries a code and a zero-based tree path, with a block-local range when available. Plain clipboard actions use text fallback. Application clipboard bridges can preserve structure with document fragments.
 
-`MarkdownCodec({.display_math = true})` opts into standalone LaTeX. Folio enables it alongside `inline_math` and `inline_images`. Display spans use the parser's whitespace rules. The codec uses `math` fences for multiline formulas to preserve exact source. The default codec reports formula loss under Strict. AllowLoss writes fallback text and returns diagnostics for formulas or other custom blocks the selected codec cannot represent.
+Enable `MarkdownOptions::inline_images` to import and export images embedded in text. Standalone Markdown images remain image blocks.
 
-Enable `MarkdownOptions::inline_math` to round trip supported dollar-delimited LaTeX and `inline_images` to import and export images embedded in a paragraph. Standalone Markdown images remain image blocks. Strict export reports object ranges that cannot be represented, and AllowLoss writes fallback text.
+### Markdown object mappings
+
+A `MarkdownCodec` instance owns its extensions independently of the editor view. A `MarkdownExtension` can map a top-level custom block, an inline object, or both. Use `MarkdownObjectSyntax::DollarSpan()` for inline dollar spans, `DoubleDollarBlock()` for standalone double-dollar spans, and `FencedBlock(info)` to match a complete fence info string. The codec writes delimiters and verifies the document by importing the generated Markdown with the same extensions. Duplicate syntax or duplicate types in the same placement cause construction to fail.
+
+```cpp
+const auto diagram_fence = MarkdownObjectSyntax::FencedBlock("diagram");
+const MarkdownCodec markdown({.extensions = {MarkdownExtension{
+    .block = MarkdownObjectMapping<CustomBlockData>{
+        .type = "example.diagram",
+        .syntax = {diagram_fence},
+        .decode = [](const MarkdownObjectText& source) {
+          return CustomBlockData{"example.diagram", 1, source.text, "Diagram"};
+        },
+        .encode = [diagram_fence](const CustomBlockData& block) -> std::optional<MarkdownObjectText> {
+          if (block.version != 1) {
+            return std::nullopt;
+          }
+          return MarkdownObjectText{diagram_fence, block.payload};
+        },
+    },
+}}});
+```
+
+An unregistered fence is ordinary code. When a registered mapping claims a fence info string, exporting a regular code block with that info reports a loss. `AllowLoss` keeps the code body and omits the conflicting info. Missing or unrepresentable object mappings report losses with block paths and, for inline objects, UTF-16 ranges. `AllowLoss` can write the object's fallback text.
+
+Folio registers its own formula mappings and retains the existing `huxerui.latex` type in JSON v1. It imports inline dollar spans, standalone double-dollar spans, and `math` fences. Display formulas export as `math` fences to preserve the source, including whitespace and line breaks. The JSON codec preserves formula data regardless of the active Markdown mappings.
 
 ## Preview and tests
 

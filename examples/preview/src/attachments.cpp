@@ -1,4 +1,5 @@
 #include "attachments.h"
+#include "formula.h"
 
 #include <algorithm>
 #include <atomic>
@@ -191,8 +192,7 @@ Task<IoResult<DocumentSource>> ReadDocument(FileReference source) {
   if (!contents.Succeeded()) {
     co_return IoResult<DocumentSource>::Failure(contents.Error());
   }
-  const auto& codec = markdown ? MarkdownCodec({.display_math = true, .inline_math = true, .inline_images = true})
-                               : JsonCodec();
+  const DocumentCodec& codec = markdown ? DocumentMarkdown() : JsonCodec();
   auto imported = codec.Import(contents.Value());
   if (!imported.document) {
     auto message = imported.issues.empty() ? std::string("Could not open the document") : imported.issues.front().message;
