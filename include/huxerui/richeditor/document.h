@@ -1,0 +1,210 @@
+#pragma once
+
+/// @file
+/// @brief Immutable document snapshots and the block and inline types shared by editors and codecs.
+///
+/// Include <huxerui/richeditor/document.h> and link HuxerUI::RichEditor. Use RichDocument::Create() to validate
+/// a tree built by application code. Use <huxerui/richeditor/format.h> to convert serialized content.
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <vector>
+
+#include <huxerui/text.h>
+
+namespace huxerui::richeditor {
+
+namespace detail {
+struct DocumentAccess;
+struct DocumentStorage;
+}
+
+/// @brief Structural role of a block in the document tree.
+enum class BlockKind {
+  Paragraph, ///< Text leaf supporting inline marks, links, and line breaks.
+  Heading,   ///< Single-line text leaf supporting inline marks, links, and a heading level.
+  CodeBlock, ///< Plain-text leaf supporting line breaks and code fence metadata.
+  Quote,     ///< Container holding one or more blocks.
+  List,      ///< Ordered or unordered container holding one or more list items.
+  ListItem,  ///< Container holding the item's content and any nested blocks. Its parent is a List.
+  Table,     ///< Top-level rectangular grid of TableRow blocks, optionally with a header in its first row.
+  TableRow,  ///< Nonempty sequence of TableCell blocks. All rows of a table have the same number of cells.
+  TableCell, ///< Container holding one paragraph, which may be empty and may contain inline styles and breaks.
+  Image,     ///< Top-level image referenced by ImageBlockData.
+  Custom,    ///< Top-level atomic block with application-defined content.
+};
+
+/// @brief Combinable inline styles supported by paragraphs and headings.
+///
+/// Use operator| to combine styles in a MarkRange and operator& to test membership.
+enum class Mark : std::uint8_t {
+  None = 0,           ///< Empty set of marks.
+  Bold = 1 << 0,      ///< Bold font weight.
+  Italic = 1 << 1,    ///< Italic font slant.
+  Strike = 1 << 2,    ///< Strikethrough decoration.
+  Code = 1 << 3,      ///< Inline code style.
+  Underline = 1 << 4, ///< Underline decoration.
+  Highlight = 1 << 5, ///< Highlight using the editor theme's background treatment.
+};
+
+constexpr Mark operator|(Mark left, Mark right) noexcept {
+  return static_cast<Mark>(static_cast<unsigned>(left) | static_cast<unsigned>(right));
+}
+
+constexpr Mark operator&(Mark left, Mark right) noexcept {
+  return static_cast<Mark>(static_cast<unsigned>(left) & static_cast<unsigned>(right));
+}
+
+/// @brief The complete set of marks over one nonempty slice of paragraph or heading text.
+struct MarkRange {
+  /// Half-open UTF-16 range [start, end) relative to the start of its block.
+  /// Both endpoints must lie on Unicode scalar boundaries. For example, the emoji in "A🙂" occupies [1, 3).
+  TextRange range;
+  /// The nonempty combination of supported marks active over the whole range.
+  Mark marks = Mark::None;
+  bool operator==(const MarkRange&) const = default;
+};
+
+/// @brief Link destination and optional title over a nonempty slice of paragraph or heading text.
+struct LinkRange {
+  /// Half-open UTF-16 range [start, end) relative to the start of its block, with endpoints on scalar boundaries.
+  TextRange range;
+  /// UTF-8 destination stored with the linked text.
+  std::string target;
+  /// UTF-8 link title. An empty string represents an absent title.
+  std::string title;
+  bool operator==(const LinkRange&) const = default;
+};
+
+/// @brief Persistent metadata for one image block.
+///
+/// The application resolves the reference in the document's storage context. A saved document can be
+/// moved together with its attachments while keeping the relative references intact.
+struct ImageBlockData {
+  /// Nonempty, single-line UTF-8 reference, such as "attachments/photo.jpg" or an HTTPS URL.
+  std::string source;
+  /// Plain UTF-8 alternative text used in accessibility and when the image is unavailable.
+  std::string alt_text;
+  /// UTF-8 Markdown image title. An empty string represents an absent title.
+  std::string title;
+  /// Preferred width in logical units. Omit it to use the resolved image's intrinsic width.
+  /// A set width must be finite and positive. The view fits it to the content and derives the height from the image.
+  std::optional<float> width{};
+  bool operator==(const ImageBlockData&) const = default;
+};
+
+/// @brief Persistent content for a custom block, independent of its presentation.
+///
+/// Use a namespaced type such as "folio.formula". Versions belong to the type and are independent of the
+/// document format version. The editor treats the payload as opaque UTF-8 and preserves it on save and reopen.
+struct CustomBlockData {
+  std::string type;          ///< Namespaced ASCII identifier with letters, digits, '.', '_' and '-'.
+  unsigned version = 1;      ///< Positive schema version interpreted by the application.
+  std::string payload;       ///< Application-owned data, such as LaTeX source or serialized JSON.
+  std::string fallback_text; ///< Plain text for placeholder display, application copy actions and lossy export.
+  bool operator==(const CustomBlockData&) const = default;
+};
+
+struct BlockData;
+
+/// @brief Immutable, shared-storage value used to build or inspect a document tree.
+///
+/// To derive a different block, copy Data() into a BlockData value, update that value, and construct a new Block.
+class Block {
+public:
+  /// @brief Stores construction data for one block.
+  /// @param data Text and inline ranges for a leaf or child blocks for a container, with kind-specific attributes.
+  /// @see RichDocument::Create() for validation of the complete tree.
+  explicit Block(BlockData data);
+
+  /// @return Borrowed data. Retain this block or a copy sharing its storage while using the reference.
+  const BlockData& Data() const noexcept;
+
+  /// Compares text, formatting, attributes, and children by value.
+  bool operator==(const Block& other) const;
+
+private:
+  struct Storage;
+  std::shared_ptr<const Storage> storage_;
+  std::uint64_t id_ = 0;
+  friend struct detail::DocumentAccess;
+};
+
+/// @brief Construction data for a single document block.
+///
+/// Set fields appropriate to kind and leave the rest at their defaults. RichDocument::Create() checks the
+/// combination when it validates the tree.
+struct BlockData {
+  /// Structural role that determines which fields can be set.
+  BlockKind kind = BlockKind::Paragraph;
+  /// UTF-8 text with LF line breaks and no embedded NUL. Headings occupy one logical line.
+  /// Leave empty for containers and atomic blocks.
+  std::string text;
+  /// Nonoverlapping ranges sorted by starting offset. Combine marks in one range when they apply together.
+  /// Available for paragraphs and headings.
+  std::vector<MarkRange> marks;
+  /// Nonoverlapping link ranges sorted by starting offset. A link may cross mark boundaries.
+  /// Available for paragraphs and headings.
+  std::vector<LinkRange> links;
+  /// Nonempty child sequence for containers. Lists contain list items, tables contain rows, and rows contain cells.
+  /// Each table cell contains exactly one paragraph.
+  std::vector<Block> children;
+  /// Level from 1 through 6 for a heading. Leave at zero for other blocks.
+  unsigned heading_level = 0;
+  /// True for a numbered list and false for a bulleted list.
+  bool ordered = false;
+  /// First ordinal of an ordered list. Zero is valid. Leave at one for unordered lists and other blocks.
+  unsigned list_start = 1;
+  /// Whether a list is tight in formats that distinguish tight and loose lists.
+  bool tight = true;
+  /// Single-line UTF-8 metadata for a code block, such as a language name. An empty string omits the info string.
+  std::string fence_info;
+  /// Whether the first row is a header. Available on Table blocks.
+  bool table_has_header = false;
+  /// Required for Image blocks. Its bytes are provided separately by the application.
+  std::optional<ImageBlockData> image;
+  /// Required for Custom blocks. A custom block cannot have child blocks or inline ranges.
+  std::optional<CustomBlockData> custom;
+  bool operator==(const BlockData&) const = default;
+};
+
+/// @brief Validated, immutable snapshot of document content.
+///
+/// Copies retain shared storage. A saved copy remains valid after the editor replaces its document or unmounts.
+/// Selection, pending typing marks, IME composition, and undo history belong to the editing session.
+/// @code{.cpp}
+/// const auto document = RichDocument::Create({
+///     Block(BlockData{.text = "A🙂", .marks = {{{1, 3}, Mark::Bold}}}),
+/// });
+/// const auto& paragraph = document.Blocks().front().Data();
+/// @endcode
+class RichDocument {
+public:
+  /// Creates a document containing one empty paragraph.
+  RichDocument();
+
+  /// @brief Validates a block tree and builds a snapshot with fresh internal block identities.
+  /// Adjacent mark ranges with identical styles are merged. An empty root becomes one empty paragraph.
+  /// @param blocks Top-level blocks in document order. A root-to-leaf path may contain up to 128 blocks.
+  /// Tables must be top-level, with at least one row and column and at most 4096 cells per table.
+  /// @return A snapshot suitable for editing or conversion.
+  /// @throws std::invalid_argument If nesting, attributes, UTF-8, or range boundaries are invalid.
+  static RichDocument Create(std::vector<Block> blocks);
+
+  /// @return A borrowed span of the top-level blocks in document order. Retain a snapshot sharing this storage
+  /// while using the span, or copy individual Block values to retain them independently.
+  std::span<const Block> Blocks() const noexcept;
+
+  /// Compares document content, including structure, inline formatting, and metadata.
+  bool operator==(const RichDocument& other) const;
+
+private:
+  explicit RichDocument(std::shared_ptr<const detail::DocumentStorage> storage);
+  std::shared_ptr<const detail::DocumentStorage> storage_;
+  friend struct detail::DocumentAccess;
+};
+
+} // namespace huxerui::richeditor

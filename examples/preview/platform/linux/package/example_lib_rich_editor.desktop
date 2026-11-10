@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Lib-RichEditor Preview
+Exec=example_lib_rich_editor
+Icon=example_lib_rich_editor
+Categories=Utility;
+Terminal=false

@@ -1,0 +1,11 @@
+add_executable(richeditor_core_tests core.cpp)
+target_link_libraries(richeditor_core_tests PRIVATE HuxerUI::RichEditor)
+add_test(NAME richeditor.core COMMAND richeditor_core_tests)
+
+if (TARGET HuxerUI::testing)
+    add_executable(richeditor_ui_tests ui.cpp)
+    target_link_libraries(richeditor_ui_tests PRIVATE HuxerUI::RichEditor HuxerUI::testing)
+    add_test(NAME richeditor.ui COMMAND richeditor_ui_tests)
+else ()
+    message(STATUS "Lib-RichEditor mounted tests require HuxerUI::testing")
+endif ()
