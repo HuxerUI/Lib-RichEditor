@@ -4,6 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include <huxerui/clipboard.h>
 #include <huxerui/gesture.h>
 #include <huxerui/lifecycle.h>
 #include <huxerui/paint.h>
@@ -16,10 +17,13 @@
 #include "editor_layout.h"
 #include "editor_session.h"
 #include "editor_view_internal.h"
+#include "inline_presentation.h"
 
 namespace huxerui::richeditor {
 namespace detail {
 namespace {
+
+constexpr std::uint64_t inline_semantic_id = std::uint64_t{1} << 63;
 
 enum class WordUnit { Space, Word, Single };
 
@@ -115,7 +119,7 @@ public:
       return {TextInputResultCode::Rejected, id};
     }
     const auto& document = editor_->VisibleDocument();
-    const auto total = DocumentAccess::Get(document).length;
+    const auto total = DocumentAccess::Get(document).index.Length();
 #if defined(__EMSCRIPTEN__)
     // The Web input element synchronizes its complete value using absolute offsets.
     if (start == 0 && length == 0) {
@@ -192,11 +196,77 @@ public:
     const auto index = LeafIndex(document, caret.offset);
     const auto& row = layout_.Rows()[index];
     if (const auto* bounds = row.AtomicBounds(); !extend && bounds && bounds->Contains(ContentPoint(point))) {
-      const auto start = DocumentAccess::Get(document).leaves[index].start;
+      const auto start = DocumentAccess::Get(document).index.At(index).start;
       editor_->Select({start, start + 1});
       return;
     }
     SetCaret(caret, extend);
+  }
+
+  std::optional<TextOffset> InlineAt(Point point) const {
+    const auto& document = editor_->VisibleDocument();
+    const auto ordinal = LeafIndex(document, Hit(point).offset);
+    const auto& row = layout_.Rows()[ordinal];
+    const auto content = ContentPoint(point);
+    if (row.cell && !layout_.VisibleCell(row).Contains(content)) {
+      return std::nullopt;
+    }
+    const auto origin = layout_.Origin(row);
+    const auto found = std::ranges::find_if(row.inline_objects, [&](const EditorLayout::InlineBox& box) {
+      return AtOrigin(box.bounds, origin).Contains(content);
+    });
+    if (found == row.inline_objects.end()) {
+      return std::nullopt;
+    }
+    return DocumentAccess::Get(document).index.At(ordinal).start + found->offset;
+  }
+
+  bool CanPerformTextEditingAction(TextEditingAction action, PlatformClipboard* clipboard) const override {
+    if (!Current()) {
+      return false;
+    }
+    const auto range = editor_->SelectionOffsets().Range();
+    if (action == TextEditingAction::SelectAll) {
+      return editor_->CommandStatus(SelectAll{}).enabled;
+    }
+    if (!clipboard) {
+      return false;
+    }
+    if (action == TextEditingAction::Copy) {
+      return !range.IsCollapsed();
+    }
+    if (!CanEditTextRange(editor_->VisibleDocument(), range)) {
+      return false;
+    }
+    return action == TextEditingAction::Paste || !range.IsCollapsed();
+  }
+
+  bool PerformTextEditingAction(TextEditingAction action, PlatformClipboard* clipboard) override {
+    if (!CanPerformTextEditingAction(action, clipboard)) {
+      return false;
+    }
+    if (action == TextEditingAction::SelectAll) {
+      return editor_->Execute(SelectAll{});
+    }
+    const auto selected = editor_->SelectionOffsets().Range();
+    std::string text;
+    if (action == TextEditingAction::Paste) {
+      auto source = clipboard->ReadText();
+      if (!source) {
+        return false;
+      }
+      text = std::move(*source);
+    } else {
+      if (!clipboard->WriteText(PlainTextSlice(editor_->VisibleDocument(), selected))) {
+        return false;
+      }
+      if (action == TextEditingAction::Copy) {
+        return true;
+      }
+    }
+    editor_->FinishComposition();
+    const TextInputCommand command{.kind = TextInputCommandKind::CommitText, .target = selected, .text = std::move(text)};
+    return editor_->Apply(std::span(&command, 1));
   }
 
   bool ClearSelection() override {
@@ -209,7 +279,8 @@ public:
       return false;
     }
     const auto hit = Hit(point);
-    const auto range = WordAt(hit.offset);
+    const auto object = InlineAt(point);
+    const auto range = object ? TextRange{*object, *object + 1} : WordAt(hit.offset);
     editor_->Select({range.start, range.end, hit.affinity});
     return true;
   }
@@ -319,12 +390,12 @@ TextOffset EditorClient::Adjacent(TextOffset offset, bool forward) const {
   const auto& document = editor_->VisibleDocument();
   const auto index = LeafIndex(document, offset);
   const auto& storage = DocumentAccess::Get(document);
-  const auto& leaf = storage.leaves[index];
+  const auto& leaf = storage.index.At(index);
   const auto local = offset - leaf.start;
   const auto& row = layout_.Rows()[index];
   if (forward) {
     return local == DocumentAccess::Body(leaf.block).Length()
-        ? std::min(storage.length, offset + 1) : leaf.start + row.AdjacentCaretOffset(local, true);
+        ? std::min(storage.index.Length(), offset + 1) : leaf.start + row.AdjacentCaretOffset(local, true);
   }
   return local == 0 ? std::max<TextOffset>(0, offset - 1) : leaf.start + row.AdjacentCaretOffset(local, false);
 }
@@ -332,7 +403,7 @@ TextOffset EditorClient::Adjacent(TextOffset offset, bool forward) const {
 TextRange EditorClient::WordAt(TextOffset offset) const {
   const auto& document = editor_->VisibleDocument();
   const auto index = LeafIndex(document, offset);
-  const auto& leaf = DocumentAccess::Get(document).leaves[index];
+  const auto& leaf = DocumentAccess::Get(document).index.At(index);
   const auto& body = DocumentAccess::Body(leaf.block);
   const auto& row = layout_.Rows()[index];
   if (body.Length() == 0) {
@@ -363,10 +434,10 @@ TextRange EditorClient::WordAt(TextOffset offset) const {
 
 TextPosition EditorClient::Vertical(TextPosition position, bool down, bool page) {
   const auto& document = editor_->VisibleDocument();
-  const auto& leaves = DocumentAccess::Get(document).leaves;
+  const auto& leaves = DocumentAccess::Get(document).index;
   const auto& rows = layout_.Rows();
   auto index = LeafIndex(document, position.offset);
-  auto line = rows[index].LineIndex({position.offset - leaves[index].start, position.affinity});
+  auto line = rows[index].LineIndex({position.offset - leaves.At(index).start, position.affinity});
   preferred_x_ = preferred_x_.value_or(layout_.Caret(document, position).x);
   if (page) {
     const auto caret = layout_.Caret(document, position);
@@ -380,11 +451,11 @@ TextPosition EditorClient::Vertical(TextPosition position, bool down, bool page)
   } else {
     const auto next = layout_.AdjacentRow(index, down, *preferred_x_);
     if (next == index) {
-      return rows[index].image ? TextPosition{leaves[index].start + down} : position;
+      return rows[index].image ? TextPosition{leaves.At(index).start + down} : position;
     }
     index = next;
     if (rows[index].image) {
-      return {leaves[index].start + !down};
+      return {leaves.At(index).start + !down};
     }
     line = down ? 0 : rows[index].layout.Lines().size() - 1;
   }
@@ -448,6 +519,9 @@ TextInputKeyResult EditorClient::HandleTextKey(const KeyEvent& event) {
       }
       break;
     case Key::Enter:
+      if (!mods.shift && editor_->SelectedInlineObject()) {
+        return unhandled;
+      }
       if (!mods.shift && (editor_->Execute(ExitTable{}) || editor_->ExitCode())) {
         return handled;
       }
@@ -477,7 +551,7 @@ TextInputKeyResult EditorClient::HandleTextKey(const KeyEvent& event) {
   }
   const auto& document = editor_->VisibleDocument();
   const auto index = LeafIndex(document, caret.offset);
-  const auto& leaf = DocumentAccess::Get(document).leaves[index];
+  const auto& leaf = DocumentAccess::Get(document).index.At(index);
   const auto& row = layout_.Rows()[index];
   switch (event.key) {
   case Key::Tab: {
@@ -497,7 +571,7 @@ TextInputKeyResult EditorClient::HandleTextKey(const KeyEvent& event) {
     }
     const auto next = mods.shift ? index - 1 : index + 1;
     preferred_x_.reset();
-    SetCaret({DocumentAccess::Get(document).leaves[next].start}, false);
+    SetCaret({DocumentAccess::Get(document).index.At(next).start}, false);
     return handled;
   }
   case Key::ArrowLeft:
@@ -526,7 +600,7 @@ TextInputKeyResult EditorClient::HandleTextKey(const KeyEvent& event) {
     const bool end = event.key == Key::End;
     const auto line = row.LineRange(row.LineIndex({caret.offset - leaf.start, caret.affinity}));
     caret = mods.meta || mods.control
-        ? TextPosition{end ? DocumentAccess::Get(document).length : 0}
+        ? TextPosition{end ? DocumentAccess::Get(document).index.Length() : 0}
         : TextPosition{leaf.start + (end ? line.end : line.start),
                        end ? TextAffinity::Upstream : TextAffinity::Downstream};
     break;
@@ -534,7 +608,7 @@ TextInputKeyResult EditorClient::HandleTextKey(const KeyEvent& event) {
   case Key::ArrowUp:
   case Key::ArrowDown:
     if (mods.meta) {
-      caret = {event.key == Key::ArrowDown ? DocumentAccess::Get(document).length : 0};
+      caret = {event.key == Key::ArrowDown ? DocumentAccess::Get(document).index.Length() : 0};
     } else {
       caret = Vertical(caret, event.key == Key::ArrowDown, false);
     }
@@ -593,12 +667,30 @@ public:
     }
     auto& layout = client_->Layout();
     const bool appearance_changed = layout.Theme() != viewport_->theme || layout.Style() != viewport_->style;
+    const auto inline_revision = viewport_->inline_revision.Get();
+    const auto image_revision = viewport_->image_revision.Get();
+    const auto previous_scroll = viewport_->scroll.Metrics().offset;
+    std::optional<std::pair<std::size_t, float>> anchor;
+    if (!edited && !follow_caret_ && layout.IsCurrent(editor_->VisibleDocument()) &&
+        (observed_inline_revision_ != inline_revision || observed_image_revision_ != image_revision)) {
+      const auto& rows = layout.Rows();
+      const auto row = std::ranges::lower_bound(rows, previous_scroll, {}, &EditorLayout::Row::Bottom);
+      if (row != rows.end()) {
+        anchor = {static_cast<std::size_t>(row - rows.begin()), row->Top()};
+      }
+    }
+    observed_inline_revision_ = inline_revision;
+    observed_image_revision_ = image_revision;
     const bool laid_out = layout.Prepare(
         measurer, editor_->VisibleDocument(), width, viewport_->theme, viewport_->style, viewport_->locale,
-        viewport_->images, viewport_->image_revision.Get(), resize_ && resize_->preview.width != resize_->original.width
-            ? std::optional(resize_->preview) : std::nullopt, viewport_->extensions);
+        viewport_->images, image_revision, resize_ && resize_->preview.width != resize_->original.width
+            ? std::optional(resize_->preview) : std::nullopt, viewport_->extensions, viewport_->inline_graphics,
+        inline_revision, viewport_->document_directory);
     if (laid_out) {
       viewport_->height = layout.Height();
+      if (anchor && viewport_->scroll.ScrollTo(previous_scroll + layout.Rows()[anchor->first].Top() - anchor->second)) {
+        observed_scroll_.offset = viewport_->scroll.Metrics().offset;
+      }
       touch_table_.reset();
       InvalidateSemantics();
     }
@@ -627,6 +719,12 @@ public:
   }
 
   PointerResult OnPointer(ViewNode& node, const PointerEvent& event) override;
+  bool OnKey(ViewNode&, const KeyEvent& event) override {
+    const auto modifiers = event.modifiers;
+    return event.type == KeyEventType::Down && event.key == Key::Enter &&
+        (modifiers.control || modifiers.meta) && !modifiers.shift && !modifiers.alt &&
+        editor_->SelectedInlineObject() && ActivateInline(editor_->SelectionOffsets().Range().start);
+  }
   FrameResult OnFrame(ViewNode& node, const FrameInfo& frame) override;
 
   void OnFocusChanged(ViewNode&, bool, bool) override {
@@ -658,6 +756,7 @@ private:
   void PaintDecorations(PaintContext& paint, const EditorLayout::Row& row, std::size_t index, bool behind) const;
   std::optional<std::size_t> CodeHeaderAt(Point point) const;
   bool OpenCodeLanguage(std::size_t index);
+  bool ActivateInline(TextOffset offset);
   PointerResult UpdateImageResize(const PointerEvent& event);
   ViewNode& node_;
   std::shared_ptr<EditorClient> client_;
@@ -667,6 +766,8 @@ private:
   std::uint64_t observed_revision_ = 0;
   std::shared_ptr<const DecorationAnalysis> decoration_analysis_;
   std::uint64_t observed_decoration_revision_ = 0;
+  std::uint64_t observed_inline_revision_ = 0;
+  std::uint64_t observed_image_revision_ = 0;
   ScrollMetrics observed_scroll_;
   bool focused_ = false;
   bool follow_caret_ = true;
@@ -817,7 +918,7 @@ bool EditorExtension::OpenCodeLanguage(std::size_t index) {
   if (bounds.IsEmpty()) {
     return false;
   }
-  const auto& block = DocumentAccess::Get(editor_->VisibleDocument()).leaves[index].block;
+  const auto& block = DocumentAccess::Get(editor_->VisibleDocument()).index.At(index).block;
   const auto id = DocumentAccess::Id(block);
   const auto generation = editor_->Generation();
   const auto presentation = viewport_->extensions.code_blocks;
@@ -882,6 +983,16 @@ bool EditorExtension::OpenCodeLanguage(std::size_t index) {
   return true;
 }
 
+bool EditorExtension::ActivateInline(TextOffset offset) {
+  const auto object = editor_->InlineObjectAt(offset);
+  if (!object) {
+    return false;
+  }
+  editor_->Select({offset, offset + 1});
+  EmitEvent<RichEditorEvents::InlineObjectActivated>(*object);
+  return true;
+}
+
 NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const PointerEvent& event) {
   if (resize_) {
     return UpdateImageResize(event);
@@ -899,7 +1010,7 @@ NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const Po
       const auto corner = ResizeCorner(box.bounds);
       const Rect hit{corner.x - 18.0F, corner.y - 16.0F, 28.0F, 28.0F};
       if (box.asset.HasValue() && hit.Contains(client_->ContentPoint(event.position))) {
-        const auto& leaf = DocumentAccess::Get(editor_->VisibleDocument()).leaves[*selected];
+        const auto& leaf = DocumentAccess::Get(editor_->VisibleDocument()).index.At(*selected);
         resize_ = ImageResize{event.pointer_id, editor_->Revision(), event.position,
                               {box.bounds.width, box.bounds.height},
                               {DocumentAccess::Id(leaf.block), box.bounds.width}};
@@ -957,6 +1068,11 @@ NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const Po
   }
 
   if (primary_down && client_->HasGeometry()) {
+    if (event.modifiers.meta || event.modifiers.control) {
+      if (const auto object = client_->InlineAt(event.position); object && ActivateInline(*object)) {
+        return PointerResult::Handled;
+      }
+    }
     if (const auto header = CodeHeaderAt(event.position); header && OpenCodeLanguage(*header)) {
       return PointerResult::Handled;
     }
@@ -1065,7 +1181,7 @@ void EditorExtension::PaintDecorations(PaintContext& paint, const EditorLayout::
 
   const auto& document = editor_->VisibleDocument();
   const bool matches_document = DocumentAccess::Same(analysis->document, document);
-  const auto& block = DocumentAccess::Get(document).leaves[index].block;
+  const auto& block = DocumentAccess::Get(document).index.At(index).block;
   const auto id = DocumentAccess::Id(block);
   for (const auto& layer : analysis->layers) {
     const auto entry = layer->blocks.find(id);
@@ -1179,6 +1295,19 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
     }
     PaintDecorations(paint, row, index, true);
     paint.DrawText(origin, row.layout);
+    for (const auto& object : row.inline_objects) {
+      const auto rect = AtOrigin(object.bounds, origin);
+      if (rect.IsEmpty()) {
+        continue;
+      }
+      if (object.graphic) {
+        std::visit([&](const auto& asset) { paint.DrawImage(asset, rect); }, *object.graphic);
+      } else if (object.fallback) {
+        paint.PushClip(rect);
+        paint.DrawText({rect.x, rect.y}, *object.fallback);
+        paint.PopClip();
+      }
+    }
     PaintDecorations(paint, row, index, false);
     if (row.cell) {
       paint.PopClip();
@@ -1230,23 +1359,36 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
 void EditorExtension::BuildSemantics(SemanticBuilder& builder) const {
   const auto& document = editor_->VisibleDocument();
   builder.SetOwner({.role = SemanticRole::TextField, .label = "Document",
-                    .value = TextSlice(document, {0, DocumentAccess::Get(document).length}),
+                    .value = TextSlice(document, {0, DocumentAccess::Get(document).index.Length()}),
                     .text_selection = editor_->SelectionOffsets().Range()});
   builder.AddAction(0, SemanticActionKind::SetText);
   builder.AddAction(0, SemanticActionKind::SetSelection);
   if (client_->HasGeometry()) {
-    const auto& leaves = DocumentAccess::Get(document).leaves;
+    const auto& leaves = DocumentAccess::Get(document).index;
     const auto& rows = client_->Layout().Rows();
-    for (std::size_t i = 0; i < leaves.size(); ++i) {
+    for (std::size_t i = 0; i < leaves.LeafCount(); ++i) {
+      const auto& row = rows[i];
+      for (const auto& object : row.inline_objects) {
+        auto bounds = AtOrigin(object.bounds, client_->Layout().Origin(row));
+        if (row.cell) {
+          bounds = bounds.Intersection(client_->Layout().VisibleCell(row));
+        }
+        if (!bounds.IsEmpty()) {
+          const auto id = inline_semantic_id | object.id;
+          builder.AddChild(id, client_->ToNode(bounds),
+                           {.role = SemanticRole::Button, .label = object.label}, true);
+          builder.AddAction(id, SemanticActionKind::Activate);
+        }
+      }
       if (rows[i].image) {
         const auto& image = *rows[i].image;
-        builder.AddChild(DocumentAccess::Id(leaves[i].block), client_->ToNode(image.bounds),
+        builder.AddChild(DocumentAccess::Id(leaves.At(i).block), client_->ToNode(image.bounds),
                          {.role = SemanticRole::Image, .label = image.label}, true);
       } else if (const auto& custom = rows[i].custom) {
-        builder.AddChild(DocumentAccess::Id(leaves[i].block), client_->ToNode(custom->bounds),
+        builder.AddChild(DocumentAccess::Id(leaves.At(i).block), client_->ToNode(custom->bounds),
                          {.role = SemanticRole::Text, .label = custom->label}, true);
       } else if (const auto& header = rows[i].code_header) {
-        const auto id = DocumentAccess::Id(leaves[i].block);
+        const auto id = DocumentAccess::Id(leaves.At(i).block);
         builder.AddChild(id, client_->ToNode(header->bounds),
                          {.role = SemanticRole::Button, .label = "Code language, " + header->label}, true);
         builder.AddAction(id, SemanticActionKind::Activate);
@@ -1258,9 +1400,20 @@ void EditorExtension::BuildSemantics(SemanticBuilder& builder) const {
 bool EditorExtension::OnSemanticAction(std::uint64_t local_id, const SemanticAction& action) {
   if (local_id != 0) {
     if (action.kind == SemanticActionKind::Activate && client_->HasGeometry()) {
-      const auto& indexes = DocumentAccess::Get(editor_->VisibleDocument()).indexes;
-      if (const auto found = indexes.find(local_id); found != indexes.end()) {
-        return OpenCodeLanguage(found->second);
+      const auto& index = DocumentAccess::Get(editor_->VisibleDocument()).index;
+      if (local_id & inline_semantic_id) {
+        const auto& rows = client_->Layout().Rows();
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+          const auto& objects = rows[i].inline_objects;
+          const auto found = std::ranges::find(objects, local_id & ~inline_semantic_id, &EditorLayout::InlineBox::id);
+          if (found != objects.end()) {
+            return ActivateInline(index.At(i).start + found->offset);
+          }
+        }
+        return false;
+      }
+      if (const auto found = index.IndexOf(local_id)) {
+        return OpenCodeLanguage(*found);
       }
     }
     return false;
@@ -1273,7 +1426,7 @@ bool EditorExtension::OnSemanticAction(std::uint64_t local_id, const SemanticAct
   if (action.kind == SemanticActionKind::SetText) {
     if (const auto* text = std::get_if<std::string>(&action.value)) {
       editor_->FinishComposition();
-      const auto length = DocumentAccess::Get(editor_->VisibleDocument()).length;
+      const auto length = DocumentAccess::Get(editor_->VisibleDocument()).index.Length();
       const TextInputCommand command{.kind = TextInputCommandKind::CommitText, .target = TextRange{0, length},
                                      .text = *text};
       return editor_->Apply(std::span(&command, 1));
@@ -1288,15 +1441,18 @@ View EditorContent(std::shared_ptr<EditorSession> editor, std::shared_ptr<Editor
   (void)editor->Observe();
   viewport->theme = UseTheme();
   viewport->style = std::move(options.style);
+  viewport->document_directory = options.document_directory;
   viewport->extensions = {.image_resolver = options.extensions.image_resolver,
                           .code_blocks = options.extensions.code_blocks,
-                          .custom_blocks = options.extensions.custom_blocks};
+                          .custom_blocks = options.extensions.custom_blocks,
+                          .inline_objects = options.extensions.inline_objects};
   viewport->locale = UseEnvironment<Locale>().LanguageTag();
   viewport->code_language_popup = UsePopup();
   const auto code_language_anchor = UseViewHandle();
   viewport->code_language_anchor = code_language_anchor;
   const auto tasks = UseTaskScope();
   ScheduleDecorations(editor, viewport, tasks, options.extensions.decorations);
+  ScheduleInlineObjects(editor, viewport, tasks, options.document_directory);
   const auto generation = editor->Generation();
   auto resolver = viewport->extensions.image_resolver;
   const auto directory = resolver ? std::nullopt : options.document_directory;
@@ -1321,6 +1477,13 @@ View EditorContent(std::shared_ptr<EditorSession> editor, std::shared_ptr<Editor
         sources.push_back(image->source);
       }
     }
+    DocumentAccess::Get(editor->VisibleDocument()).index.VisitInlineBlocks([&](const Block& block) {
+      for (const auto& object : block.Data().inline_objects) {
+        if (object.data.type == inline_image_type && object.data.attachments.size() == 1) {
+          sources.push_back(object.data.attachments.front().source);
+        }
+      }
+    });
     std::ranges::sort(sources);
     sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
   }

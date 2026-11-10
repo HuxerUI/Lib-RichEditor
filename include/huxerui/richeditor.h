@@ -17,6 +17,7 @@
 #include <variant>
 
 #include <huxerui/file.h>
+#include <huxerui/event.h>
 #include <huxerui/richeditor/document.h>
 #include <huxerui/richeditor/extension.h>
 #include <huxerui/richeditor/style.h>
@@ -180,6 +181,46 @@ struct ReplaceCustomBlock {
   std::optional<CustomBlockData> expected{};
 };
 
+/// @brief Inserts one inline object at the caret or replaces a selection within one paragraph or heading.
+///
+/// Inserts the replacement character and annotation as one undoable edit, then places the caret after it.
+/// Table cell paragraphs are eligible. The command is unavailable during IME preedit.
+struct InsertInlineObject {
+  InlineObjectData object; ///< Persistent object data to validate and insert.
+};
+
+/// @brief Updates a captured inline object, preserving its identity and the current selection.
+///
+/// The target must still resolve in this controller's document. The replacement must have the same type.
+/// This is one undoable edit and is unavailable during IME preedit.
+struct ReplaceInlineObject {
+  InlineObjectTarget target;   ///< Handle obtained from selection or activation.
+  InlineObjectData replacement; ///< New persistent value, which may use a different schema version.
+  /// If present, the update succeeds only when the object's current data matches this value.
+  std::optional<InlineObjectData> expected;
+};
+
+/// @brief Rich clipboard value containing a validated snapshot and its selection boundary information.
+///
+/// A fragment retains resource references. When copying between documents with different storage directories,
+/// the application must arrange for those references to resolve in the destination.
+struct DocumentFragment {
+  RichDocument content; ///< Selected structure, marks, links and inline objects.
+  /// True when the selection starts inside its first leaf. An eligible edge can merge with the target prefix.
+  bool leading_partial = false;
+  /// True when the selection ends inside its last leaf. An eligible edge can merge with the target suffix.
+  bool trailing_partial = false;
+};
+
+/// @brief Inserts a rich fragment at the caret or replaces a selection within one paragraph or heading.
+///
+/// A single paragraph or heading contributes its inline contents to the destination block. Other fragments
+/// require a top-level paragraph or heading as the destination. Paste assigns new identities to inserted
+/// objects and records one undo entry. The command is unavailable during IME preedit.
+struct InsertFragment {
+  DocumentFragment fragment; ///< Rich clipboard value to insert.
+};
+
 /// @brief Selects all document text across blocks.
 struct SelectAll {};
 
@@ -194,7 +235,8 @@ using EditorCommand = std::variant<ToggleMark, ClearFormatting, SetLink, SetBloc
                                    IndentList, OutdentList, SelectAll, Undo, Redo, InsertTable, InsertTableRow,
                                    InsertTableColumn, DeleteTableRow, DeleteTableColumn, ToggleTableHeader,
                                    DeleteTable, ExitTable, InsertImage, ReplaceImage, DeleteImage, ResizeImage,
-                                   SetListStart, InsertCustomBlock, ReplaceCustomBlock>;
+                                   SetListStart, InsertCustomBlock, ReplaceCustomBlock, InsertInlineObject,
+                                   ReplaceInlineObject, InsertFragment>;
 
 /// @brief Appearance and resource context for a mounted editor.
 struct RichEditorOptions {
@@ -206,6 +248,17 @@ struct RichEditorOptions {
   std::optional<File> document_directory;
   /// An explicit image resolver takes precedence over document_directory.
   RichEditorExtensions extensions;
+};
+
+/// @brief Typed events emitted by the mounted RichEditor view.
+struct RichEditorEvents {
+  /// @brief Requests the application-defined action for an explicitly activated inline object.
+  ///
+  /// The view selects the object before emitting this event. Control-click or Command-click, the
+  /// corresponding Enter shortcut on a selected object, and accessibility activation can emit it.
+  /// Subscribe with View::On(). The event argument is borrowed for the call. Copy it to retain the
+  /// data and target for an application dialog.
+  struct InlineObjectActivated : Event<void(const InlineObjectSelection&)> {};
 };
 
 /// @brief State of a format for the current selection or caret.
@@ -274,6 +327,18 @@ public:
   /// @brief Reads the selected custom block for application commands, such as editing its source.
   /// Returns an empty value unless exactly one custom block is selected. Calls in composition observe selection.
   std::optional<CustomBlockData> SelectedCustomBlock() const;
+
+  /// @brief Reads the object whose replacement character is exactly covered by the current selection.
+  /// Calls in composition observe selection and editing changes.
+  /// @return A target and a copy of its data, or an empty value for any other selection or during IME preedit.
+  std::optional<InlineObjectSelection> SelectedInlineObject() const;
+
+  /// @brief Copies selected structure, inline objects and formatting for an application clipboard bridge.
+  ///
+  /// Selecting a complete table keeps its grid. A partial table selection contributes selected cell text as
+  /// paragraphs. Calls in composition observe selection and editing changes.
+  /// @return A rich fragment, or an empty value for a collapsed selection or during IME preedit.
+  std::optional<DocumentFragment> SelectedFragment() const;
 
   /// @brief Applies a command to the retained selection or caret.
   /// A formatting command records changes across all affected blocks as one undo entry. An active IME composition

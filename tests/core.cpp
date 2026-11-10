@@ -61,6 +61,36 @@ void RoundTrip() {
   Check(encoded.text && markdown.Import(*encoded.text).document == imported.document, "Markdown semantic round trip");
 }
 
+void InlineObjectCodecs() {
+  const auto& codec = MarkdownCodec({.inline_math = true, .inline_images = true});
+  const auto imported = codec.Import("A🙂 $x^2$ 中文 ![map](attachments/map.png) and [**$y$**](https://example.org).");
+  Check(imported.document.has_value() && imported.issues.empty(), "Import math and images embedded in text");
+  const auto& paragraph = imported.document->Blocks().front().Data();
+  Check(paragraph.inline_objects.size() == 3 && paragraph.inline_objects[0].offset == 4 &&
+            paragraph.inline_objects[0].data == LatexInline("x^2") &&
+            ReadInlineImage(paragraph.inline_objects[1].data)->source == "attachments/map.png",
+        "Inline math and images use UTF-16 offsets and structured attachment references");
+  const auto json = JsonCodec().Export(*imported.document);
+  Check(json.text && JsonCodec().Import(*json.text).document == imported.document, "JSON v1 retains inline objects");
+  const auto markdown = codec.Export(*imported.document);
+  Check(markdown.text && codec.Import(*markdown.text).document == imported.document,
+        "Strict Markdown round trips inline math, images, marks and links");
+
+  const InlineObjectData unknown{"folio.mention", 2, R"({"id":"42"})", "Alice", {{"avatar", "attachments/a.png"}}};
+  const auto custom = RichDocument::Create({Block(BlockData{.text = "Hi \xef\xbf\xbc" "!",
+      .marks = {{{3, 4}, Mark::Bold}}, .inline_objects = {{3, unknown}}})});
+  const auto saved = JsonCodec().Export(custom);
+  Check(saved.text && JsonCodec().Import(*saved.text).document == custom, "Unknown objects keep payload and attachments");
+  const auto strict = codec.Export(custom);
+  const auto lossy = codec.Export(custom, LossPolicy::AllowLoss);
+  Check(!strict.text && strict.issues.front().range == TextRange{3, 4} &&
+            lossy.text && lossy.text->find("**Alice**") != std::string::npos,
+        "Lossy Markdown replaces an object with styled fallback text and reports its original range");
+  Check(!JsonCodec().Import(R"({"version":1,"blocks":[{"type":"paragraph","text":"A","inline_objects":[
+      {"offset":0,"type":"folio.mention","version":1,"payload":""}]}]})").document,
+        "An inline object must reference a replacement character");
+}
+
 void ValidateLoss() {
   const auto& markdown = MarkdownCodec();
   const auto& json = JsonCodec();
@@ -293,6 +323,7 @@ void CustomBlockCodecs() {
 int main() {
   try {
     RoundTrip();
+    InlineObjectCodecs();
     ValidateLoss();
     ValidateJsonAndBoundaries();
     DefaultHighlighting();

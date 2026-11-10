@@ -42,20 +42,20 @@ Task<void> AnalyzeDecorations(std::shared_ptr<DecorationAnalysis> analysis,
       request.document = document;
     }
     if (layer.analyze_all) {
-      for (const auto& leaf : storage.leaves) {
-        if (IsTextBlock(leaf.block.Data().kind)) {
-          append(leaf);
+      for (auto leaf = storage.index.Leaves(); leaf; leaf.Next()) {
+        if (IsTextBlock(leaf->block.Data().kind)) {
+          append(*leaf);
         }
       }
     } else {
       std::vector<std::size_t> indexes;
       indexes.reserve(layer.pending.size());
       for (const auto id : layer.pending) {
-        indexes.push_back(storage.indexes.at(id));
+        indexes.push_back(storage.index.IndexOf(id).value());
       }
       std::ranges::sort(indexes);
       for (const auto index : indexes) {
-        append(storage.leaves[index]);
+        append(storage.index.At(index));
       }
     }
     layer.analyze_all = false;
@@ -81,7 +81,7 @@ Task<void> AnalyzeDecorations(std::shared_ptr<DecorationAnalysis> analysis,
       const auto& current = DocumentAccess::Get(analysis->document);
       for (const auto& block : blocks) {
         const auto id = DocumentAccess::Id(block);
-        if (const auto* leaf = FindTextLeaf(current, id); leaf && leaf->block == block) {
+        if (const auto* leaf = FindTextBlock(current.index, id); leaf && *leaf == block) {
           layer.blocks.try_emplace(id, DecorationAnalysis::Entry{block, {}});
           layer.pending.erase(id);
         }
@@ -118,14 +118,14 @@ void CancelRequest(DecorationAnalysis::Layer& layer) {
   }
 }
 
-bool UpdateBlockCache(const DocumentStorage& document, DecorationAnalysis::Layer& layer,
+bool UpdateBlockCache(const DocumentIndex& index, DecorationAnalysis::Layer& layer,
                       std::span<const BlockId> changed_blocks) {
   bool repaint = false;
   for (const auto id : changed_blocks) {
-    const auto* leaf = FindTextLeaf(document, id);
+    const auto* leaf = FindTextBlock(index, id);
     const auto entry = layer.blocks.find(id);
     if (entry != layer.blocks.end()) {
-      if (leaf && leaf->block == entry->second.block) {
+      if (leaf && *leaf == entry->second.block) {
         continue;
       }
       repaint |= !entry->second.ranges.empty();
@@ -226,7 +226,7 @@ void ScheduleDecorations(const std::shared_ptr<EditorSession>& editor,
         layer->pending.clear();
         layer->analyze_all = true;
       } else if (document_changed && !layer->analyze_all) {
-        repaint |= UpdateBlockCache(DocumentAccess::Get(document), *layer, changed_blocks);
+        repaint |= UpdateBlockCache(DocumentAccess::Get(document).index, *layer, changed_blocks);
       }
       if (!layer->request && (layer->analyze_all || !layer->pending.empty())) {
         layer->request = tasks.Launch(AnalyzeDecorations(analysis, viewport, layer));

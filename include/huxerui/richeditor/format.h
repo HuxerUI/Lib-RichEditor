@@ -3,8 +3,8 @@
 /// @file
 /// @brief Synchronous conversion between UTF-8 formats and rich-text document snapshots.
 ///
-/// Include <huxerui/richeditor/format.h> and link HuxerUI::RichEditor. Use JsonCodec() for full-fidelity storage
-/// and MarkdownCodec() for CommonMark interchange. Applications can implement DocumentCodec for their own formats.
+/// Include <huxerui/richeditor/format.h> and link HuxerUI::RichEditor for JsonCodec() and MarkdownCodec().
+/// Applications can implement DocumentCodec for their own formats.
 
 #include <cstddef>
 #include <optional>
@@ -80,36 +80,40 @@ public:
 
 /// @brief Returns the shared Lib-RichEditor JSON codec.
 ///
-/// Version 1 preserves all supported block types, inline styles, links, and metadata under either loss policy.
+/// Version 1 preserves all supported blocks, inline styles, links, object payloads and attachment references
+/// under either loss policy. Applications store attachment bytes separately.
 /// Import reports "json.version" for an unsupported version and "json.invalid" for malformed input or invalid
 /// document content.
 /// @return A reference to the built-in codec with process lifetime.
 const DocumentCodec& JsonCodec();
 
-/// @brief Returns the shared CommonMark codec with GFM strikethrough and top-level table support.
+/// @brief Controls opt-in Markdown syntax without changing the default CommonMark codec.
+struct MarkdownOptions {
+  /// Recognize standalone top-level display math and fenced code with the exact info string "math" as LaTeX.
+  /// Display spans use the parser's whitespace rules. Fences preserve multiline source, including line breaks.
+  /// Nested display math reports a conversion loss. Export verifies that the source re-imports faithfully.
+  bool display_math = false;
+  /// Import inline dollar-delimited math as editable LaTeX objects and export representable objects in that form.
+  bool inline_math = false;
+  /// Import and export inline images. A standalone image in a top-level paragraph remains an image block.
+  /// Markdown image syntax preserves the reference, alternative text and title.
+  bool inline_images = false;
+};
+
+/// @brief Returns a shared CommonMark codec with GFM strikethrough and top-level table support.
 ///
 /// Import maps paragraphs, headings, lists, quotes, code, emphasis, and links to editable content. Soft breaks
 /// become spaces in paragraphs and hard breaks become LF. Raw HTML is stored as literal text. Tables follow the
 /// parsed GFM grid, which pads missing cells and ignores cells beyond the header width. Explicit column alignment,
 /// nested tables and tasks report diagnostics. An image occupying its own top-level paragraph becomes an Image
-/// block with its reference, alternative text, and title. Other image placements report diagnostics. AllowLoss
-/// can return an approximation. Codecs preserve image references; the application resolves and stores their bytes.
+/// block with its reference, alternative text, and title. Other image placements require inline_images. Codecs
+/// preserve image references while the application resolves and stores their bytes.
 ///
 /// Export writes canonical Markdown and checks that re-import preserves the document. Strict withholds output
 /// when content or styling such as a missing table header, a cell line break, underline, highlight, or a
 /// preferred image width cannot be represented. AllowLoss returns Markdown with issues describing the losses.
-/// @return A reference to the built-in codec with process lifetime.
-const DocumentCodec& MarkdownCodec();
-
-/// @brief Controls opt-in Markdown syntax without changing the default CommonMark codec.
-struct MarkdownOptions {
-  /// Recognize standalone top-level display math and fenced code with the exact info string "math" as LaTeX.
-  /// Display spans use the parser's whitespace rules. Fences preserve multiline source, including line breaks.
-  /// Inline and nested math report a conversion loss. Export verifies that the source re-imports faithfully.
-  bool display_math = false;
-};
-
-/// @brief Returns the shared Markdown codec for the requested syntax options.
-const DocumentCodec& MarkdownCodec(MarkdownOptions options);
+/// @param options Opt-in syntax for import and export. Omitting this argument leaves all extensions disabled.
+/// @return A reference to the built-in codec for these options with process lifetime.
+const DocumentCodec& MarkdownCodec(MarkdownOptions options = {});
 
 } // namespace huxerui::richeditor

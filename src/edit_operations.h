@@ -13,8 +13,8 @@ struct EditChanges {
 
   /// Records leaves before a subtree is replaced or erased, including atomic blocks that may become text.
   void Touch(const Block& block);
-  /// Rebuilds the document and records any newly assigned text block IDs.
-  RichDocument Build(std::vector<Block> blocks);
+  /// Builds the next snapshot from the edited tree and child splices, recording newly assigned text leaf IDs.
+  RichDocument Build(const RichDocument& document, std::vector<Block> blocks, const ChildChanges& changes);
 };
 
 struct EditResult {
@@ -29,6 +29,21 @@ bool CanEditTextRange(const RichDocument& document, TextRange range);
 EditResult InsertParagraphAtAtomicBlock(const RichDocument& document, TextOffset caret, EditChanges& edit);
 EditResult ReplaceText(const RichDocument& document, TextRange range, std::string_view text,
                        std::optional<Mark> marks, bool hard_break, EditChanges& edit);
+/// Checks that both endpoints belong to one paragraph or heading. Offsets use the flattened UTF-16 text.
+bool CanInsertInlineObject(const RichDocument& document, TextRange range);
+/// Replaces a range allowed by CanInsertInlineObject with a new character and annotation.
+EditResult InsertInlineContent(const RichDocument& document, TextRange range, const InlineObjectData& object,
+                               std::optional<Mark> marks, EditChanges& edit);
+/// Replaces the data at index in the leaf's inline_objects array, preserving object identity and offset.
+RichDocument ReplaceInlineContent(const RichDocument& document, const Leaf& leaf, std::size_t index,
+                                  const InlineObjectData& object, EditChanges& edit);
+/// Copies a noncollapsed flattened UTF-16 range and records whether each edge slices a leaf.
+DocumentFragment CopyFragment(const RichDocument& document, TextRange range);
+/// Checks whether the fragment can be inserted at the range given the destination block and nesting.
+bool CanInsertFragment(const RichDocument& document, TextRange range, const DocumentFragment& fragment);
+/// Applies a fragment accepted by CanInsertFragment and returns the caret after the inserted content.
+EditResult PasteFragment(const RichDocument& document, TextRange range, const DocumentFragment& fragment,
+                         EditChanges& edit);
 Mark MarksAt(const RichDocument& document, TextOffset position);
 CommandState MarkStatus(const RichDocument& document, TextRange range, Mark mark, std::optional<Mark> pending);
 const LinkRange* LinkAt(const RichDocument& document, TextRange range);

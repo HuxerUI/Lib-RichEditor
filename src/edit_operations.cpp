@@ -14,45 +14,57 @@ void EditChanges::Touch(const Block& block) {
   }
 }
 
-RichDocument EditChanges::Build(std::vector<Block> blocks) {
-  return DocumentAccess::Build(std::move(blocks), last_id, false, &touched);
+RichDocument EditChanges::Build(const RichDocument& document, std::vector<Block> blocks, const ChildChanges& changes) {
+  return DocumentAccess::Build(std::move(blocks), last_id, &document, changes, &touched);
 }
 
 namespace {
 
 using Replacements = std::unordered_map<BlockId, std::vector<Block>>;
 
-std::vector<Block> Rewrite(std::span<const Block> blocks, const Replacements& changes, bool& changed) {
+std::vector<Block> Rewrite(std::span<const Block> blocks, const Replacements& changes, BlockId parent,
+                           ChildChanges& child_changes) {
   std::vector<Block> result;
-  for (const auto& block : blocks) {
-    const auto found = changes.find(DocumentAccess::Id(block));
+  result.reserve(blocks.size());
+  std::optional<ChildChange> changed;
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    const auto& block = blocks[i];
+    const auto id = DocumentAccess::Id(block);
+    const auto found = changes.find(id);
     if (found != changes.end()) {
       result.insert(result.end(), found->second.begin(), found->second.end());
-      changed = true;
     } else if (IsLeaf(block.Data().kind)) {
       result.push_back(block);
+      continue;
     } else {
-      bool child_changed = false;
-      auto children = Rewrite(block.Data().children, changes, child_changed);
-      changed |= child_changed;
+      auto children = Rewrite(block.Data().children, changes, id, child_changes);
+      if (!child_changes.contains(id)) {
+        result.push_back(block);
+        continue;
+      }
       if (!children.empty()) {
-        if (child_changed) {
-          auto data = block.Data();
-          data.children = std::move(children);
-          result.push_back(DocumentAccess::WithData(block, std::move(data)));
-        } else {
-          result.push_back(block);
-        }
+        auto data = block.Data();
+        data.children = std::move(children);
+        result.push_back(DocumentAccess::WithData(block, std::move(data)));
       }
     }
+    if (!changed) {
+      changed = {i, i + 1, result.size()};
+    } else {
+      changed->old_end = i + 1;
+      changed->new_end = result.size();
+    }
+  }
+  if (changed) {
+    child_changes.emplace(parent, *changed);
   }
   return result;
 }
 
-RichDocument Rewrite(const RichDocument& document, const Replacements& changes, EditChanges& edit) {
-  bool changed = false;
-  auto blocks = Rewrite(document.Blocks(), changes, changed);
-  return changed ? edit.Build(std::move(blocks)) : document;
+RichDocument Rewrite(const RichDocument& document, const Replacements& changes, EditChanges& edit,
+                     ChildChanges child_changes = {}) {
+  auto blocks = Rewrite(document.Blocks(), changes, 0, child_changes);
+  return child_changes.contains(0) ? edit.Build(document, std::move(blocks), child_changes) : document;
 }
 
 TextRange Clip(TextRange range, TextRange within) {
@@ -74,8 +86,15 @@ struct LeafBuilder {
     last_link = &link;
   }
 
-  void AppendSlice(const Block& block, TextRange range) {
+  void AppendSlice(const Block& block, TextRange range, bool fresh_objects = false) {
     data.text += DocumentAccess::Body(block).TextInRange(range);
+    const auto& objects = block.Data().inline_objects;
+    auto object = std::ranges::lower_bound(objects, range.start, {}, &InlineObject::offset);
+    for (; object != objects.end() && object->offset < range.end; ++object) {
+      auto copy = fresh_objects ? InlineObject(object->offset, object->data) : *object;
+      copy.offset = length + copy.offset - range.start;
+      data.inline_objects.push_back(std::move(copy));
+    }
     if (data.kind != BlockKind::CodeBlock) {
       for (const auto& mark : block.Data().marks) {
         const auto part = Clip(mark.range, range);
@@ -117,16 +136,16 @@ Mark MarkAt(const Block& block, TextOffset offset) {
 std::pair<std::size_t, std::size_t> TouchedLeaves(const RichDocument& document, TextRange range) {
   const auto first = LeafIndex(document, range.start);
   auto last = LeafIndex(document, range.end);
-  if (last != first && DocumentAccess::Get(document).leaves[last].start == range.end) {
+  if (last != first && DocumentAccess::Get(document).index.At(last).start == range.end) {
     --last;
   }
   return {first, last};
 }
 
 bool TouchesRoot(const RichDocument& document, TextRange range, auto matches) {
-  const auto& leaves = DocumentAccess::Get(document).leaves;
-  const auto first = leaves[LeafIndex(document, range.start)].path.front();
-  const auto last = leaves[LeafIndex(document, range.end)].path.front();
+  const auto& leaves = DocumentAccess::Get(document).index;
+  const auto first = leaves.At(LeafIndex(document, range.start)).path.front();
+  const auto last = leaves.At(LeafIndex(document, range.end)).path.front();
   return std::ranges::any_of(document.Blocks().subspan(first, last - first + 1), [matches](const Block& block) {
     return matches(block.Data().kind);
   });
@@ -233,8 +252,9 @@ RichDocument Splice(const RichDocument& document, const TreeRange& range, std::v
   auto children = BlocksBetween(siblings, 0, range.first);
   children.insert(children.end(), replacement.begin(), replacement.end());
   children.insert(children.end(), siblings.begin() + static_cast<std::ptrdiff_t>(range.last + 1), siblings.end());
+  const ChildChange change{range.first, range.last + 1, range.first + replacement.size()};
   if (range.parent.empty()) {
-    return edit.Build(std::move(children));
+    return edit.Build(document, std::move(children), {{0, change}});
   }
   const auto& parent = BlockAt(document, range.parent);
   auto data = parent.Data();
@@ -245,14 +265,14 @@ RichDocument Splice(const RichDocument& document, const TreeRange& range, std::v
   } else {
     changes[DocumentAccess::Id(parent)] = {};
   }
-  return Rewrite(document, changes, edit);
+  return Rewrite(document, changes, edit, {{DocumentAccess::Id(parent), change}});
 }
 
 TreeRange Siblings(const RichDocument& document, TextRange range) {
   const auto [first, last] = TouchedLeaves(document, range);
-  const auto& leaves = DocumentAccess::Get(document).leaves;
-  const auto& a = leaves[first].path;
-  const auto& b = leaves[last].path;
+  const auto& leaves = DocumentAccess::Get(document).index;
+  const auto& a = leaves.At(first).path;
+  const auto& b = leaves.At(last).path;
   std::size_t depth = 0;
   while (depth + 1 < a.size() && depth + 1 < b.size() && a[depth] == b[depth]) {
     ++depth;
@@ -267,9 +287,9 @@ TreeRange Siblings(const RichDocument& document, TextRange range) {
 
 std::optional<TreeRange> SelectedItems(const RichDocument& document, TextRange range) {
   const auto [first, last] = TouchedLeaves(document, range);
-  const auto& leaves = DocumentAccess::Get(document).leaves;
-  const auto& a = leaves[first].path;
-  const auto& b = leaves[last].path;
+  const auto& leaves = DocumentAccess::Get(document).index;
+  const auto& a = leaves.At(first).path;
+  const auto& b = leaves.At(last).path;
   BlockPath common;
   std::optional<TreeRange> result;
   for (std::size_t depth = 0; depth + 1 < a.size() && depth + 1 < b.size() && a[depth] == b[depth]; ++depth) {
@@ -438,15 +458,15 @@ bool CanEditTextRange(const RichDocument& document, TextRange range) {
   if (first == last) {
     return true;
   }
-  const auto& leaves = DocumentAccess::Get(document).leaves;
+  const auto& leaves = DocumentAccess::Get(document).index;
   // An atomic block's separator can only be removed together with the block.
   return !TouchesRootKind(document, range, BlockKind::Table) &&
-      (!IsAtomicBlock(leaves[first].block.Data().kind) || range.start == leaves[first].start) &&
-      (!IsAtomicBlock(leaves[last].block.Data().kind) || range.end > leaves[last].start);
+      (!IsAtomicBlock(leaves.At(first).block.Data().kind) || range.start == leaves.At(first).start) &&
+      (!IsAtomicBlock(leaves.At(last).block.Data().kind) || range.end > leaves.At(last).start);
 }
 
 EditResult InsertParagraphAtAtomicBlock(const RichDocument& document, TextOffset caret, EditChanges& edit) {
-  const auto& leaf = DocumentAccess::Get(document).leaves[LeafIndex(document, caret)];
+  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, caret));
   const bool after = caret != leaf.start;
   const Block paragraph(BlockData{});
   auto blocks = after ? std::vector<Block>{leaf.block, paragraph} : std::vector<Block>{paragraph, leaf.block};
@@ -464,13 +484,13 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
     throw std::invalid_argument("Text replacement crosses a protected block boundary");
   }
   const auto& storage = DocumentAccess::Get(document);
-  const auto first = storage.indexes.at(start.block);
-  const auto last = storage.indexes.at(finish.block);
-  const auto& head = storage.leaves[first].block;
-  const auto& tail = storage.leaves[last].block;
+  const auto first = storage.index.IndexOf(start.block).value();
+  const auto last = storage.index.IndexOf(finish.block).value();
+  const auto& head = storage.index.At(first).block;
+  const auto& tail = storage.index.At(last).block;
   const bool head_atomic = IsAtomicBlock(head.Data().kind);
   const bool tail_atomic = IsAtomicBlock(tail.Data().kind);
-  hard_break |= TableCellAt(document, storage.leaves[first]).has_value();
+  hard_break |= TableCellAt(document, storage.index.At(first)).has_value();
   auto text = NormalizeLineEndings(input);
   const auto inserted_length = AttributedText(text).Length();
   if (head_atomic && range.IsCollapsed()) {
@@ -484,15 +504,18 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
     return result;
   }
   if (head_atomic && tail_atomic && text.empty()) {
-    const auto first_block = storage.leaves[first].path.front();
-    const auto last_block = storage.leaves[last].path.front();
+    const auto first_block = storage.index.At(first).path.front();
+    const auto last_block = storage.index.At(last).path.front();
     const bool has_next = last_block + 1 < document.Blocks().size();
     const TextOffset leading = !has_next && first_block != 0 ? -1 : 0;
     return {Splice(document, {{}, first_block, last_block}, {}, edit),
             range.start + leading, leading, has_next ? -1 : 0};
   }
 
-  if (!head_atomic && first == last && DocumentAccess::Body(head).TextInRange({start.offset, finish.offset}) == text) {
+  if (!head_atomic && first == last && DocumentAccess::Body(head).TextInRange({start.offset, finish.offset}) == text &&
+      std::ranges::none_of(head.Data().inline_objects, [&](const InlineObject& object) {
+        return object.offset >= start.offset && object.offset < finish.offset;
+      })) {
     return {document, range.start + inserted_length};
   }
 
@@ -546,16 +569,217 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
 
   edit.Touch(head);
   Replacements replacements{{start.block, std::move(blocks)}};
-  for (std::size_t i = first + 1; i <= last; ++i) {
-    const auto& block = storage.leaves[i].block;
+  auto removed = storage.index.Leaves(first + 1);
+  for (std::size_t i = first + 1; i <= last; ++i, removed.Next()) {
+    const auto& block = removed->block;
     edit.Touch(block);
     replacements[DocumentAccess::Id(block)] = {};
   }
   return {Rewrite(document, replacements, edit), range.start + inserted_length};
 }
 
+bool CanInsertInlineObject(const RichDocument& document, TextRange range) {
+  const auto& index = DocumentAccess::Get(document).index;
+  const auto start = index.AtOffset(range.start);
+  return start.ordinal == index.AtOffset(range.end).ordinal &&
+      (start.block.Data().kind == BlockKind::Paragraph || start.block.Data().kind == BlockKind::Heading);
+}
+
+EditResult InsertInlineContent(const RichDocument& document, TextRange range, const InlineObjectData& object,
+                               std::optional<Mark> marks, EditChanges& edit) {
+  const auto leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
+  const auto local = LocalRange(leaf, range);
+  LeafBuilder builder;
+  builder.data.kind = leaf.block.Data().kind;
+  builder.data.heading_level = leaf.block.Data().heading_level;
+  builder.AppendSlice(leaf.block, {0, local.start});
+  builder.data.inline_objects.emplace_back(builder.length, object);
+  const auto inherited = marks.value_or(MarksAt(document, range.start));
+  const auto* link = FindLink(leaf, range);
+  builder.AppendText(object_replacement, 1, Without(inherited, Mark::Code), link);
+  builder.AppendSlice(leaf.block, {local.end, DocumentAccess::Body(leaf.block).Length()});
+  auto block = DocumentAccess::WithData(leaf.block, std::move(builder.data));
+  return {Splice(document, ParentSlot(leaf.path), {std::move(block)}, edit), range.start + 1};
+}
+
+RichDocument ReplaceInlineContent(const RichDocument& document, const Leaf& leaf, std::size_t index,
+                                  const InlineObjectData& object, EditChanges& edit) {
+  auto data = leaf.block.Data();
+  data.inline_objects[index].data = object;
+  return Splice(document, ParentSlot(leaf.path), {DocumentAccess::WithData(leaf.block, std::move(data))}, edit);
+}
+
+namespace {
+
+bool InlineText(BlockKind kind) {
+  return kind == BlockKind::Paragraph || kind == BlockKind::Heading;
+}
+
+LeafBuilder ForTextBlock(const Block& block) {
+  LeafBuilder builder;
+  builder.data.kind = block.Data().kind;
+  builder.data.heading_level = block.Data().heading_level;
+  builder.data.fence_info = block.Data().fence_info;
+  return builder;
+}
+
+Block CopyLeaf(const Leaf& leaf, TextRange range) {
+  const auto kind = leaf.block.Data().kind;
+  const auto local = LocalRange(leaf, range);
+  if (IsAtomicBlock(kind)) {
+    return local.IsCollapsed() ? Block(BlockData{}) : leaf.block;
+  }
+  auto builder = ForTextBlock(leaf.block);
+  builder.AppendSlice(leaf.block, local);
+  return Block(std::move(builder.data));
+}
+
+std::vector<Block> CopyFragmentBlocks(const RichDocument& document, std::span<const Block> blocks, TextRange range,
+                                      std::size_t first, std::size_t last, std::size_t& ordinal, std::size_t depth = 0) {
+  const auto& index = DocumentAccess::Get(document).index;
+  std::vector<Block> result;
+  for (const auto& block : blocks) {
+    if (ordinal > last) {
+      break;
+    }
+    const auto& data = block.Data();
+    if (IsLeaf(data.kind)) {
+      if (ordinal >= first) {
+        result.push_back(CopyLeaf(index.At(ordinal), range));
+      }
+      ++ordinal;
+    } else if (data.kind == BlockKind::Table) {
+      const auto count = data.children.size() * data.children.front().Data().children.size();
+      const auto end = ordinal + count;
+      if (end > first) {
+        const auto first_cell = index.At(ordinal);
+        const auto last_cell = index.At(end - 1);
+        if (range.start <= first_cell.start && range.end >= last_cell.start + DocumentAccess::Body(last_cell.block).Length()) {
+          result.push_back(block);
+        } else {
+          auto cell = index.Leaves(std::max(first, ordinal));
+          for (auto i = std::max(first, ordinal); i < end && i <= last; ++i, cell.Next()) {
+            result.push_back(CopyLeaf(*cell, range));
+          }
+        }
+      }
+      ordinal = end;
+    } else {
+      const auto begin = ordinal;
+      auto children = CopyFragmentBlocks(document, data.children, range, first, last, ordinal, depth + 1);
+      if (!children.empty()) {
+        auto copy = data;
+        copy.children = std::move(children);
+        if (data.kind == BlockKind::List && data.ordered && begin < first) {
+          const auto path = index.At(first).path;
+          const auto ordinal = static_cast<std::uint64_t>(copy.list_start) + path[depth + 1];
+          copy.list_start = static_cast<unsigned>(std::min<std::uint64_t>(ordinal, std::numeric_limits<unsigned>::max()));
+        }
+        result.emplace_back(std::move(copy));
+      }
+    }
+  }
+  return result;
+}
+
+Block FreshFragmentBlock(const Block& block) {
+  auto data = block.Data();
+  for (auto& object : data.inline_objects) {
+    object = InlineObject(object.offset, std::move(object.data));
+  }
+  for (auto& child : data.children) {
+    child = FreshFragmentBlock(child);
+  }
+  return Block(std::move(data));
+}
+
+void AppendFreshText(LeafBuilder& builder, const Block& block) {
+  builder.AppendSlice(block, {0, DocumentAccess::Body(block).Length()}, true);
+}
+
+} // namespace
+
+DocumentFragment CopyFragment(const RichDocument& document, TextRange range) {
+  const auto& index = DocumentAccess::Get(document).index;
+  const auto first = index.AtOffset(range.start);
+  const auto last = index.AtOffset(range.end);
+  std::size_t ordinal = 0;
+  auto blocks = CopyFragmentBlocks(document, document.Blocks(), range, first.ordinal, last.ordinal, ordinal);
+  return {RichDocument::Create(std::move(blocks)), range.start != first.start,
+          range.end != last.start + DocumentAccess::Body(last.block).Length()};
+}
+
+bool CanInsertFragment(const RichDocument& document, TextRange range, const DocumentFragment& fragment) {
+  if (!CanInsertInlineObject(document, range)) {
+    return false;
+  }
+  const auto blocks = fragment.content.Blocks();
+  if (blocks.size() == 1 && InlineText(blocks.front().Data().kind)) {
+    const auto target = DocumentAccess::Get(document).index.AtOffset(range.start);
+    return target.block.Data().kind != BlockKind::Heading || blocks.front().Data().text.find('\n') == std::string::npos;
+  }
+  return DocumentAccess::Get(document).index.At(LeafIndex(document, range.start)).path.size() == 1;
+}
+
+EditResult PasteFragment(const RichDocument& document, TextRange range, const DocumentFragment& fragment,
+                         EditChanges& edit) {
+  const auto leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
+  const auto local = LocalRange(leaf, range);
+  const auto length = DocumentAccess::Body(leaf.block).Length();
+  const auto content = fragment.content.Blocks();
+  std::vector<Block> incoming;
+  incoming.reserve(content.size());
+  for (const auto& block : content) {
+    incoming.push_back(FreshFragmentBlock(block));
+  }
+  auto prefix = ForTextBlock(leaf.block);
+  prefix.AppendSlice(leaf.block, {0, local.start});
+  if (incoming.size() == 1 && InlineText(incoming.front().Data().kind)) {
+    AppendFreshText(prefix, content.front());
+    const auto caret = leaf.start + prefix.length;
+    prefix.AppendSlice(leaf.block, {local.end, length});
+    if (prefix.data == leaf.block.Data()) {
+      return {document, caret};
+    }
+    auto block = DocumentAccess::WithData(leaf.block, std::move(prefix.data));
+    return {Splice(document, ParentSlot(leaf.path), {std::move(block)}, edit), caret};
+  }
+
+  const auto root = leaf.path.front();
+  std::vector<Block> replacement;
+  if (fragment.leading_partial && InlineText(incoming.front().Data().kind) &&
+      (prefix.data.kind != BlockKind::Heading || incoming.front().Data().text.find('\n') == std::string::npos)) {
+    AppendFreshText(prefix, content.front());
+    incoming.front() = DocumentAccess::WithData(leaf.block, std::move(prefix.data));
+  } else if (prefix.length != 0) {
+    replacement.push_back(DocumentAccess::WithData(leaf.block, std::move(prefix.data)));
+  }
+  const auto inserted_end = root + replacement.size() + incoming.size() - 1;
+  replacement.insert(replacement.end(), std::make_move_iterator(incoming.begin()), std::make_move_iterator(incoming.end()));
+  TextOffset suffix_length = 0;
+  if (local.end < length) {
+    if (fragment.trailing_partial && InlineText(replacement.back().Data().kind) &&
+        (replacement.back().Data().kind != BlockKind::Heading ||
+         DocumentAccess::Body(leaf.block).TextInRange({local.end, length}).find('\n') == std::string::npos)) {
+      auto suffix = ForTextBlock(replacement.back());
+      AppendFreshText(suffix, content.back());
+      suffix.AppendSlice(leaf.block, {local.end, length});
+      replacement.back() = Block(std::move(suffix.data));
+      suffix_length = length - local.end;
+    } else {
+      auto suffix = ForTextBlock(leaf.block);
+      suffix.AppendSlice(leaf.block, {local.end, length});
+      replacement.emplace_back(std::move(suffix.data));
+    }
+  }
+  auto next = Splice(document, ParentSlot(leaf.path), std::move(replacement), edit);
+  Selection caret;
+  SelectBlock(caret, next.Blocks()[inserted_end], true);
+  return {next, Absolute(next, caret.active) - suffix_length};
+}
+
 Mark MarksAt(const RichDocument& document, TextOffset position) {
-  const auto& leaf = DocumentAccess::Get(document).leaves[LeafIndex(document, position)];
+  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, position));
   const auto local = position - leaf.start;
   return MarkAt(leaf.block, local == 0 ? 0 : local - 1);
 }
@@ -565,22 +789,24 @@ CommandState MarkStatus(const RichDocument& document, TextRange range, Mark mark
     return {};
   }
   if (range.IsCollapsed()) {
-    const auto& leaf = DocumentAccess::Get(document).leaves[LeafIndex(document, range.start)];
+    const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
     return {IsTextBlock(leaf.block.Data().kind) && leaf.block.Data().kind != BlockKind::CodeBlock,
             Has(pending.value_or(MarksAt(document, range.start)), mark) ? CheckState::On : CheckState::Off};
   }
 
-  const auto& leaves = DocumentAccess::Get(document).leaves;
+  const auto& leaves = DocumentAccess::Get(document).index;
   const auto [first, last] = TouchedLeaves(document, range);
   TextOffset length = 0;
   TextOffset marked = 0;
-  for (std::size_t i = first; i <= last; ++i) {
-    if (leaves[i].block.Data().kind == BlockKind::CodeBlock || IsAtomicBlock(leaves[i].block.Data().kind)) {
+  auto cursor = leaves.Leaves(first);
+  for (std::size_t i = first; i <= last; ++i, cursor.Next()) {
+    const auto& data = cursor->block.Data();
+    if (data.kind == BlockKind::CodeBlock || IsAtomicBlock(data.kind)) {
       continue;
     }
-    const auto part = LocalRange(leaves[i], range);
+    const auto part = LocalRange(*cursor, range);
     length += part.Length();
-    for (const auto& run : leaves[i].block.Data().marks) {
+    for (const auto& run : data.marks) {
       if (Has(run.marks, mark)) {
         marked += Clip(run.range, part).Length();
       }
@@ -590,7 +816,7 @@ CommandState MarkStatus(const RichDocument& document, TextRange range, Mark mark
 }
 
 const LinkRange* LinkAt(const RichDocument& document, TextRange range) {
-  const auto& leaf = DocumentAccess::Get(document).leaves[LeafIndex(document, range.start)];
+  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
   return FindLink(leaf, range);
 }
 
@@ -609,12 +835,16 @@ CommandState BlockKindStatus(const RichDocument& document, TextRange range, cons
     return {};
   }
   const auto [first, last] = TouchedLeaves(document, range);
-  const auto& leaves = DocumentAccess::Get(document).leaves;
+  const auto& leaves = DocumentAccess::Get(document).index;
   bool enabled = true;
   std::size_t matching = 0;
-  for (std::size_t i = first; i <= last; ++i) {
-    const auto& data = leaves[i].block.Data();
+  auto cursor = leaves.Leaves(first);
+  for (std::size_t i = first; i <= last; ++i, cursor.Next()) {
+    const auto& data = cursor->block.Data();
     if (heading && data.text.find('\n') != std::string::npos) {
+      enabled = false;
+    }
+    if (command.kind == BlockKind::CodeBlock && !data.inline_objects.empty()) {
       enabled = false;
     }
     if (data.kind == command.kind && (!heading || data.heading_level == command.heading_level)) {
@@ -629,10 +859,10 @@ CommandState BlockKindStatus(const RichDocument& document, TextRange range, cons
 RichDocument Format(const RichDocument& document, TextRange range, const EditorCommand& command, bool remove_mark,
                     EditChanges& edit) {
   Replacements changes;
-  const auto& leaves = DocumentAccess::Get(document).leaves;
+  const auto& leaves = DocumentAccess::Get(document).index;
   const auto* link = std::get_if<SetLink>(&command);
   if (link && range.IsCollapsed()) {
-    const auto& leaf = leaves[LeafIndex(document, range.start)];
+    const auto& leaf = leaves.At(LeafIndex(document, range.start));
     const auto* current = FindLink(leaf, range);
     if (!current) {
       return document;
@@ -640,8 +870,9 @@ RichDocument Format(const RichDocument& document, TextRange range, const EditorC
     range = {leaf.start + current->range.start, leaf.start + current->range.end};
   }
   const auto [first, last] = TouchedLeaves(document, range);
-  for (std::size_t i = first; i <= last; ++i) {
-    const auto& leaf = leaves[i];
+  auto cursor = leaves.Leaves(first);
+  for (std::size_t i = first; i <= last; ++i, cursor.Next()) {
+    const auto& leaf = *cursor;
     if (IsAtomicBlock(leaf.block.Data().kind)) {
       continue;
     }
@@ -735,7 +966,7 @@ RichDocument ChangeContainer(const RichDocument& document, TextRange range, cons
 }
 
 RichDocument SplitListItem(const RichDocument& document, TextOffset new_paragraph, EditChanges& edit) {
-  const auto& leaf = DocumentAccess::Get(document).leaves[LeafIndex(document, new_paragraph)];
+  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, new_paragraph));
   const auto slot = ParentSlot(leaf.path);
   if (slot.parent.empty() || slot.first == 0) {
     return document;
@@ -753,7 +984,7 @@ RichDocument SplitListItem(const RichDocument& document, TextOffset new_paragrap
 }
 
 RichDocument ExitContainer(const RichDocument& document, TextOffset caret, bool empty_only, EditChanges& edit) {
-  const auto& leaf = DocumentAccess::Get(document).leaves[LeafIndex(document, caret)];
+  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, caret));
   if (caret != leaf.start || (empty_only && !leaf.block.Data().text.empty())) {
     return document;
   }
@@ -771,7 +1002,7 @@ RichDocument ExitContainer(const RichDocument& document, TextOffset caret, bool 
 }
 
 EditResult ExitCodeBlock(const RichDocument& document, TextOffset caret, EditChanges& edit) {
-  const auto& leaf = DocumentAccess::Get(document).leaves[LeafIndex(document, caret)];
+  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, caret));
   if (leaf.block.Data().kind != BlockKind::CodeBlock) {
     return {document, caret};
   }
@@ -787,9 +1018,9 @@ bool IsTableCommand(const EditorCommand& command) {
 }
 
 CommandState TableStatus(const RichDocument& document, TextRange range, const EditorCommand& command) {
-  const auto& leaves = DocumentAccess::Get(document).leaves;
+  const auto& leaves = DocumentAccess::Get(document).index;
   const auto first = LeafIndex(document, range.start);
-  const auto& leaf = leaves[first];
+  const auto& leaf = leaves.At(first);
   if (const auto* insert = std::get_if<InsertTable>(&command)) {
     return {range.IsCollapsed() && leaf.path.size() == 1 && leaf.block.Data().kind == BlockKind::Paragraph &&
             ValidTableSize(insert->rows, insert->columns)};
@@ -824,20 +1055,21 @@ CommandState TableStatus(const RichDocument& document, TextRange range, const Ed
 RichDocument ChangeTable(const RichDocument& document, Selection& selection, const EditorCommand& command,
                          EditChanges& edit) {
   const auto& storage = DocumentAccess::Get(document);
-  const auto& leaf = storage.leaves[storage.indexes.at(selection.active.block)];
+  const auto& leaf = storage.index.At(storage.index.IndexOf(selection.active.block).value());
   auto index = leaf.path.front();
   auto blocks = BlocksBetween(document.Blocks(), 0, document.Blocks().size());
   if (const auto* insert = std::get_if<InsertTable>(&command)) {
     Block table(BlockData{.kind = BlockKind::Table,
                           .children = std::vector<Block>(insert->rows, EmptyRow(insert->columns)),
                           .table_has_header = insert->has_header});
-    if (leaf.block.Data().text.empty()) {
+    const bool replace = leaf.block.Data().text.empty();
+    if (replace) {
       edit.Touch(blocks[index]);
       blocks[index] = std::move(table);
     } else {
       blocks.insert(blocks.begin() + static_cast<std::ptrdiff_t>(++index), std::move(table));
     }
-    auto next = edit.Build(std::move(blocks));
+    auto next = edit.Build(document, std::move(blocks), {{0, {index, index + replace, index + 1}}});
     SelectBlock(selection, next.Blocks()[index]);
     return next;
   }
@@ -846,7 +1078,7 @@ RichDocument ChangeTable(const RichDocument& document, Selection& selection, con
   if (std::holds_alternative<DeleteTable>(command)) {
     edit.Touch(blocks[index]);
     blocks.erase(blocks.begin() + static_cast<std::ptrdiff_t>(index));
-    auto next = edit.Build(std::move(blocks));
+    auto next = edit.Build(document, std::move(blocks), {{0, {index, index + 1, index}}});
     const bool at_end = index >= next.Blocks().size();
     SelectBlock(selection, next.Blocks()[at_end ? index - 1 : index], at_end);
     return next;
@@ -858,7 +1090,7 @@ RichDocument ChangeTable(const RichDocument& document, Selection& selection, con
       return document;
     }
     blocks.emplace(blocks.begin() + static_cast<std::ptrdiff_t>(index), BlockData{});
-    auto next = edit.Build(std::move(blocks));
+    auto next = edit.Build(document, std::move(blocks), {{0, {index, index, index + 1}}});
     SelectBlock(selection, next.Blocks()[index]);
     return next;
   }
@@ -899,8 +1131,8 @@ RichDocument ChangeTable(const RichDocument& document, Selection& selection, con
     }
   }
   blocks[index] = DocumentAccess::WithData(blocks[index], std::move(data));
-  auto next = edit.Build(std::move(blocks));
-  if (!DocumentAccess::Get(next).indexes.contains(selection.active.block)) {
+  auto next = edit.Build(document, std::move(blocks), {{0, {index, index + 1, index + 1}}});
+  if (!DocumentAccess::Get(next).index.FindLeaf(selection.active.block)) {
     SelectBlock(selection, next.Blocks()[index].Data().children[row].Data().children[column]);
   }
   return next;
@@ -913,7 +1145,7 @@ bool IsImageCommand(const EditorCommand& command) {
 
 std::optional<std::size_t> SelectedAtomicIndex(const RichDocument& document, TextRange range) {
   const auto index = LeafIndex(document, range.start);
-  const auto& leaf = DocumentAccess::Get(document).leaves[index];
+  const auto& leaf = DocumentAccess::Get(document).index.At(index);
   if (IsAtomicBlock(leaf.block.Data().kind) && range == TextRange{leaf.start, leaf.start + 1}) {
     return index;
   }
@@ -922,14 +1154,14 @@ std::optional<std::size_t> SelectedAtomicIndex(const RichDocument& document, Tex
 
 std::optional<std::size_t> SelectedImageIndex(const RichDocument& document, TextRange range) {
   const auto index = SelectedAtomicIndex(document, range);
-  return index && DocumentAccess::Get(document).leaves[*index].block.Data().image ? index : std::nullopt;
+  return index && DocumentAccess::Get(document).index.At(*index).block.Data().image ? index : std::nullopt;
 }
 
 bool CanInsertAtomicBlock(const RichDocument& document, TextRange range) {
   if (!range.IsCollapsed()) {
     return SelectedAtomicIndex(document, range).has_value();
   }
-  const auto& leaf = DocumentAccess::Get(document).leaves[LeafIndex(document, range.start)];
+  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
   const auto kind = leaf.block.Data().kind;
   return leaf.path.size() == 1 && (kind == BlockKind::Paragraph || IsAtomicBlock(kind));
 }
@@ -953,7 +1185,7 @@ CommandState ImageStatus(const RichDocument& document, TextRange range, const Ed
 RichDocument InsertAtomicBlock(const RichDocument& document, Selection& selection, BlockData data,
                                EditChanges& edit) {
   const auto& storage = DocumentAccess::Get(document);
-  const auto& leaf = storage.leaves[storage.indexes.at(selection.active.block)];
+  const auto& leaf = storage.index.At(storage.index.IndexOf(selection.active.block).value());
   const auto slot = ParentSlot(leaf.path);
   std::vector<Block> blocks;
   const auto length = DocumentAccess::Body(leaf.block).Length();
@@ -995,7 +1227,7 @@ RichDocument ChangeImage(const RichDocument& document, Selection& selection, con
     return InsertAtomicBlock(document, selection, {.kind = BlockKind::Image, .image = insert->image}, edit);
   }
   const auto& storage = DocumentAccess::Get(document);
-  const auto& leaf = storage.leaves[storage.indexes.at(selection.active.block)];
+  const auto& leaf = storage.index.At(storage.index.IndexOf(selection.active.block).value());
   const auto slot = ParentSlot(leaf.path);
   if (const auto* replace = std::get_if<ReplaceImage>(&command)) {
     auto data = leaf.block.Data();
@@ -1022,7 +1254,7 @@ RichDocument ChangeImage(const RichDocument& document, Selection& selection, con
 RichDocument ReplaceSelectedCustomBlock(const RichDocument& document, const Selection& selection,
                                         const CustomBlockData& replacement, EditChanges& edit) {
   const auto& storage = DocumentAccess::Get(document);
-  const auto& leaf = storage.leaves[storage.indexes.at(selection.active.block)];
+  const auto& leaf = storage.index.At(storage.index.IndexOf(selection.active.block).value());
   auto data = leaf.block.Data();
   data.custom = replacement;
   return Splice(document, ParentSlot(leaf.path), {DocumentAccess::WithData(leaf.block, std::move(data))}, edit);

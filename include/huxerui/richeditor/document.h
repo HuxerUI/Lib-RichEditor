@@ -11,6 +11,8 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <huxerui/text.h>
@@ -20,6 +22,7 @@ namespace huxerui::richeditor {
 namespace detail {
 struct DocumentAccess;
 struct DocumentStorage;
+class EditorSession;
 }
 
 /// @brief Structural role of a block in the document tree.
@@ -108,6 +111,98 @@ struct CustomBlockData {
   bool operator==(const CustomBlockData&) const = default;
 };
 
+/// @brief A named resource reference stored alongside an inline object's payload.
+///
+/// Keeping references here lets the application copy or rebase attachments without interpreting the payload.
+/// The application owns the resource bytes and decides how to resolve the reference.
+struct InlineAttachment {
+  /// Nonempty name unique within this object. Uses ASCII letters, digits, '.', '_' and '-'.
+  std::string role;
+  /// Nonempty, single-line UTF-8 reference. A relative path such as "attachments/photo.png" is interpreted
+  /// relative to the document directory by resolvers that support local files.
+  std::string source;
+  bool operator==(const InlineAttachment&) const = default;
+};
+
+/// @brief Persistent data for an atomic inline object, independent of its renderer.
+///
+/// JSON preserves this value even when the application has no renderer for its type or version. The object
+/// occupies one UTF-16 code unit in the document regardless of its rendered size or fallback text.
+/// @see InlineObject, InlineObjectExtension
+struct InlineObjectData {
+  /// Namespaced ASCII identifier such as "folio.mention". Separate nonempty components with '.'.
+  /// Components use letters, digits, '_' and '-'.
+  std::string type;
+  /// Positive schema version of the payload. Independent of the document's JSON format version.
+  unsigned version = 1;
+  /// Application-owned UTF-8 data. LF is allowed. CR and NUL are invalid.
+  std::string payload;
+  /// Single-line UTF-8 text without NUL, used for plain-text conversion and when presentation is unavailable.
+  /// The view uses the type as its display and accessibility label if the fallback is empty.
+  std::string fallback_text;
+  /// Named references the application can inspect when migrating the document.
+  std::vector<InlineAttachment> attachments;
+  bool operator==(const InlineObjectData&) const = default;
+};
+
+/// @brief Associates persistent object data with a U+FFFC in a paragraph or heading.
+///
+/// The annotation gives the replacement character object semantics. An unannotated U+FFFC is ordinary text.
+/// Use InsertInlineObject to insert the character and its annotation together in an editor.
+struct InlineObject {
+  /// @brief Constructs an annotation to place in BlockData::inline_objects.
+  /// @param offset Block-local UTF-16 offset of an existing U+FFFC in BlockData::text.
+  /// @param data Persistent object data. Document construction validates the offset and data.
+  InlineObject(TextOffset offset, InlineObjectData data) : offset(offset), data(std::move(data)) {}
+
+  TextOffset offset;     ///< Block-local UTF-16 offset of the replacement character.
+  InlineObjectData data; ///< Persistent value stored at that offset.
+  /// Compares offset and data. The editor's transient identity is independent of document equality.
+  bool operator==(const InlineObject& other) const { return offset == other.offset && data == other.data; }
+
+private:
+  std::uint64_t id_ = 0;
+  friend struct detail::DocumentAccess;
+};
+
+/// @brief Opaque editing handle for an inline object in one controller's current document.
+///
+/// A handle follows the object through text edits and moves. It can resolve again after undo restores a
+/// removed object. Replacing the document invalidates handles from the previous document. Store a handle
+/// while an application editor or dialog is open and use ReplaceInlineObject to apply the result.
+/// @see InlineObjectSelection, ReplaceInlineObject
+class InlineObjectTarget {
+public:
+  /// Constructs an empty handle. Obtain a usable handle from a selection or activation event.
+  InlineObjectTarget() = default;
+
+private:
+  std::weak_ptr<const void> owner_;
+  std::uint64_t id_ = 0;
+  friend class detail::EditorSession;
+};
+
+/// @brief Captures an inline object's editing handle and a copy of its data at selection or activation.
+struct InlineObjectSelection {
+  InlineObjectTarget target; ///< Handle to pass to ReplaceInlineObject.
+  InlineObjectData data;    ///< Captured value. Use it as the expected value when applying an edit.
+};
+
+/// Persistent type used by InlineImage() and recognized by the built-in image presenter.
+inline constexpr std::string_view inline_image_type = "huxerui.image";
+
+/// @brief Encodes image metadata as a version-one inline object with one named image reference.
+/// @param image Reference, alternative text, title and optional preferred width.
+/// @return Object data with a single-line fallback. The original alternative text is retained for conversion.
+/// @see ReadInlineImage
+InlineObjectData InlineImage(const ImageBlockData& image);
+
+/// @brief Decodes image metadata without resolving or loading the referenced asset.
+/// @param object Candidate inline object.
+/// @return Image metadata for valid version-one inline images, or an empty value for other types,
+/// unsupported versions, or malformed image data.
+std::optional<ImageBlockData> ReadInlineImage(const InlineObjectData& object);
+
 struct BlockData;
 
 /// @brief Immutable, shared-storage value used to build or inspect a document tree.
@@ -168,6 +263,9 @@ struct BlockData {
   std::optional<ImageBlockData> image;
   /// Required for Custom blocks. A custom block cannot have child blocks or inline ranges.
   std::optional<CustomBlockData> custom;
+  /// Inline objects in increasing block-local UTF-16 offset order. Each offset must identify a distinct
+  /// U+FFFC in text. Available in paragraphs, including table cell paragraphs, and in headings.
+  std::vector<InlineObject> inline_objects;
   bool operator==(const BlockData&) const = default;
 };
 

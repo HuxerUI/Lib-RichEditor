@@ -94,10 +94,10 @@ Block DecodeBlock(const Json& object) {
         object.value("fallback_text", std::string{})};
     return Block(std::move(data));
   case BlockKind::Paragraph:
-    CheckFields(object, {"type", "text", "marks", "links"});
+    CheckFields(object, {"type", "text", "marks", "links", "inline_objects"});
     break;
   case BlockKind::Heading:
-    CheckFields(object, {"type", "text", "marks", "links", "level"});
+    CheckFields(object, {"type", "text", "marks", "links", "level", "inline_objects"});
     data.heading_level = static_cast<unsigned>(Unsigned(object.at("level"), 6));
     break;
   case BlockKind::CodeBlock:
@@ -157,6 +157,30 @@ Block DecodeBlock(const Json& object) {
     for (const auto& link : links) {
       CheckFields(link, {"start", "end", "target", "title"});
       data.links.push_back({DecodeRange(link), link.at("target").get<std::string>(), link.value("title", std::string{})});
+    }
+  }
+  if (const auto objects = object.find("inline_objects"); objects != object.end()) {
+    if (!objects->is_array()) {
+      throw std::invalid_argument("Expected a JSON inline object array");
+    }
+    for (const auto& entry : *objects) {
+      CheckFields(entry, {"offset", "type", "version", "payload", "fallback_text", "attachments"});
+      InlineObjectData content{
+          entry.at("type").get<std::string>(),
+          static_cast<unsigned>(Unsigned(entry.at("version"), std::numeric_limits<unsigned>::max())),
+          entry.at("payload").get<std::string>(), entry.value("fallback_text", std::string{})};
+      if (const auto attachments = entry.find("attachments"); attachments != entry.end()) {
+        if (!attachments->is_array()) {
+          throw std::invalid_argument("Expected a JSON inline attachment array");
+        }
+        for (const auto& attachment : *attachments) {
+          CheckFields(attachment, {"role", "source"});
+          content.attachments.push_back(
+              {attachment.at("role").get<std::string>(), attachment.at("source").get<std::string>()});
+        }
+      }
+      const auto offset = Unsigned(entry.at("offset"), std::numeric_limits<TextOffset>::max());
+      data.inline_objects.emplace_back(static_cast<TextOffset>(offset), std::move(content));
     }
   }
   return Block(std::move(data));
@@ -225,6 +249,20 @@ Json EncodeBlock(const Block& block) {
     for (const auto& link : data.links) {
       links.push_back({{"start", link.range.start}, {"end", link.range.end},
                        {"target", link.target}, {"title", link.title}});
+    }
+  }
+  if (!data.inline_objects.empty()) {
+    auto& objects = object["inline_objects"] = Json::array();
+    for (const auto& object : data.inline_objects) {
+      Json entry{{"offset", object.offset}, {"type", object.data.type}, {"version", object.data.version},
+                 {"payload", object.data.payload}, {"fallback_text", object.data.fallback_text}};
+      if (!object.data.attachments.empty()) {
+        auto& attachments = entry["attachments"] = Json::array();
+        for (const auto& attachment : object.data.attachments) {
+          attachments.push_back({{"role", attachment.role}, {"source", attachment.source}});
+        }
+      }
+      objects.push_back(std::move(entry));
     }
   }
   return object;

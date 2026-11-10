@@ -291,6 +291,24 @@ std::vector<EditorLayout::InlineBackground> InlineBackgrounds(const TextLayout& 
 
 } // namespace
 
+InlineObjectRenderContext ResolveInlineContext(const BlockData& data, TextOffset offset, const ThemeSpec& theme,
+                                               const RichEditorStyle& style, const std::string& locale,
+                                               const std::optional<File>& directory) {
+  const TextStyle body{
+      style.body_font.value_or(Font::FromFamily(theme.typography.family, theme.typography.body_large)),
+      style.text_color.value_or(theme.colors.on_surface),
+  };
+  const auto base = BlockStyle(data, body, body, style);
+  const auto mark = std::ranges::find_if(data.marks, [offset](const MarkRange& range) {
+    return range.range.start <= offset && offset < range.range.end;
+  });
+  const bool link = std::ranges::any_of(data.links, [offset](const LinkRange& range) {
+    return range.range.start <= offset && offset < range.range.end;
+  });
+  return {link ? style.accent_color.value_or(theme.colors.primary) : base.foreground, base.font.Size(),
+          mark == data.marks.end() ? Mark::None : mark->marks, locale, directory};
+}
+
 TextPosition InlineOffsets::ToLayout(TextPosition position) const {
   const auto next = std::ranges::lower_bound(insertions, position.offset, {}, &Insertion::source);
   if (next != insertions.end() && next->source == position.offset) {
@@ -334,12 +352,13 @@ TextRange EditorLayout::Row::LineRange(std::size_t line) const {
 bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document, float width, const ThemeSpec& theme,
                            const RichEditorStyle& style, const std::string& locale, const ImageAssets& images,
                            std::uint64_t image_revision, std::optional<ImageWidthPreview> image_preview,
-                           const RichEditorExtensions& extensions) {
+                           const RichEditorExtensions& extensions, const InlineGraphics& inline_graphics,
+                           std::uint64_t inline_revision, const std::optional<File>& document_directory) {
   const bool style_changed = style_ != style;
   const bool reflow = width_ != width || theme_ != theme || style_changed || locale_ != locale ||
       code_blocks_ != extensions.code_blocks || custom_blocks_ != extensions.custom_blocks;
   if (document_ && DocumentAccess::Same(*document_, document) && !reflow && image_revision_ == image_revision &&
-      image_preview_ == image_preview) {
+      image_preview_ == image_preview && inline_revision_ == inline_revision) {
     return false;
   }
   if (style_changed) {
@@ -356,6 +375,7 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
   const auto& code_presentation = code_blocks_ ? *code_blocks_ : DefaultCodeBlockHighlighting();
   locale_ = locale;
   image_revision_ = image_revision;
+  inline_revision_ = inline_revision;
   image_preview_ = image_preview;
   document_ = document;
   rows_.clear();
@@ -387,6 +407,23 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
     const float available = std::max(1.0F, block_width - insets.Horizontal());
     const auto id = DocumentAccess::Id(leaf.block);
     const auto found = cache_.find(id);
+    std::vector<InlineSource> sources;
+    for (const auto& object : data.inline_objects) {
+      InlineSource source{.id = DocumentAccess::Id(object)};
+      const auto extension = std::ranges::find(extensions.inline_objects, object.data.type, &InlineObjectExtension::type);
+      if (const auto custom = inline_graphics.find(source.id); custom != inline_graphics.end() &&
+          extension != extensions.inline_objects.end() && extension->render == custom->second->renderer &&
+          custom->second->data == object.data &&
+          custom->second->context == ResolveInlineContext(data, object.offset, theme, style, locale, document_directory)) {
+        source.custom = custom->second;
+      } else if (object.data.type == inline_image_type && object.data.attachments.size() == 1) {
+        const auto image = images.find(object.data.attachments.front().source);
+        if (image != images.end()) {
+          source.image = image->second;
+        }
+      }
+      sources.push_back(std::move(source));
+    }
     const auto create = [&] {
       auto base = BlockStyle(data, body, code, style);
       if (header) {
@@ -394,7 +431,62 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
       }
       const TextLayoutOptions options{.shaping = {.locale = locale}};
       const auto attributed = Attributed(leaf.block, base, code.font, theme.colors, style, code_presentation);
-      auto layout = measurer.CreateTextLayout(attributed, base, available, options);
+      std::vector<InlineBox> boxes;
+      std::vector<TextInlineObject> metrics;
+      for (std::size_t i = 0; i < data.inline_objects.size(); ++i) {
+        const auto& object = data.inline_objects[i];
+        const auto& source = sources[i];
+        auto label = object.data.fallback_text.empty() ? object.data.type : object.data.fallback_text;
+        InlineBox box{object.offset, DocumentAccess::Id(object), {}, {}, {}, label};
+        TextInlineObject measure{.offset = object.offset};
+        if (source.custom) {
+          const auto& custom = source.custom->graphic;
+          box.graphic = custom.asset;
+          if (!custom.accessible_label.empty()) {
+            box.label = custom.accessible_label;
+          }
+          measure = {object.offset, custom.width, custom.ascent, custom.descent};
+        } else if (source.image.HasValue()) {
+          const auto image = ReadInlineImage(object.data);
+          const auto intrinsic = source.image.IntrinsicSize();
+          const float width = image ? image->width.value_or(intrinsic.width) : intrinsic.width;
+          const float height = ImageHeight(source.image, width);
+          if (width > 0 && height > 0 && std::isfinite(height)) {
+            box.graphic = source.image;
+            measure = {object.offset, width, height, 0.0F};
+          }
+        }
+        if (box.graphic) {
+          const auto scale = std::min(1.0F, available / measure.width);
+          measure.width *= scale;
+          measure.ascent *= scale;
+          measure.descent *= scale;
+        } else {
+          auto fallback_style = base;
+          const auto context = ResolveInlineContext(data, object.offset, theme, style, locale, {});
+          fallback_style.foreground = context.foreground;
+          if (Has(context.marks, Mark::Bold)) {
+            fallback_style.font = fallback_style.font.WithWeight(FontWeight::Bold);
+          }
+          if (Has(context.marks, Mark::Italic)) {
+            fallback_style.font = fallback_style.font.WithSlant(FontSlant::Italic);
+          }
+          const auto run = measurer.MeasureRun(label, fallback_style, options.shaping);
+          if (run.advance > available) {
+            fallback_style.font = fallback_style.font.WithSize(std::max(1.0F, base.font.Size() * available / run.advance));
+          }
+          box.fallback = measurer.CreateTextLayout(AttributedText(std::move(label)), fallback_style, available,
+                                                   {.shaping = options.shaping, .wrap = TextWrap::NoWrap});
+          const auto geometry = box.fallback->Metrics();
+          measure.width = std::clamp(geometry.size.width, 1.0F, available);
+          measure.ascent = std::clamp(geometry.first_baseline, 1.0F, std::max(1.0F, geometry.size.height));
+          measure.descent = std::max(0.0F, geometry.size.height - measure.ascent);
+        }
+        boxes.push_back(std::move(box));
+        metrics.push_back(measure);
+      }
+      auto layout = measurer.CreateTextLayout(metrics.empty() ? attributed : attributed.WithInlineObjects(metrics),
+                                               base, available, options);
       const auto fills = CustomInlineFills(data, theme.colors, style);
       InlineOffsets offsets;
       if (std::ranges::any_of(fills, [](const InlineFillRange& fill) { return fill.fill.horizontal_padding > 0.0F; })) {
@@ -403,9 +495,16 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         if (spacer) {
           const auto padded = PadInlineCode(attributed, layout, fills, *spacer, offsets);
           if (!offsets.insertions.empty()) {
-            layout = measurer.CreateTextLayout(padded, base, available, options);
+            for (auto& object : metrics) {
+              object.offset = offsets.ToLayout({object.offset, TextAffinity::Downstream}).offset;
+            }
+            layout = measurer.CreateTextLayout(metrics.empty() ? padded : padded.WithInlineObjects(metrics),
+                                               base, available, options);
           }
         }
+      }
+      for (std::size_t i = 0; i < boxes.size(); ++i) {
+        boxes[i].bounds = layout.InlineObjectRect(metrics[i].offset).value_or(Rect{});
       }
       auto backgrounds = InlineBackgrounds(layout, offsets, fills);
       std::optional<CustomBlockGraphic> graphic;
@@ -416,10 +515,10 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         }
       }
       return CachedLayout{leaf.block, available, std::move(layout), std::move(offsets), std::move(backgrounds),
-                          std::move(graphic), header};
+                          std::move(boxes), sources, std::move(graphic), header};
     };
     auto cached = found != cache_.end() && found->second.width == available && found->second.block == leaf.block &&
-            found->second.header == header ? found->second : create();
+            found->second.header == header && found->second.inline_sources == sources ? found->second : create();
     std::optional<Rect> code_bounds;
     std::optional<CodeHeader> code_header;
     float header_height = 0.0F;
@@ -448,6 +547,7 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         .code_bounds = code_bounds,
         .code_header = std::move(code_header),
         .inline_backgrounds = cached.inline_backgrounds,
+        .inline_objects = cached.inline_objects,
         .cell = cell,
     });
     if (data.custom) {
@@ -478,11 +578,12 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
     next_cache.emplace(id, std::move(cached));
   };
 
-  const auto& leaves = DocumentAccess::Get(document).leaves;
+  const auto& leaves = DocumentAccess::Get(document).index;
   const float content_width = std::max(1.0F, width - padding.Horizontal());
   float y = padding.top;
-  for (std::size_t i = 0; i < leaves.size();) {
-    const auto& leaf = leaves[i];
+  auto cursor = leaves.Leaves();
+  for (std::size_t i = 0; cursor;) {
+    const auto& leaf = *cursor;
     if (const auto cell = TableCellAt(document, leaf)) {
       const auto& block = document.Blocks()[cell->table];
       const auto& table = block.Data();
@@ -504,8 +605,10 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         float height = body.font.Size();
         for (std::size_t column = 0; column < columns; ++column) {
           const float x = padding.left + static_cast<float>(column) * column_width;
-          append(leaves[i++], {x, y}, column_width, insets, {}, grid.has_header && row == 0,
+          append(*cursor, {x, y}, column_width, insets, {}, grid.has_header && row == 0,
                  Cell{table_index, {x, y, column_width, 0.0F}});
+          ++i;
+          cursor.Next();
           height = std::max(height, rows_.back().layout.Metrics().size.height);
         }
         height += insets.Vertical();
@@ -522,8 +625,8 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
       const auto first = i;
       float used = 0.0F;
       float height = 0.0F;
-      for (; i < leaves.size(); ++i) {
-        const auto& item = leaves[i];
+      for (; cursor; ++i, cursor.Next()) {
+        const auto& item = *cursor;
         const auto& image = item.block.Data().image;
         if (!image) {
           break;
@@ -602,6 +705,7 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
       rule.height = bottom - rule.y;
     }
     y = bottom + style.block_spacing;
+    cursor.Next();
   }
   cache_ = std::move(next_cache);
   height_ = rows_.back().Bottom() + padding.bottom;
@@ -712,17 +816,17 @@ TextPosition EditorLayout::Hit(const RichDocument& document, std::size_t index, 
   const auto& row = rows_[index];
   if (const auto* atomic = row.AtomicBounds()) {
     const auto& bounds = *atomic;
-    return {DocumentAccess::Get(document).leaves[index].start + (point.y >= bounds.y + bounds.height / 2.0F)};
+    return {DocumentAccess::Get(document).index.At(index).start + (point.y >= bounds.y + bounds.height / 2.0F)};
   }
   auto result = row.offsets.ToSource(row.layout.HitTest(point - Origin(row)));
-  result.offset += DocumentAccess::Get(document).leaves[index].start;
+  result.offset += DocumentAccess::Get(document).index.At(index).start;
   return result;
 }
 
 Rect EditorLayout::Caret(const RichDocument& document, TextPosition position) const {
   const auto index = LeafIndex(document, position.offset);
   const auto& row = rows_[index];
-  position.offset -= DocumentAccess::Get(document).leaves[index].start;
+  position.offset -= DocumentAccess::Get(document).index.At(index).start;
   if (const auto* atomic = row.AtomicBounds()) {
     const auto& bounds = *atomic;
     return {bounds.x, position.offset == 0 ? row.origin.y : bounds.y + bounds.height,
@@ -732,11 +836,13 @@ Rect EditorLayout::Caret(const RichDocument& document, TextPosition position) co
 }
 
 std::vector<Rect> EditorLayout::Ranges(const RichDocument& document, TextRange range) const {
-  const auto& leaves = DocumentAccess::Get(document).leaves;
+  const auto& leaves = DocumentAccess::Get(document).index;
   std::vector<Rect> result;
+  const auto first = LeafIndex(document, range.start);
   const auto last = LeafIndex(document, range.end);
-  for (auto i = LeafIndex(document, range.start); i <= last; ++i) {
-    const auto& leaf = leaves[i];
+  auto cursor = leaves.Leaves(first);
+  for (auto i = first; i <= last; ++i, cursor.Next()) {
+    const auto& leaf = *cursor;
     const auto& row = rows_[i];
     const auto end = leaf.start + DocumentAccess::Body(leaf.block).Length();
     const auto start = std::max(range.start, leaf.start);
@@ -757,7 +863,7 @@ std::vector<Rect> EditorLayout::Ranges(const RichDocument& document, TextRange r
         result.insert(result.end(), fragments.begin(), fragments.end());
       }
     }
-    if (i + 1 < leaves.size() && range.start <= end && range.end > end) {
+    if (i + 1 < leaves.LeafCount() && range.start <= end && range.end > end) {
       auto separator = Caret(document, {end, TextAffinity::Upstream});
       separator.width = 6.0F;
       append(separator);

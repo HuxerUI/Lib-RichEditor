@@ -17,6 +17,7 @@ namespace huxerui::richeditor::detail {
 Task<IoResult<ImageAsset>> ResolveImageFile(File directory, std::string source);
 
 struct DecorationAnalysis;
+struct InlineRendering;
 
 struct EditorViewport {
   using ScrollInputHandler = std::function<bool(const ScrollInputEvent&)>;
@@ -33,9 +34,13 @@ struct EditorViewport {
   std::optional<ViewHandle> code_language_anchor;
   std::shared_ptr<const ImageResolver> image_resolver;
   std::optional<File> image_directory;
+  std::optional<File> document_directory;
   std::uint64_t image_generation = 0;
   State<std::uint64_t> image_revision{0};
   ImageAssets images;
+  InlineGraphics inline_graphics;
+  State<std::uint64_t> inline_revision{0};
+  std::shared_ptr<InlineRendering> inline_rendering;
   std::shared_ptr<DecorationAnalysis> decoration_analysis;
   State<std::uint64_t> decoration_revision{0};
   State<float> content_width{0.0F};

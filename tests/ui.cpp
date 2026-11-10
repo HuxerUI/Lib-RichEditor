@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <thread>
 
+#include "../src/editor_session.h"
+
 using namespace huxerui;
 using namespace huxerui::richeditor;
 using namespace huxerui::testing;
@@ -28,6 +30,150 @@ void Check(bool condition, const char* message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+void CheckDocumentIndex(const RichDocument& document) {
+  using namespace huxerui::richeditor::detail;
+  const auto& index = DocumentAccess::Get(document).index;
+  auto cursor = index.Leaves();
+  BlockPath path;
+  TextOffset start = 0;
+  std::size_t ordinal = 0;
+  const auto visit = [&](const auto& self, std::span<const Block> blocks) -> void {
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+      const auto& block = blocks[i];
+      path.push_back(i);
+      if (block.Data().children.empty()) {
+        const auto id = DocumentAccess::Id(block);
+        const auto leaf = index.At(ordinal);
+        const auto& body = DocumentAccess::Body(block);
+        Check(leaf.path == path && leaf.start == start && DocumentAccess::Id(leaf.block) == id &&
+                  index.IndexOf(id) == ordinal && index.StartOf(id) == start,
+              "Random index lookup agrees with the document tree");
+        Check(cursor && cursor->path == path && cursor->start == start && DocumentAccess::Id(cursor->block) == id,
+              "Sequential cursor agrees with the document tree");
+        Check(PositionAt(document, start).block == id &&
+                  PositionAt(document, start + body.Length()).offset == body.Length(),
+              "UTF-16 start, end, and separator resolve to the expected block");
+        start += body.Length() + 1;
+        ++ordinal;
+        cursor.Next();
+      } else {
+        self(self, block.Data().children);
+      }
+      path.pop_back();
+    }
+  };
+  visit(visit, document.Blocks());
+  Check(!cursor && index.LeafCount() == ordinal && index.Length() == start - 1, "Index totals agree with the tree");
+}
+
+void CheckIncrementalDocumentIndex() {
+  using namespace huxerui::richeditor::detail;
+  std::vector<Block> paragraphs;
+  for (unsigned i = 0; i < 195; ++i) {
+    paragraphs.emplace_back(BlockData{.text = "A🙂 " + std::to_string(i)});
+  }
+  const auto initial = RichDocument::Create(std::move(paragraphs));
+  const auto& index = DocumentAccess::Get(initial).index;
+  CheckDocumentIndex(initial);
+
+  for (const auto ordinal : {0u, 63u, 64u, 98u, 194u}) {
+    EditorSession editor(initial);
+    const auto original = index.At(ordinal);
+    const auto start = original.start;
+    const TextInputCommand split{.kind = TextInputCommandKind::CommitText,
+                                 .target = TextRange{start + 3, start + 3}, .text = "\n"};
+    Check(editor.Apply(std::span(&split, 1)), "Split a paragraph near a page boundary");
+    const auto inserted = editor.Document();
+    const auto& new_index = DocumentAccess::Get(inserted).index;
+    const auto id = DocumentAccess::Id(new_index.At(ordinal + 1).block);
+    Check(new_index.LeafCount() == index.LeafCount() + 1 && new_index.StartOf(id) == start + 4 &&
+              !index.IndexOf(id),
+          "A newly allocated ID is visible in the edited snapshot");
+    CheckDocumentIndex(inserted);
+
+    const TextInputCommand join{.kind = TextInputCommandKind::CommitText,
+                                .target = TextRange{start + 3, start + 4}};
+    Check(editor.Apply(std::span(&join, 1)) && editor.Document() == initial &&
+              !DocumentAccess::Get(editor.Document()).index.IndexOf(id),
+          "Joining paragraphs removes the deleted ID from the new snapshot");
+    CheckDocumentIndex(editor.Document());
+    Check(editor.Execute(Undo{}) && DocumentAccess::Same(editor.Document(), inserted) &&
+              editor.Execute(Redo{}) && editor.Document() == initial && new_index.IndexOf(id) == ordinal + 1,
+          "Undo and redo switch snapshots and keep retained indexes valid");
+  }
+
+  EditorSession editor(initial);
+  const auto start = index.At(64).start;
+  const TextInputCommand preedit{.kind = TextInputCommandKind::UpdateComposition,
+                                  .target = TextRange{start + 1, start + 3}, .text = "zhong"};
+  Check(editor.Apply(std::span(&preedit, 1)) && DocumentAccess::Same(editor.Document(), initial) &&
+            editor.CompositionRange() == TextRange{start + 1, start + 6},
+        "Preedit uses the visible index and preserves the committed snapshot");
+  CheckDocumentIndex(editor.VisibleDocument());
+  const TextInputCommand commit{.kind = TextInputCommandKind::CommitText, .text = "中文"};
+  Check(editor.Apply(std::span(&commit, 1)) && editor.SelectionOffsets() == TextSelection{start + 3, start + 3},
+        "IME commits at the correct UTF-16 offset after replacing a surrogate pair");
+  CheckDocumentIndex(editor.Document());
+  const TextInputCommand invalid{.kind = TextInputCommandKind::SetSelection,
+                                 .selection_after = TextSelection{index.At(65).start + 2, index.At(65).start + 2}};
+  Check(!editor.Apply(std::span(&invalid, 1)), "IME rejects a selection that splits a surrogate pair");
+  const auto tail_id = DocumentAccess::Id(index.At(194).block);
+  const auto removed_id = DocumentAccess::Id(index.At(70).block);
+  const TextInputCommand delete_pages{.kind = TextInputCommandKind::CommitText,
+                                      .target = TextRange{3, index.At(150).start}};
+  Check(editor.Apply(std::span(&delete_pages, 1)), "Delete a selection covering multiple pages");
+  const auto& shortened = DocumentAccess::Get(editor.VisibleDocument()).index;
+  Check(shortened.LeafCount() == 45 && shortened.IndexOf(tail_id) == 44 && !shortened.IndexOf(removed_id),
+        "The following pages shift and the erased IDs disappear");
+  CheckDocumentIndex(editor.Document());
+  Check(editor.Execute(Undo{}) && DocumentAccess::Get(editor.Document()).index.IndexOf(removed_id) == 70,
+        "Undo restores the erased pages and their IDs");
+
+  const auto nested = *MarkdownCodec().Import("- First\n  - Inner\n- Second 🙂\n- Third\n").document;
+  EditorSession list(nested);
+  const auto& nested_index = DocumentAccess::Get(nested).index;
+  const auto moving = nested_index.At(2);
+  const auto id = DocumentAccess::Id(moving.block);
+  Check(list.Select({moving.start, moving.start}) && list.Execute(IndentList{}),
+        "Indent moves an existing item into a different container");
+  const auto indented = list.Document();
+  const auto& indented_index = DocumentAccess::Get(indented).index;
+  Check(indented_index.StartOf(id) == moving.start &&
+            indented_index.At(*indented_index.IndexOf(id)).path != moving.path,
+        "Moving across containers preserves the block identity and updates the path");
+  CheckDocumentIndex(indented);
+  Check(list.Execute(Undo{}) && DocumentAccess::Same(list.Document(), nested) &&
+            list.Execute(Redo{}) && DocumentAccess::Same(list.Document(), indented),
+        "Undo and redo restore both versions of a moved subtree");
+  Check(list.Execute(OutdentList{}) && list.Document() == nested, "Outdent restores the tree and coordinates");
+  CheckDocumentIndex(list.Document());
+
+  const auto quoted = *MarkdownCodec().Import("> First\n>\n> Move 🙂\n\nMiddle\n\n> Last\n").document;
+  const auto& quoted_index = DocumentAccess::Get(quoted).index;
+  const auto moved_id = DocumentAccess::Id(quoted_index.At(1).block);
+  std::vector<Block> roots(quoted.Blocks().begin(), quoted.Blocks().end());
+  auto source = roots.front().Data();
+  auto target = roots.back().Data();
+  target.children.push_back(source.children.back());
+  source.children.pop_back();
+  roots.front() = DocumentAccess::WithData(roots.front(), std::move(source));
+  roots.back() = DocumentAccess::WithData(roots.back(), std::move(target));
+  EditChanges change{DocumentAccess::Get(quoted).max_id};
+  const auto reordered = change.Build(quoted, std::move(roots), {{0, {0, 3, 3}}});
+  const auto& reordered_index = DocumentAccess::Get(reordered).index;
+  Check(reordered_index.IndexOf(moved_id) == 3 && reordered_index.StartOf(moved_id) > quoted_index.StartOf(moved_id),
+        "A cross-container move updates the ordinal and offset when the flattened order changes");
+  CheckDocumentIndex(reordered);
+}
+
+void IncrementalDocumentIndex() {
+  const Application app([]() -> View { return Text(""); },
+                        {.show_debug_overlay = false, .application_hooks = {[](ApplicationContext&) {
+                           CheckIncrementalDocumentIndex();
+                         }}});
+  UiTest ui(app);
 }
 
 View App() {
@@ -938,6 +1084,19 @@ void ImageWorkflow() {
   const auto reopened = JsonCodec().Import(*JsonCodec().Export(*local.document).text);
   controller->ReplaceDocument(*reopened.document);
   ui.PumpUntil(local_loaded);
+  const auto& inline_codec = MarkdownCodec({.inline_images = true});
+  const auto inline_doc = inline_codec.Import(
+      "| Image | Note |\n| --- | --- |\n| A ![Inline local](<attachments/photo%20local.png>) | B |\n");
+  Check(inline_doc.document.has_value(), "Inline image in a table imports");
+  const auto inline_json = JsonCodec().Export(*inline_doc.document);
+  controller->ReplaceDocument(*JsonCodec().Import(*inline_json.text).document);
+  const auto inline_image = ui.FindSemantics(UiSemanticSelector::Label("Inline local"));
+  ui.PumpUntil([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    return inline_image.Exists() && inline_image.One().bounds.width == 2.0F;
+  });
+  Check(inline_codec.Export(controller->Document()).text.has_value(),
+        "A table inline image reopens from a moved attachment directory and exports strictly");
   Check(fixture.DeleteRecursively(), "Clean up the attachment fixture");
   image_directory_state.reset();
   image_resolver_state.reset();
@@ -1065,6 +1224,96 @@ void IncrementalBlockDecorations() {
   providers.reset();
 }
 
+void InlineObjectWorkflow() {
+  using namespace huxerui::richeditor::detail;
+  static std::optional<InlineObjectSelection> activation;
+  static unsigned renders = 0;
+  activation.reset();
+  renders = 0;
+  const auto& markdown = MarkdownCodec({.inline_math = true, .inline_images = true});
+  const Application app([]() -> View {
+    static const auto initial = MarkdownCodec({.inline_math = true}).Import("A🙂 $x^2$ 中文 with `code`.\n\nOther.").document;
+    static const auto renderer = std::make_shared<const InlineObjectRenderer>(
+        [](InlineObjectData data, InlineObjectRenderContext context) -> Task<std::optional<InlineObjectGraphic>> {
+          ++renders;
+          co_await Delay(std::chrono::milliseconds(45));
+          auto asset = VectorAsset::Create(Size{24, 15}, [](VectorBuilder&) {});
+          co_return InlineObjectGraphic{std::move(asset), 24, 11, 4, "Math " + data.payload};
+        });
+    const auto editor = UseRichEditor(*initial);
+    controller = editor;
+    return RichEditor(editor, {.style = {.inline_code_horizontal_padding = 4.0F},
+                               .extensions = {.inline_objects = {{std::string(latex_block_type), renderer}}}})
+        .On<RichEditorEvents::InlineObjectActivated>([](const InlineObjectSelection& event) {
+          activation = event;
+        });
+  }, {.show_debug_overlay = false});
+  UiTest ui(app, {.viewport = {300.0F, 360.0F}});
+  const auto initial = controller->Document();
+  ui.TapAt({20.0F, 24.0F});
+  const auto resolved = ui.FindSemantics(UiSemanticSelector::Label("Math x^2"));
+  ui.PumpUntil([&] { return resolved.Exists(); });
+  Check(renders == 1, "Resolve one mounted object");
+  resolved.PerformSemanticAction({SemanticActionKind::Activate, {}});
+  Check(activation && activation->data == LatexInline("x^2") &&
+            ui.ActiveTextInput()->selection.Range() == TextRange{4, 5},
+        "Typed activation selects exactly one UTF-16 object");
+  const auto original = *activation;
+  const auto fragment = controller->SelectedFragment();
+  Check(fragment && fragment->content.Blocks()[0].Data().inline_objects.size() == 1 &&
+            PlainTextSlice(initial, {4, 5}) == "x^2" &&
+            TextSlice(initial, {4, 5}) == object_replacement,
+        "Rich copy retains the object and plain copy differs from the IME projection");
+
+  Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "zhong"}});
+  Check(controller->Document() == initial, "IME preedit does not publish the replaced object");
+  Accept(ui, {{.kind = TextInputCommandKind::CancelComposition}});
+  const auto restored = controller->SelectedInlineObject();
+  Check(restored && restored->data == original.data, "Cancel restores the selected object");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .target = TextRange{4, 4}, .text = "中"}});
+  Check(renders == 1, "Typing before an object reuses its renderer");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .target = TextRange{5, 5}, .text = "\n"}});
+  const auto split = controller->Document();
+  Check(split.Blocks().size() == 3 && split.Blocks()[1].Data().inline_objects.size() == 1 &&
+            split.Blocks()[1].Data().inline_objects.front().offset == 0 &&
+            controller->Execute(ReplaceInlineObject{original.target, LatexInline("x^3"), original.data}),
+        "The captured target can replace the object after a paragraph split");
+  ui.Pump();
+  Check(!controller->Execute(ReplaceInlineObject{original.target, LatexInline("wrong"), original.data}),
+        "An expected value rejects a stale edit of the same object");
+
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{0, 0}}});
+  Check(controller->Execute(InsertFragment{*fragment}), "Paste the rich fragment into another paragraph");
+  ui.Pump();
+  const auto pasted = controller->Document();
+  Check(pasted.Blocks()[0].Data().inline_objects.size() == 1 && pasted.Blocks()[1].Data().inline_objects.size() == 1,
+        "Both the original and the pasted object are present");
+  const auto& first = pasted.Blocks()[0].Data().inline_objects.front();
+  const auto& second = pasted.Blocks()[1].Data().inline_objects.front();
+  Check(first.data == LatexInline("x^2") && second.data == LatexInline("x^3") &&
+            DocumentAccess::Id(first) != DocumentAccess::Id(second),
+        "Paste preserves payload and gives the pasted object a new identity");
+
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .target = TextRange{0, 8}}});
+  Check(controller->Document().Blocks()[0].Data().inline_objects.empty() &&
+            controller->Execute(Undo{}) && controller->Document() == pasted,
+        "Cross-paragraph deletion removes both objects and undo restores them");
+  ui.Pump();
+  const auto json = JsonCodec().Export(controller->Document());
+  const auto reopened = JsonCodec().Import(*json.text);
+  Check(reopened.document == pasted && markdown.Export(*reopened.document).text,
+        "Reopened JSON strictly exports the edited inline formulas");
+  controller->ReplaceDocument(*reopened.document);
+  Check(!controller->Execute(ReplaceInlineObject{original.target, LatexInline("expired")}),
+        "Opening a new document expires captured targets");
+  controller->ReplaceDocument(RichDocument::Create({Block(BlockData{
+      .text = std::string(object_replacement),
+      .inline_objects = {{0, InlineObjectData{"folio.mention", 1, "42", "Unknown person"}}},
+  })}));
+  ui.PumpUntil([&] { return ui.FindSemantics(UiSemanticSelector::Label("Unknown person")).Exists(); });
+  activation.reset();
+}
+
 void TallImageScrolling() {
   constexpr unsigned char png[]{
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
@@ -1121,6 +1370,7 @@ void TallImageScrolling() {
 
 int main() {
   try {
+    IncrementalDocumentIndex();
     Workflow();
     controller.reset();
     HeadingAndLinkEditing();
@@ -1136,6 +1386,8 @@ int main() {
     CodeLanguagePicker();
     controller.reset();
     PresentationExtensions();
+    controller.reset();
+    InlineObjectWorkflow();
     controller.reset();
     IncrementalBlockDecorations();
     controller.reset();

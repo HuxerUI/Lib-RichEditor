@@ -20,6 +20,11 @@ struct InlineBuilder {
   BlockData& block;
   TextOffset length = 0;
 
+  void AppendObject(InlineObjectData data, Mark marks) {
+    block.inline_objects.emplace_back(length, std::move(data));
+    Append(detail::object_replacement, marks);
+  }
+
   void Append(std::string_view text, Mark marks) {
     auto normalized = detail::NormalizeLineEndings(text);
     const TextOffset end = length + AttributedText(normalized).Length();
@@ -38,7 +43,7 @@ public:
     options.tables = true;
     options.task_lists = true;
     options.strikethrough = true;
-    options.math = options_.display_math;
+    options.math = options_.display_math || options_.inline_math;
     try {
       const auto parsed = markdown::ParseMarkdown(source, options);
       auto blocks = ConvertChildren(parsed.Root());
@@ -89,13 +94,25 @@ private:
       break;
     case NodeKind::Link:
       break;
-    case NodeKind::Image:
-      Report("markdown.image", "Image replaced by its alternative text");
-      builder.Append(markdown::PlainText(node), marks);
+    case NodeKind::Image: {
+      auto alt = detail::NormalizeLineEndings(markdown::PlainText(node));
+      const ImageBlockData image{node.destination, alt, detail::NormalizeLineEndings(node.title)};
+      if (options_.inline_images && detail::ValidImageData(image) && alt.find('\n') == alt.npos) {
+        builder.AppendObject(InlineImage(image), marks);
+      } else {
+        Report("markdown.image", "Image replaced by its alternative text");
+        builder.Append(alt, marks);
+      }
       return;
+    }
     case NodeKind::InlineMath:
+      if (options_.inline_math) {
+        builder.AppendObject(LatexInline(node.text), marks);
+        return;
+      }
+      [[fallthrough]];
     case NodeKind::DisplayMath:
-      Report("markdown.math", "Only standalone top-level display math is editable. Formula converted to text.");
+      Report("markdown.math", "Formula converted to text because this Markdown math syntax is disabled or unsupported here");
       builder.Append(node.text, marks);
       return;
     default:
@@ -408,6 +425,20 @@ public:
         round_trip = std::move(protected_round_trip);
       }
     }
+    if (round_trip.document != projected && policy == LossPolicy::AllowLoss && !drop_inline_at_) {
+      BlockPath mismatch;
+      if (round_trip.document) {
+        FindMismatch(projected.Blocks(), round_trip.document->Blocks(), mismatch);
+      } else if (!round_trip.issues.empty()) {
+        mismatch = round_trip.issues.front().block_path;
+      }
+      MarkdownWriter fallback(options_);
+      fallback.drop_inline_at_ = std::move(mismatch);
+      auto result = fallback.Run(document, policy);
+      if (fallback.dropped_encodable_) {
+        return result;
+      }
+    }
     if (!round_trip.document) {
       issues_.push_back({"markdown.round_trip", {}, {}, "Generated Markdown could not be re-imported without loss"});
     } else if (projected != *round_trip.document) {
@@ -471,6 +502,7 @@ private:
           data = BlockData{.text = custom.fallback_text};
         }
       }
+      ProjectInlineObjects(data, in_cell);
       auto marks = std::move(data.marks);
       data.marks.clear();
       for (const auto& run : marks) {
@@ -488,6 +520,68 @@ private:
       path_.pop_back();
     }
     return result;
+  }
+
+  void ProjectInlineObjects(BlockData& data, bool in_cell) {
+    if (data.inline_objects.empty()) {
+      return;
+    }
+    const AttributedText body(data.text);
+    std::vector<std::pair<TextOffset, TextOffset>> shifts;
+    std::vector<InlineObject> retained;
+    std::string text;
+    TextOffset start = 0;
+    TextOffset shift = 0;
+    for (const auto& object : data.inline_objects) {
+      const auto& value = object.data;
+      const bool latex = value.type == latex_block_type;
+      const auto image = ReadInlineImage(value);
+      const bool code = std::ranges::any_of(data.marks, [&](const MarkRange& mark) {
+        return mark.range.start <= object.offset && object.offset < mark.range.end &&
+            detail::Has(mark.marks, Mark::Code);
+      });
+      const bool standalone_image = path_.size() == 1 && data.kind == BlockKind::Paragraph &&
+          body.Length() == 1 && data.marks.empty() && data.links.empty();
+      const bool representable = !code &&
+          ((latex && options_.inline_math && value == LatexInline(value.payload) && !value.payload.empty() &&
+            value.payload.find_first_of(in_cell ? "$\n|" : "$\n") == value.payload.npos) ||
+           (options_.inline_images && image && !image->width && value == InlineImage(*image) && !standalone_image));
+      const bool fallback = drop_inline_at_ && path_.size() >= drop_inline_at_->size() &&
+          std::equal(drop_inline_at_->begin(), drop_inline_at_->end(), path_.begin());
+      if (representable && !fallback) {
+        auto copy = object;
+        copy.offset += shift;
+        retained.push_back(std::move(copy));
+        continue;
+      }
+      dropped_encodable_ |= representable;
+      issues_.push_back({latex ? "markdown.math" : "markdown.inline_object", path_,
+                         TextRange{object.offset, object.offset + 1},
+                         "This inline object has no faithful Markdown encoding. AllowLoss writes its fallback text."});
+      text += body.TextInRange({start, object.offset});
+      text += value.fallback_text;
+      start = object.offset + 1;
+      shift += AttributedText(value.fallback_text).Length() - 1;
+      shifts.emplace_back(start, shift);
+    }
+    if (shifts.empty()) {
+      return;
+    }
+    text += body.TextInRange({start, body.Length()});
+    const auto translate = [&](TextOffset offset) {
+      const auto after = std::ranges::upper_bound(shifts, offset, {}, &std::pair<TextOffset, TextOffset>::first);
+      return offset + (after == shifts.begin() ? 0 : std::prev(after)->second);
+    };
+    for (auto& mark : data.marks) {
+      mark.range = {translate(mark.range.start), translate(mark.range.end)};
+    }
+    for (auto& link : data.links) {
+      link.range = {translate(link.range.start), translate(link.range.end)};
+    }
+    std::erase_if(data.marks, [](const MarkRange& mark) { return mark.range.IsCollapsed(); });
+    std::erase_if(data.links, [](const LinkRange& link) { return link.range.IsCollapsed(); });
+    data.inline_objects = std::move(retained);
+    data.text = std::move(text);
   }
 
   std::string WriteMath(const CustomBlockData& custom) const {
@@ -523,7 +617,24 @@ private:
   std::string Inline(const Block& block, TextRange range, bool in_table, std::size_t depth = 0) const {
     const auto& body = detail::DocumentAccess::Body(block);
     if (depth == markdown_marks.size()) {
-      return EscapeText(body.TextInRange(range), protect_);
+      std::string text;
+      auto start = range.start;
+      const auto& objects = block.Data().inline_objects;
+      auto object = std::ranges::lower_bound(objects, start, {}, &InlineObject::offset);
+      for (; object != objects.end() && object->offset < range.end; ++object) {
+        text += EscapeText(body.TextInRange({start, object->offset}), protect_);
+        if (object->data.type == latex_block_type) {
+          text += "$" + object->data.payload + "$";
+        } else if (const auto image = ReadInlineImage(object->data)) {
+          text += "![" + EscapeText(image->alt_text, protect_) + "](<" + EscapeAttribute(image->source, in_table) + ">";
+          if (!image->title.empty()) {
+            text += " \"" + EscapeAttribute(image->title, in_table) + '"';
+          }
+          text += ')';
+        }
+        start = object->offset + 1;
+      }
+      return text + EscapeText(body.TextInRange({start, range.end}), protect_);
     }
     const auto [mark, preferred_delimiter] = markdown_marks[depth];
     const auto delimiter = protect_ && mark == Mark::Italic ? std::string_view("_") : preferred_delimiter;
@@ -678,6 +789,8 @@ private:
   BlockPath path_;
   std::vector<ConversionIssue> issues_;
   bool protect_ = false;
+  std::optional<BlockPath> drop_inline_at_;
+  bool dropped_encodable_ = false;
   MarkdownOptions options_;
 };
 
@@ -699,14 +812,16 @@ private:
 
 } // namespace
 
-const DocumentCodec& MarkdownCodec() {
-  return MarkdownCodec({});
-}
-
 const DocumentCodec& MarkdownCodec(MarkdownOptions options) {
-  static const MarkdownDocumentCodec commonmark({});
-  static const MarkdownDocumentCodec math({.display_math = true});
-  return options.display_math ? math : commonmark;
+  static const std::array codecs{
+      MarkdownDocumentCodec({}), MarkdownDocumentCodec({.display_math = true}),
+      MarkdownDocumentCodec({.inline_math = true}), MarkdownDocumentCodec({.display_math = true, .inline_math = true}),
+      MarkdownDocumentCodec({.inline_images = true}),
+      MarkdownDocumentCodec({.display_math = true, .inline_images = true}),
+      MarkdownDocumentCodec({.inline_math = true, .inline_images = true}),
+      MarkdownDocumentCodec({.display_math = true, .inline_math = true, .inline_images = true}),
+  };
+  return codecs[options.display_math + 2 * options.inline_math + 4 * options.inline_images];
 }
 
 } // namespace huxerui::richeditor

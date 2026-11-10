@@ -118,12 +118,26 @@ Task<IoResult<FileReference>> FindAttachment(FileReference directory, std::vecto
 
 std::set<std::string> LocalReferences(const RichDocument& document) {
   std::set<std::string> sources;
-  for (const auto& block : document.Blocks()) {
-    const auto& image = block.Data().image;
-    if (image && !External(image->source)) {
-      sources.insert(image->source);
+  const auto add = [&](const std::string& source) {
+    if (!External(source)) {
+      sources.insert(source);
     }
-  }
+  };
+  const auto visit = [&](const auto& self, std::span<const Block> blocks) -> void {
+    for (const auto& block : blocks) {
+      const auto& data = block.Data();
+      if (data.image) {
+        add(data.image->source);
+      }
+      for (const auto& object : data.inline_objects) {
+        for (const auto& attachment : object.data.attachments) {
+          add(attachment.source);
+        }
+      }
+      self(self, data.children);
+    }
+  };
+  visit(visit, document.Blocks());
   return sources;
 }
 
@@ -177,7 +191,9 @@ Task<IoResult<DocumentSource>> ReadDocument(FileReference source) {
   if (!contents.Succeeded()) {
     co_return IoResult<DocumentSource>::Failure(contents.Error());
   }
-  auto imported = (markdown ? MarkdownCodec({.display_math = true}) : JsonCodec()).Import(contents.Value());
+  const auto& codec = markdown ? MarkdownCodec({.display_math = true, .inline_math = true, .inline_images = true})
+                               : JsonCodec();
+  auto imported = codec.Import(contents.Value());
   if (!imported.document) {
     auto message = imported.issues.empty() ? std::string("Could not open the document") : imported.issues.front().message;
     co_return IoResult<DocumentSource>::Failure({IoErrorCode::InvalidEncoding, std::move(message)});
@@ -238,13 +254,27 @@ Task<IoResult<OpenedDocument>> ReadAttachments(FileReference source, File workin
   auto document = std::move(imported.document);
   if (!copied.empty()) {
     auto blocks = std::vector<Block>(document.Blocks().begin(), document.Blocks().end());
-    for (auto& block : blocks) {
-      if (block.Data().image && copied.contains(block.Data().image->source)) {
+    const auto replace = [&](std::string& source) {
+      if (const auto found = copied.find(source); found != copied.end()) {
+        source = found->second;
+      }
+    };
+    const auto rewrite = [&](const auto& self, std::vector<Block>& children) -> void {
+      for (auto& block : children) {
         auto data = block.Data();
-        data.image->source = copied.at(data.image->source);
+        if (data.image) {
+          replace(data.image->source);
+        }
+        for (auto& object : data.inline_objects) {
+          for (auto& attachment : object.data.attachments) {
+            replace(attachment.source);
+          }
+        }
+        self(self, data.children);
         block = Block(std::move(data));
       }
-    }
+    };
+    rewrite(rewrite, blocks);
     document = RichDocument::Create(std::move(blocks));
   }
   co_return IoResult<OpenedDocument>::Success({std::move(document), missing_images});

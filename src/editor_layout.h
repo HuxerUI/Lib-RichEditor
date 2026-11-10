@@ -16,6 +16,21 @@ namespace huxerui::richeditor::detail {
 
 using ImageAssets = std::unordered_map<std::string, ImageAsset>;
 
+/// Retains a completed render and the request inputs layout must match before reusing it.
+struct ResolvedInlineGraphic {
+  InlineObjectData data;
+  InlineObjectRenderContext context;
+  std::shared_ptr<const InlineObjectRenderer> renderer;
+  InlineObjectGraphic graphic;
+};
+/// Completed inline graphics keyed by transient object ID.
+using InlineGraphics = std::unordered_map<std::uint64_t, std::shared_ptr<const ResolvedInlineGraphic>>;
+
+/// Resolves the same appearance at a block-local UTF-16 offset for request scheduling and layout.
+InlineObjectRenderContext ResolveInlineContext(const BlockData& data, TextOffset offset, const ThemeSpec& theme,
+                                               const RichEditorStyle& style, const std::string& locale,
+                                               const std::optional<File>& directory);
+
 inline float ImageHeight(const ImageAsset& asset, float width) {
   return width * (static_cast<float>(asset.PixelHeight()) / static_cast<float>(asset.PixelWidth()));
 }
@@ -112,6 +127,16 @@ public:
     std::string label;
   };
 
+  /// Layout and accessibility data for one atomic object on a text row.
+  struct InlineBox {
+    TextOffset offset; ///< Block-local UTF-16 offset in the document projection.
+    std::uint64_t id;   ///< Transient object ID shared by rendering and interaction.
+    Rect bounds;
+    std::optional<CustomBlockGraphic> graphic;
+    std::optional<TextLayout> fallback;
+    std::string label;
+  };
+
   /// One text layout and its decorations for a document leaf.
   struct Row {
     Point origin;
@@ -121,6 +146,7 @@ public:
     std::optional<Rect> code_bounds;
     std::optional<CodeHeader> code_header;
     std::vector<InlineBackground> inline_backgrounds;
+    std::vector<InlineBox> inline_objects;
     std::optional<Cell> cell;
     std::optional<ImageBox> image;
     std::optional<CustomBox> custom;
@@ -155,7 +181,8 @@ public:
   bool Prepare(TextMeasurer& measurer, const RichDocument& document, float width, const ThemeSpec& theme,
                const RichEditorStyle& style, const std::string& locale, const ImageAssets& images,
                std::uint64_t image_revision, std::optional<ImageWidthPreview> image_preview,
-               const RichEditorExtensions& extensions);
+               const RichEditorExtensions& extensions, const InlineGraphics& inline_graphics,
+               std::uint64_t inline_revision, const std::optional<File>& document_directory);
 
   /// Tests whether the rows refer to the exact snapshot prepared for layout.
   bool IsCurrent(const RichDocument& document) const;
@@ -190,12 +217,22 @@ public:
   std::vector<Rect> TextFragments(const Row& row, TextRange range) const;
 
 private:
+  /// Inputs compared when deciding whether a cached text layout can reuse its inline boxes.
+  struct InlineSource {
+    std::uint64_t id = 0;
+    std::shared_ptr<const ResolvedInlineGraphic> custom;
+    ImageAsset image;
+    bool operator==(const InlineSource&) const = default;
+  };
+
   struct CachedLayout {
     Block block;
     float width;
     TextLayout layout;
     InlineOffsets offsets;
     std::vector<InlineBackground> inline_backgrounds;
+    std::vector<InlineBox> inline_objects;
+    std::vector<InlineSource> inline_sources;
     std::optional<CustomBlockGraphic> custom_graphic;
     bool header;
   };
@@ -214,6 +251,7 @@ private:
   TextStyle marker_style_;
   std::string locale_;
   std::uint64_t image_revision_ = 0;
+  std::uint64_t inline_revision_ = 0;
   std::optional<ImageWidthPreview> image_preview_;
   float width_ = 0.0F;
   float height_ = 80.0F;

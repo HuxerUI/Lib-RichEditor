@@ -50,6 +50,10 @@ public:
     return draft_.composition ? std::nullopt : SelectedAtomicIndex(VisibleDocument(), SelectionOffsets().Range());
   }
   const CustomBlockData* SelectedCustomBlock() const;
+  std::optional<InlineObjectSelection> SelectedInlineObject() const;
+  std::optional<DocumentFragment> SelectedFragment() const;
+  /// Captures the object starting at a flattened UTF-16 offset. Available outside IME preedit.
+  std::optional<InlineObjectSelection> InlineObjectAt(TextOffset absolute) const;
   std::optional<TextRange> CompositionRange() const;
   std::uint64_t Revision() const { return revision_; }
   std::uint64_t ContentRevision() const { return content_revision_; }
@@ -72,6 +76,13 @@ public:
   bool Execute(const EditorCommand& command);
 
 private:
+  /// Current location of a captured object. Resolving it again allows the object to move between edits.
+  struct InlineLocation {
+    Leaf leaf;
+    std::size_t object;
+  };
+  std::optional<InlineLocation> LocateInlineObject(const InlineObjectTarget& target) const;
+
   struct History {
     EditState before;
     EditState after;
@@ -90,6 +101,8 @@ private:
   std::uint64_t revision_ = 0;
   std::uint64_t content_revision_ = 0;
   std::uint64_t generation_ = 0;
+  /// Ownership token held weakly by targets. Renewed on each ReplaceDocument() call.
+  std::shared_ptr<const void> inline_owner_ = std::make_shared<int>(0);
 };
 
 } // namespace huxerui::richeditor::detail

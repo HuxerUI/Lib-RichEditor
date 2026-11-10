@@ -37,9 +37,9 @@ void KeepChangedTextBlocks(std::vector<BlockId>& blocks, const RichDocument& bef
   const auto& old = DocumentAccess::Get(before);
   const auto& current = DocumentAccess::Get(after);
   std::erase_if(blocks, [&](BlockId id) {
-    const auto* first = FindTextLeaf(old, id);
-    const auto* second = FindTextLeaf(current, id);
-    return first && second ? first->block == second->block : !first && !second;
+    const auto* first = FindTextBlock(old.index, id);
+    const auto* second = FindTextBlock(current.index, id);
+    return first && second ? *first == *second : !first && !second;
   });
 }
 
@@ -84,7 +84,7 @@ void DeleteRange(Draft& draft, TextRange range) {
 }
 
 TextOffset MoveScalars(const RichDocument& document, TextOffset offset, TextOffset count, bool forward) {
-  const auto end = forward ? DocumentAccess::Get(document).length : 0;
+  const auto end = forward ? DocumentAccess::Get(document).index.Length() : 0;
   const auto step = forward ? 1 : -1;
   for (TextOffset i = 0; i < count && offset != end; ++i) {
     offset += step;
@@ -104,7 +104,7 @@ void DeleteSurrounding(Draft& draft, const TextInputCommand& command) {
   if (!CanEditTextRange(document, selected)) {
     throw std::invalid_argument("Surrounding deletion crosses a protected block boundary");
   }
-  const auto length = DocumentAccess::Get(document).length;
+  const auto length = DocumentAccess::Get(document).index.Length();
   if (command.delete_before < 0 || command.delete_after < 0) {
     throw std::invalid_argument("Negative surrounding deletion");
   }
@@ -255,6 +255,7 @@ void EditorSession::ReplaceDocument(RichDocument document) {
   redo_.clear();
   block_changes_.clear();
   ++generation_;
+  inline_owner_ = std::make_shared<int>(0);
   if (!Publish(std::move(next), false)) {
     changed_ = ++revision_;
   }
@@ -372,7 +373,7 @@ bool EditorSession::BreakLine(bool hard_break) {
         return Publish(std::move(next), true);
       }
     }
-    const auto& leaf = DocumentAccess::Get(next.edit.document).leaves[LeafIndex(next.edit.document, selected.start)];
+    const auto& leaf = DocumentAccess::Get(next.edit.document).index.At(LeafIndex(next.edit.document, selected.start));
     const bool split_item = !hard_break && leaf.block.Data().kind != BlockKind::CodeBlock;
     auto result = selected.IsCollapsed() && IsAtomicBlock(leaf.block.Data().kind)
         ? InsertParagraphAtAtomicBlock(next.edit.document, selected.start, next.changes)
@@ -427,11 +428,11 @@ void EditorSession::FinishComposition() {
 
 bool EditorSession::SetCodeLanguage(BlockId block, std::string_view language) {
   const auto& storage = DocumentAccess::Get(VisibleDocument());
-  const auto found = storage.indexes.find(block);
-  if (found == storage.indexes.end()) {
+  const auto found = storage.index.IndexOf(block);
+  if (!found) {
     return false;
   }
-  const auto& leaf = storage.leaves[found->second];
+  const auto leaf = storage.index.At(*found);
   const auto& data = leaf.block.Data();
   if (data.kind != BlockKind::CodeBlock || CodeFenceWord(data.fence_info) == language) {
     return false;
@@ -454,10 +455,62 @@ bool EditorSession::SetCodeLanguage(BlockId block, std::string_view language) {
 
 const CustomBlockData* EditorSession::SelectedCustomBlock() const {
   if (const auto index = SelectedAtomicBlock()) {
-    const auto& data = DocumentAccess::Get(VisibleDocument()).leaves[*index].block.Data().custom;
+    const auto& data = DocumentAccess::Get(VisibleDocument()).index.At(*index).block.Data().custom;
     return data ? &*data : nullptr;
   }
   return nullptr;
+}
+
+std::optional<InlineObjectSelection> EditorSession::InlineObjectAt(TextOffset absolute) const {
+  if (draft_.composition) {
+    return std::nullopt;
+  }
+  const auto at = DocumentAccess::Get(VisibleDocument()).index.AtOffset(absolute);
+  const auto offset = absolute - at.start;
+  const auto& objects = at.block.Data().inline_objects;
+  const auto found = std::ranges::lower_bound(objects, offset, {}, &InlineObject::offset);
+  if (found == objects.end() || found->offset != offset) {
+    return std::nullopt;
+  }
+  InlineObjectTarget target;
+  target.owner_ = inline_owner_;
+  target.id_ = DocumentAccess::Id(*found);
+  return InlineObjectSelection{std::move(target), found->data};
+}
+
+std::optional<InlineObjectSelection> EditorSession::SelectedInlineObject() const {
+  const auto range = SelectionOffsets().Range();
+  return range.Length() == 1 ? InlineObjectAt(range.start) : std::nullopt;
+}
+
+std::optional<DocumentFragment> EditorSession::SelectedFragment() const {
+  const auto range = SelectionOffsets().Range();
+  if (draft_.composition || range.IsCollapsed()) {
+    return std::nullopt;
+  }
+  return CopyFragment(VisibleDocument(), range);
+}
+
+std::optional<EditorSession::InlineLocation> EditorSession::LocateInlineObject(const InlineObjectTarget& target) const {
+  if (draft_.composition || target.owner_.lock() != inline_owner_) {
+    return std::nullopt;
+  }
+  const auto& index = DocumentAccess::Get(VisibleDocument()).index;
+  std::optional<InlineLocation> location;
+  index.VisitInlineBlocks([&](const Block& block) {
+    if (location) {
+      return;
+    }
+    const auto& objects = block.Data().inline_objects;
+    const auto found = std::ranges::find(objects, target.id_, [](const auto& object) {
+      return DocumentAccess::Id(object);
+    });
+    if (found != objects.end()) {
+      location = InlineLocation{index.At(index.IndexOf(DocumentAccess::Id(block)).value()),
+                                static_cast<std::size_t>(found - objects.begin())};
+    }
+  });
+  return location;
 }
 
 CommandState EditorSession::CommandStatus(const EditorCommand& command) const {
@@ -477,7 +530,7 @@ CommandState EditorSession::CommandStatus(const EditorCommand& command) const {
     return BlockKindStatus(document, range, *block);
   }
   if (std::holds_alternative<SelectAll>(command)) {
-    const auto size = DocumentAccess::Get(document).length;
+    const auto size = DocumentAccess::Get(document).index.Length();
     return {size != 0 && range != TextRange{0, size}};
   }
   if (std::holds_alternative<Undo>(command)) {
@@ -501,6 +554,22 @@ CommandState EditorSession::CommandStatus(const EditorCommand& command) const {
     const auto* selected = SelectedCustomBlock();
     return {selected && selected->type == replace->block.type && *selected != replace->block &&
             (!replace->expected || *selected == *replace->expected) && ValidCustomData(replace->block)};
+  }
+  if (const auto* insert = std::get_if<InsertInlineObject>(&command)) {
+    const auto selected = SelectedInlineObject();
+    return {!draft_.composition && CanInsertInlineObject(document, range) && ValidInlineData(insert->object) &&
+            (!selected || selected->data != insert->object)};
+  }
+  if (const auto* replace = std::get_if<ReplaceInlineObject>(&command)) {
+    if (const auto location = LocateInlineObject(replace->target)) {
+      const auto& data = location->leaf.block.Data().inline_objects[location->object].data;
+      return {data.type == replace->replacement.type && data != replace->replacement &&
+              (!replace->expected || data == *replace->expected) && ValidInlineData(replace->replacement)};
+    }
+    return {};
+  }
+  if (const auto* insert = std::get_if<InsertFragment>(&command)) {
+    return {!draft_.composition && CanInsertFragment(document, range, insert->fragment)};
   }
   if (std::holds_alternative<SetListStart>(command)) {
     return {OrderedListStart().has_value()};
@@ -539,7 +608,7 @@ bool EditorSession::Execute(const EditorCommand& command) {
   const auto range = selection.Range();
   try {
     if (std::holds_alternative<SelectAll>(command)) {
-      SetSelection(next.edit, {0, DocumentAccess::Get(next.edit.document).length}, true);
+      SetSelection(next.edit, {0, DocumentAccess::Get(next.edit.document).index.Length()}, true);
     } else if (const auto* mark = std::get_if<ToggleMark>(&command); mark && range.IsCollapsed()) {
       const auto value = next.edit.pending.value_or(MarksAt(next.edit.document, range.start));
       next.edit.pending = status.checked == CheckState::On ? Without(value, mark->mark) : value | mark->mark;
@@ -565,6 +634,18 @@ bool EditorSession::Execute(const EditorCommand& command) {
     } else if (const auto* replace = std::get_if<ReplaceCustomBlock>(&command)) {
       next.edit.document = ReplaceSelectedCustomBlock(next.edit.document, next.edit.selection, replace->block,
                                                       next.changes);
+    } else if (const auto* insert = std::get_if<InsertInlineObject>(&command)) {
+      auto result = InsertInlineContent(next.edit.document, range, insert->object, next.edit.pending, next.changes);
+      next.edit.document = std::move(result.document);
+      SetSelection(next.edit, {result.caret, result.caret}, false);
+    } else if (const auto* replace = std::get_if<ReplaceInlineObject>(&command)) {
+      const auto location = LocateInlineObject(replace->target);
+      next.edit.document = ReplaceInlineContent(next.edit.document, location->leaf, location->object,
+                                                replace->replacement, next.changes);
+    } else if (const auto* insert = std::get_if<InsertFragment>(&command)) {
+      auto result = PasteFragment(next.edit.document, range, insert->fragment, next.changes);
+      next.edit.document = std::move(result.document);
+      SetSelection(next.edit, {result.caret, result.caret}, true);
     } else {
       next.edit.document = ChangeContainer(next.edit.document, range, command, next.changes);
     }

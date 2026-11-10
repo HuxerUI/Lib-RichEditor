@@ -41,7 +41,7 @@ std::optional<Size> RichEditorController::SelectedImageSize() const {
   if (!selected || viewport_->image_generation != session_->Generation()) {
     return std::nullopt;
   }
-  const auto& image = *detail::DocumentAccess::Get(session_->VisibleDocument()).leaves[*selected].block.Data().image;
+  const auto& image = *detail::DocumentAccess::Get(session_->VisibleDocument()).index.At(*selected).block.Data().image;
   const auto asset = viewport_->images.find(image.source);
   if (asset == viewport_->images.end() || !asset->second.HasValue()) {
     return std::nullopt;
@@ -60,6 +60,16 @@ std::optional<CustomBlockData> RichEditorController::SelectedCustomBlock() const
     return *selected;
   }
   return std::nullopt;
+}
+
+std::optional<InlineObjectSelection> RichEditorController::SelectedInlineObject() const {
+  (void)session_->Observe();
+  return session_->SelectedInlineObject();
+}
+
+std::optional<DocumentFragment> RichEditorController::SelectedFragment() const {
+  (void)session_->Observe();
+  return session_->SelectedFragment();
 }
 
 bool RichEditorController::Execute(const EditorCommand& command) const { return session_->Execute(command); }

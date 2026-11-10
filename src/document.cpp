@@ -2,6 +2,7 @@
 
 #include <huxerui/richeditor/math.h>
 
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -28,7 +29,7 @@ RichDocument::RichDocument(std::shared_ptr<const detail::DocumentStorage> storag
 
 RichDocument RichDocument::Create(std::vector<Block> blocks) {
   detail::BlockId last_id = 0;
-  return detail::DocumentAccess::Build(std::move(blocks), last_id, true);
+  return detail::DocumentAccess::Build(std::move(blocks), last_id);
 }
 
 std::span<const Block> RichDocument::Blocks() const noexcept { return storage_->blocks; }
@@ -42,6 +43,13 @@ CustomBlockData LatexBlock(std::string source) {
   return {std::string(latex_block_type), 1, source, source};
 }
 
+InlineObjectData LatexInline(std::string source) {
+  source = detail::NormalizeLineEndings(source);
+  auto fallback = source;
+  std::ranges::replace(fallback, '\n', ' ');
+  return {std::string(latex_block_type), 1, std::move(source), std::move(fallback)};
+}
+
 namespace detail {
 namespace {
 
@@ -51,7 +59,7 @@ bool HasInvalidControl(std::string_view text) {
 
 AttributedText BlockBody(const BlockData& data) {
   // Project each atomic block as one UTF-16 object replacement character.
-  return IsAtomicBlock(data.kind) ? AttributedText("\xEF\xBF\xBC") : AttributedText(data.text);
+  return IsAtomicBlock(data.kind) ? AttributedText(std::string(object_replacement)) : AttributedText(data.text);
 }
 
 void ValidateNesting(const BlockData& data, BlockKind parent, bool root) {
@@ -158,21 +166,69 @@ bool ValidImageData(const ImageBlockData& image) {
   }
 }
 
-bool ValidCustomData(const CustomBlockData& custom) {
-  const auto dot = custom.type.find('.');
-  if (custom.version == 0 || dot == std::string::npos || dot == 0 || dot + 1 == custom.type.size() ||
-      custom.type.find("..") != std::string::npos ||
-      custom.type.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") !=
-          std::string::npos ||
-      HasInvalidControl(custom.payload) || HasInvalidControl(custom.fallback_text)) {
+namespace {
+
+bool ValidCustomContent(std::string_view type, unsigned version, const std::string& payload,
+                        const std::string& fallback) {
+  const auto dot = type.find('.');
+  if (version == 0 || dot == type.npos || dot == 0 || dot + 1 == type.size() ||
+      type.find("..") != type.npos ||
+      type.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") != type.npos ||
+      HasInvalidControl(payload) || HasInvalidControl(fallback)) {
     return false;
   }
   try {
-    (void)AttributedText(custom.payload);
-    (void)AttributedText(custom.fallback_text);
+    (void)AttributedText(payload);
+    (void)AttributedText(fallback);
     return true;
   } catch (const std::invalid_argument&) {
     return false;
+  }
+}
+
+} // namespace
+
+bool ValidCustomData(const CustomBlockData& custom) {
+  return ValidCustomContent(custom.type, custom.version, custom.payload, custom.fallback_text);
+}
+
+bool ValidInlineData(const InlineObjectData& object) {
+  if (!ValidCustomContent(object.type, object.version, object.payload, object.fallback_text) ||
+      object.fallback_text.find('\n') != std::string::npos) {
+    return false;
+  }
+  std::vector<std::string_view> roles;
+  for (const auto& attachment : object.attachments) {
+    if (attachment.role.empty() ||
+        attachment.role.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") !=
+            std::string::npos ||
+        !ValidImageSource(attachment.source) || std::ranges::find(roles, attachment.role) != roles.end()) {
+      return false;
+    }
+    roles.push_back(attachment.role);
+  }
+  return true;
+}
+
+void DocumentAccess::PrepareInlineObjects(BlockData& data, const AttributedText& body, bool fresh) {
+  if (data.inline_objects.empty()) {
+    return;
+  }
+  if (data.kind != BlockKind::Paragraph && data.kind != BlockKind::Heading) {
+    throw std::invalid_argument("Inline objects require a paragraph or heading");
+  }
+  static std::atomic<std::uint64_t> last_id{0};
+  TextOffset previous = -1;
+  for (auto& object : data.inline_objects) {
+    if (object.offset <= previous || object.offset >= body.Length() ||
+        body.TextInRange({object.offset, object.offset + 1}) != object_replacement ||
+        !ValidInlineData(object.data)) {
+      throw std::invalid_argument("Invalid inline object");
+    }
+    if (fresh || object.id_ == 0) {
+      object.id_ = ++last_id;
+    }
+    previous = object.offset;
   }
 }
 
@@ -183,71 +239,46 @@ Block DocumentAccess::WithData(const Block& block, BlockData data) {
   const bool same_projection = IsAtomicBlock(data.kind) == IsAtomicBlock(old.data.kind) &&
       data.text == old.data.text;
   const auto body = same_projection ? old.body : BlockBody(data);
+  PrepareInlineObjects(data, body, false);
   Block changed = block;
   changed.storage_ = std::make_shared<const Block::Storage>(Block::Storage{std::move(data), body});
   return changed;
 }
 
-RichDocument DocumentAccess::Build(std::vector<Block> blocks, BlockId& last_id, bool fresh,
-                                   std::vector<BlockId>* added_text_blocks) {
+void DocumentAccess::ValidatePlacement(const Block& block, BlockKind parent, bool root) {
+  ValidateNesting(block.Data(), parent, root);
+}
+
+void DocumentAccess::AssignId(Block& block, BlockId& last_id, std::vector<BlockId>* added_text_blocks, bool fresh) {
+  auto data = block.Data();
+  const auto body = BlockBody(data);
+  ValidateBlock(data, body);
+  PrepareInlineObjects(data, body, fresh);
+  auto marks = std::move(data.marks);
+  data.marks.clear();
+  for (const auto& mark : marks) {
+    AddMark(data.marks, mark.range, mark.marks);
+  }
+  if (last_id == std::numeric_limits<BlockId>::max()) {
+    throw std::length_error("Editor block identity limit exceeded");
+  }
+  block.storage_ = std::make_shared<const Block::Storage>(Block::Storage{std::move(data), body});
+  block.id_ = ++last_id;
+  if (added_text_blocks && IsTextBlock(block.Data().kind)) {
+    added_text_blocks->push_back(block.id_);
+  }
+}
+
+RichDocument DocumentAccess::Build(std::vector<Block> blocks, BlockId& last_id, const RichDocument* previous,
+                                   const ChildChanges& changes, std::vector<BlockId>* added_text_blocks) {
   if (blocks.empty()) {
     blocks.emplace_back(BlockData{});
   }
-  auto storage = std::make_shared<DocumentStorage>();
-  BlockPath path;
-  auto visit = [&](auto& self, std::vector<Block>& siblings, BlockKind parent) -> bool {
-    if (path.size() >= max_nesting) {
-      throw std::invalid_argument("Document nesting limit exceeded");
-    }
-    bool reassigned = false;
-    for (std::size_t i = 0; i < siblings.size(); ++i) {
-      Block& block = siblings[i];
-      ValidateNesting(block.Data(), parent, path.empty());
-      const bool needs_id = fresh || block.id_ == 0;
-      if (needs_id) {
-        auto data = block.Data();
-        const auto body = BlockBody(data);
-        ValidateBlock(data, body);
-        auto marks = std::move(data.marks);
-        data.marks.clear();
-        for (const auto& mark : marks) {
-          AddMark(data.marks, mark.range, mark.marks);
-        }
-        block.storage_ = std::make_shared<const Block::Storage>(Block::Storage{std::move(data), body});
-        if (last_id == std::numeric_limits<BlockId>::max()) {
-          throw std::length_error("Editor block identity limit exceeded");
-        }
-        block.id_ = ++last_id;
-        if (added_text_blocks && IsTextBlock(block.Data().kind)) {
-          added_text_blocks->push_back(block.id_);
-        }
-        reassigned = true;
-      }
-      path.push_back(i);
-      if (IsLeaf(block.Data().kind)) {
-        if (!storage->leaves.empty()) {
-          ++storage->length;
-        }
-        storage->indexes.emplace(block.id_, storage->leaves.size());
-        storage->leaves.push_back({block, path, storage->length});
-        storage->length += Body(block).Length();
-      } else {
-        auto children = block.Data().children;
-        if (self(self, children, block.Data().kind)) {
-          auto data = block.Data();
-          data.children = std::move(children);
-          block = WithData(block, std::move(data));
-          reassigned = true;
-        }
-      }
-      path.pop_back();
-    }
-    return reassigned;
-  };
-  visit(visit, blocks, BlockKind::Paragraph);
-  storage->blocks = std::move(blocks);
-  storage->max_id = last_id;
-  return RichDocument(std::move(storage));
+  auto index = DocumentIndex::Build(blocks, last_id, previous ? &Get(*previous).index : nullptr,
+                                    previous ? previous->Blocks() : std::span<const Block>{},
+                                    changes, added_text_blocks);
+  return RichDocument(std::make_shared<const DocumentStorage>(
+      DocumentStorage{std::move(blocks), std::move(index), last_id}));
 }
 
 const Block& BlockAt(const RichDocument& document, std::span<const std::size_t> path) {
@@ -267,48 +298,57 @@ std::optional<TableCellLocation> TableCellAt(const RichDocument& document, const
 }
 
 std::size_t LeafIndex(const RichDocument& document, TextOffset absolute) {
-  const auto& leaves = DocumentAccess::Get(document).leaves;
-  const auto after = std::upper_bound(leaves.begin(), leaves.end(), absolute,
-                                      [](TextOffset value, const Leaf& leaf) { return value < leaf.start; });
-  return static_cast<std::size_t>(std::distance(leaves.begin(), after) - 1);
+  return DocumentAccess::Get(document).index.AtOffset(absolute).ordinal;
 }
 
 Position PositionAt(const RichDocument& document, TextOffset absolute, TextAffinity affinity) {
-  const auto& storage = DocumentAccess::Get(document);
-  if (absolute < 0 || absolute > storage.length ||
+  const auto& index = DocumentAccess::Get(document).index;
+  if (absolute < 0 || absolute > index.Length() ||
       (affinity != TextAffinity::Downstream && affinity != TextAffinity::Upstream)) {
     throw std::invalid_argument("Invalid editor position");
   }
-  const auto& leaf = storage.leaves[LeafIndex(document, absolute)];
+  const auto leaf = index.AtOffset(absolute);
   const auto local = absolute - leaf.start;
   (void)DocumentAccess::Body(leaf.block).TextInRange({local, local});
   return {DocumentAccess::Id(leaf.block), local, affinity};
 }
 
 TextOffset Absolute(const RichDocument& document, Position position) {
-  const auto& storage = DocumentAccess::Get(document);
-  return storage.leaves[storage.indexes.at(position.block)].start + position.offset;
+  return DocumentAccess::Get(document).index.StartOf(position.block) + position.offset;
 }
 
-std::string TextSlice(const RichDocument& document, TextRange range) {
+static std::string Slice(const RichDocument& document, TextRange range, bool plain) {
   if (!range.IsValid()) {
     throw std::invalid_argument("Invalid editor range");
   }
   (void)PositionAt(document, range.start);
   (void)PositionAt(document, range.end);
-  const auto& leaves = DocumentAccess::Get(document).leaves;
-  const auto first = LeafIndex(document, range.start);
-  const auto last = LeafIndex(document, range.end);
+  const auto& index = DocumentAccess::Get(document).index;
+  const auto first = index.AtOffset(range.start).ordinal;
+  const auto last = index.AtOffset(range.end).ordinal;
   std::string result;
-  for (std::size_t i = first; i <= last; ++i) {
-    const auto& leaf = leaves[i];
-    const auto& body = DocumentAccess::Body(leaf.block);
+  auto leaf = index.Leaves(first);
+  for (auto i = first; i <= last; ++i, leaf.Next()) {
+    const auto& body = DocumentAccess::Body(leaf->block);
     if (i != first) {
       result += '\n';
     }
-    const auto from = i == first ? range.start - leaf.start : 0;
-    const auto to = i == last ? range.end - leaf.start : body.Length();
-    if (from == 0 && to == body.Length()) {
+    const auto from = i == first ? range.start - leaf->start : 0;
+    const auto to = i == last ? range.end - leaf->start : body.Length();
+    const auto& data = leaf->block.Data();
+    if (plain && from == 0 && to == 1 && IsAtomicBlock(data.kind)) {
+      result += data.image ? data.image->alt_text : data.custom->fallback_text;
+    } else if (plain && !data.inline_objects.empty()) {
+      auto start = from;
+      for (const auto& object : data.inline_objects) {
+        if (object.offset >= from && object.offset < to) {
+          result += body.TextInRange({start, object.offset});
+          result += object.data.fallback_text;
+          start = object.offset + 1;
+        }
+      }
+      result += body.TextInRange({start, to});
+    } else if (from == 0 && to == body.Length()) {
       result += body.PlainText();
     } else {
       result += body.TextInRange({from, to});
@@ -317,22 +357,30 @@ std::string TextSlice(const RichDocument& document, TextRange range) {
   return result;
 }
 
+std::string TextSlice(const RichDocument& document, TextRange range) { return Slice(document, range, false); }
+
+std::string PlainTextSlice(const RichDocument& document, TextRange range) { return Slice(document, range, true); }
+
 bool SameText(const RichDocument& first, const RichDocument& second) {
   if (DocumentAccess::Same(first, second)) {
     return true;
   }
-  const auto& a = DocumentAccess::Get(first);
-  const auto& b = DocumentAccess::Get(second);
-  if (a.length != b.length) {
+  const auto& a = DocumentAccess::Get(first).index;
+  const auto& b = DocumentAccess::Get(second).index;
+  if (a.Length() != b.Length()) {
     return false;
   }
-  if (a.leaves.size() == b.leaves.size() &&
-      std::equal(a.leaves.begin(), a.leaves.end(), b.leaves.begin(), [](const Leaf& x, const Leaf& y) {
-        return DocumentAccess::Body(x.block).PlainText() == DocumentAccess::Body(y.block).PlainText();
-      })) {
-    return true;
+  if (a.LeafCount() == b.LeafCount()) {
+    auto left = a.Leaves();
+    auto right = b.Leaves();
+    for (; left && DocumentAccess::Body(left->block).PlainText() == DocumentAccess::Body(right->block).PlainText();
+         left.Next(), right.Next()) {
+    }
+    if (!left) {
+      return true;
+    }
   }
-  return TextSlice(first, {0, a.length}) == TextSlice(second, {0, b.length});
+  return TextSlice(first, {0, a.Length()}) == TextSlice(second, {0, b.Length()});
 }
 
 std::string NormalizeLineEndings(std::string_view text) {

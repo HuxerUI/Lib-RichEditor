@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <huxerui/richeditor/document.h>
+#include <huxerui/file.h>
 #include <huxerui/resource.h>
 #include <huxerui/stream.h>
 #include <huxerui/task.h>
@@ -124,6 +125,62 @@ struct CustomBlockExtension {
   bool operator==(const CustomBlockExtension&) const = default;
 };
 
+/// @brief Resolved appearance and storage context supplied to an inline object renderer.
+///
+/// The editor uses this value, the persistent object data and the renderer instance to decide whether a
+/// previous request still applies.
+struct InlineObjectRenderContext {
+  /// Resolved text foreground at the object's position, including the link color when it is linked.
+  Color foreground;
+  /// Resolved base font size of the containing block, in logical units.
+  float font_size = 0.0F;
+  /// Inline marks that cover the replacement character.
+  Mark marks = Mark::None;
+  /// Locale used for text shaping by the editor.
+  std::string locale;
+  /// Directory supplied by the application for resolving relative references, when available.
+  std::optional<File> document_directory;
+  bool operator==(const InlineObjectRenderContext&) const = default;
+};
+
+/// @brief Graphic to place on a text line with baseline-relative dimensions in logical units.
+///
+/// The asset must be valid. The width and total height must be finite and positive, with nonnegative
+/// ascent and descent. The editor scales all three dimensions together to fit the available line width.
+struct InlineObjectGraphic {
+  /// Raster or vector content drawn inside the measured object box.
+  std::variant<ImageAsset, VectorAsset> asset;
+  /// Horizontal advance occupied by the object.
+  float width = 0.0F;
+  /// Height of the object above the text baseline.
+  float ascent = 0.0F;
+  /// Height of the object below the text baseline.
+  float descent = 0.0F;
+  /// Optional accessibility label. When empty, the editor uses the fallback text or the type identifier.
+  std::string accessible_label;
+};
+
+/// @brief Asynchronously resolves an inline object's graphic for a committed document snapshot.
+///
+/// The mounted editor starts a cancellable task on the application thread with owned copies of the data
+/// and context. Use RunWorker() for expensive rendering. The editor can reuse a result when the object
+/// moves and its inputs are unchanged. It discards stale results after the request changes or the view
+/// unmounts. An empty or invalid result leaves the built-in image presentation or text fallback in place.
+using InlineObjectRenderer =
+    std::function<Task<std::optional<InlineObjectGraphic>>(InlineObjectData, InlineObjectRenderContext)>;
+
+/// @brief Registers an inline object renderer for a persistent type.
+///
+/// The first registration for a type takes precedence. Keep the renderer instance stable while its
+/// behavior and captured inputs stay the same. Replace the instance to refresh its results.
+struct InlineObjectExtension {
+  /// Exact identifier stored in InlineObjectData::type.
+  std::string type;
+  /// Optional renderer. The view can still use its built-in image presentation or the text fallback.
+  std::shared_ptr<const InlineObjectRenderer> render;
+  bool operator==(const InlineObjectExtension&) const = default;
+};
+
 /// @brief Presentation extensions owned by the mounted view.
 struct RichEditorExtensions {
   /// Optional application policy for image sources. The view can resolve local files when this is absent.
@@ -134,6 +191,9 @@ struct RichEditorExtensions {
   std::vector<std::shared_ptr<const DecorationProvider>> decorations;
   /// Registers one presenter per custom type. When registrations repeat a type, the first takes precedence.
   std::vector<CustomBlockExtension> custom_blocks;
+  /// Inline object presenters in registration order. A resolved graphic takes precedence over built-in
+  /// presentation for the same object.
+  std::vector<InlineObjectExtension> inline_objects;
 };
 
 } // namespace huxerui::richeditor

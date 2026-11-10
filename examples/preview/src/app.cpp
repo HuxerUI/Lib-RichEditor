@@ -23,7 +23,7 @@ namespace {
 
 constexpr std::string_view sample_markdown = R"markdown(# Field notes
 
-Collect ideas worth keeping. Try **bold**, *italics*, and `inline code`. 中文输入 and emoji 🙂 work here too.
+Collect ideas worth keeping. Try **bold**, *italics*, and `inline code`. 中文输入 and emoji 🙂 work here too. Try inline math $x^2 + y^2 = r^2$ in a sentence.
 
 > Keep the detail that makes the story yours.
 
@@ -443,28 +443,41 @@ View LinkTool(RichEditorController editor, ViewHandle focus, bool available) {
       );
 }
 
+struct FormulaRequest {
+  bool inline_math = false;
+  std::optional<CustomBlockData> block;
+  std::optional<InlineObjectSelection> object;
+};
+
 [[huxerui::composable]]
-View FormulaDialog(DialogContext context, RichEditorController editor, std::optional<CustomBlockData> original) {
+View FormulaDialog(DialogContext context, RichEditorController editor, FormulaRequest request) {
   const auto& theme = UseTheme();
-  const std::string source = original ? original->payload : R"(\frac{a}{b})";
+  const bool editing = request.block || request.object;
+  const std::string source = request.object ? request.object->data.payload
+      : request.block ? request.block->payload : R"(\frac{a}{b})";
   const auto draft = UseState(TextEditingValue{source, {0, AttributedText(source).Length()}, {}});
-  const auto replacement = LatexBlock(draft->text);
-  const EditorCommand command = original ? EditorCommand{ReplaceCustomBlock{replacement, original}}
-                                         : EditorCommand{InsertCustomBlock{replacement}};
+  EditorCommand command = InsertCustomBlock{LatexBlock(draft->text)};
+  if (request.object) {
+    command = ReplaceInlineObject{request.object->target, LatexInline(draft->text), request.object->data};
+  } else if (request.inline_math) {
+    command = InsertInlineObject{LatexInline(draft->text)};
+  } else if (request.block) {
+    command = ReplaceCustomBlock{LatexBlock(draft->text), request.block};
+  }
   const bool enabled = draft->text.find_first_not_of(" \t\r\n") != std::string::npos &&
       !draft->composition && editor.GetCommandState(command).enabled;
   return Column {
-    Text(original ? "Edit formula" : "Insert formula", TextRole::Title),
+    Text(editing ? "Edit formula" : request.inline_math ? "Insert inline formula" : "Insert display formula", TextRole::Title),
     TextField(draft)
         .Label("LaTeX source")
         .Variant(TextFieldVariant::Outlined)
-        .LineLimits(TextFieldLineLimits::MultiLine(2, 5))
+        .LineLimits(request.inline_math ? TextFieldLineLimits::SingleLine() : TextFieldLineLimits::MultiLine(2, 5))
         .InputConfiguration({.autocorrect = false})
         .OnChanged([draft](const TextEditingValue& value) { draft = value; }),
     Row {
       Spacer().With(Grow()),
       Button("Cancel").OnClick([context] { context.Dismiss(); }),
-      Button(original ? "Apply" : "Insert").OnClick([=] {
+      Button(editing ? "Apply" : "Insert").OnClick([=] {
         if (editor.Execute(command)) {
           context.Dismiss();
         }
@@ -495,7 +508,7 @@ std::vector<TextDecorationRange> FindMatches(std::span<const DecorationBlock> bl
 
 [[huxerui::composable]]
 View FormattingBar(RichEditorController editor, ViewHandle focus, bool available, bool can_pick_images,
-                   std::function<void(bool)> pick_image) {
+                   std::function<void(bool, bool)> pick_image) {
   using namespace app::images;
   const auto& theme = UseTheme();
   const auto menu = UseMenu();
@@ -569,11 +582,20 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const bool can_insert_image = can_pick_images &&
       editor.GetCommandState(InsertImage{{.source = "attachments/image.jpg"}}).enabled;
   const auto custom = editor.SelectedCustomBlock();
-  const bool formula_selected = custom && custom->type == latex_block_type && custom->version == 1;
+  const auto inline_object = editor.SelectedInlineObject();
+  const bool inline_formula = inline_object && inline_object->data.type == latex_block_type &&
+      inline_object->data.version == 1;
+  const bool formula_selected = inline_formula || (custom && custom->type == latex_block_type && custom->version == 1);
   const bool can_insert_formula = editor.GetCommandState(InsertCustomBlock{LatexBlock("x")}).enabled;
-  const auto insert_formula = [=] { dialog.Show(FormulaDialog, editor, std::optional<CustomBlockData>{}); };
-  const auto edit_formula = [=] { dialog.Show(FormulaDialog, editor, custom); };
-  const auto copy_formula = [=] { clipboard->WriteText(custom->payload); };
+  const bool can_insert_inline_formula = editor.GetCommandState(InsertInlineObject{LatexInline("x")}).enabled;
+  const bool can_insert_inline_image = can_pick_images && editor.GetCommandState(
+      InsertInlineObject{InlineImage({.source = "attachments/image.png"})}).enabled;
+  const auto insert_formula = [=] { dialog.Show(FormulaDialog, editor, FormulaRequest{}); };
+  const auto insert_inline_formula = [=] { dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true}); };
+  const auto edit_formula = [=] {
+    dialog.Show(FormulaDialog, editor, FormulaRequest{inline_formula, custom, inline_formula ? inline_object : std::nullopt});
+  };
+  const auto copy_formula = [=] { clipboard->WriteText(inline_formula ? inline_object->data.payload : custom->payload); };
   const auto selected_size = editor.SelectedImageSize();
   const ToggleList ordered_list{ListKind::Ordered};
   const auto ordered_state = editor.GetCommandState(ordered_list);
@@ -614,8 +636,8 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       dialog.Show(ImageSizeDialog, editor, *size);
     }
   };
-  const auto add_after = MenuItem("Add image after", [pick_image] { pick_image(false); }).Enabled(can_pick_images);
-  const auto replace_image = [pick_image] { pick_image(true); };
+  const auto add_after = MenuItem("Add image after", [pick_image] { pick_image(false, false); }).Enabled(can_pick_images);
+  const auto replace_image = [pick_image] { pick_image(true, false); };
   const auto table_tool = menu_tool(table_grid, table_label, table_anchor, header_state.enabled || can_insert_table,
                                     in_table, [=] {
     if (in_table) {
@@ -662,7 +684,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       context = "image";
       actions.Add(text_tool("Size", "Image size", selected_size.has_value(), open_image_size));
       actions.Add(text_tool("Replace", "Replace image", can_pick_images, replace_image));
-      actions.Add(text_tool("+ Image", "Add image after", can_pick_images, [pick_image] { pick_image(false); }));
+      actions.Add(text_tool("+ Image", "Add image after", can_pick_images, [pick_image] { pick_image(false, false); }));
     } else if (formula_selected) {
       context = "formula";
       actions.Add(text_tool("Edit formula", "Edit formula", true, edit_formula));
@@ -726,9 +748,12 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         }));
         items.emplace_back(MenuItem("Insert", {
             command_item("Insert table", insert_table),
-            MenuItem("Insert image", [pick_image] { pick_image(false); }).Enabled(can_insert_image),
-            MenuItem("Insert formula…", insert_formula).Enabled(can_insert_formula),
-        }).Enabled(can_insert_table || can_insert_image || can_insert_formula));
+            MenuItem("Insert image", [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
+            MenuItem("Insert inline image", [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
+            MenuItem("Insert inline formula…", insert_inline_formula).Enabled(can_insert_inline_formula),
+            MenuItem("Insert display formula…", insert_formula).Enabled(can_insert_formula),
+        }).Enabled(can_insert_table || can_insert_image || can_insert_inline_image ||
+                   can_insert_formula || can_insert_inline_formula));
         items.emplace_back(MenuItem("Lists and quote", {
             command_item("Bulleted list", ToggleList{ListKind::Unordered}),
             command_item("Numbered list", ordered_list),
@@ -748,7 +773,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       tool(undo, "Undo", Undo{}),
       tool(redo, "Redo", Redo{}),
       table_tool,
-      menu_tool(image_block, image_label, image_anchor, image_selected || can_insert_image, image_selected, [=] {
+      menu_tool(image_block, image_label, image_anchor, image_selected || can_insert_image || can_insert_inline_image, image_selected, [=] {
         if (image_selected) {
           menu.Show(image_anchor, {
               MenuItem("Image size…", open_image_size).Enabled(selected_size.has_value()),
@@ -758,18 +783,24 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
               command_item("Delete image", DeleteImage{}),
           });
         } else {
-          pick_image(false);
+          menu.Show(image_anchor, {
+              MenuItem("Insert image block", [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
+              MenuItem("Insert inline image", [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
+          });
         }
       }),
       menu_tool(formula, formula_selected ? "Formula actions" : "Insert formula", formula_anchor,
-                formula_selected || can_insert_formula, formula_selected, [=] {
+                formula_selected || can_insert_formula || can_insert_inline_formula, formula_selected, [=] {
         if (formula_selected) {
           menu.Show(formula_anchor, {
               MenuItem("Edit formula…", edit_formula),
               MenuItem("Copy LaTeX", copy_formula).Enabled(clipboard && clipboard->IsAvailable()),
           });
         } else {
-          insert_formula();
+          menu.Show(formula_anchor, {
+              MenuItem("Inline formula…", insert_inline_formula).Enabled(can_insert_inline_formula),
+              MenuItem("Display formula…", insert_formula).Enabled(can_insert_formula),
+          });
         }
       }),
       tool(bulleted_list, "Bulleted list", ToggleList{ListKind::Unordered}),
@@ -794,7 +825,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
 
 [[huxerui::composable]]
 View Preview() {
-  static const auto imported = MarkdownCodec({.display_math = true}).Import(sample_markdown);
+  static const auto imported = MarkdownCodec({.display_math = true, .inline_math = true, .inline_images = true}).Import(sample_markdown);
   const auto editor = UseRichEditor(imported.document.value_or(RichDocument{}));
   const auto focus = UseViewHandle();
   const auto find_focus = UseViewHandle();
@@ -856,7 +887,7 @@ View Preview() {
     decoration_providers.push_back(provider);
   }
 
-  const auto pick_image = [=](bool replace) {
+  const auto pick_image = [=](bool replace, bool inline_image) {
     if (busy.Get()) {
       return;
     }
@@ -868,8 +899,9 @@ View Preview() {
       if (selected) {
         auto saved = co_await folio::ImportImage(directory, *selected);
         if (saved.Succeeded()) {
-          const auto command = replace ? EditorCommand{ReplaceImage{std::move(saved.Value())}}
-              : EditorCommand{InsertImage{{std::move(saved.Value()), selected->Name(), {}}}};
+          const ImageBlockData image{std::move(saved.Value()), selected->Name(), {}};
+          const auto command = replace ? EditorCommand{ReplaceImage{image.source}}
+              : inline_image ? EditorCommand{InsertInlineObject{InlineImage(image)}} : EditorCommand{InsertImage{image}};
           status = editor.Execute(command) ? (replace ? "Image replaced" : "Image inserted")
                                            : "Select an image or place the caret in a paragraph";
         } else {
@@ -947,8 +979,9 @@ View Preview() {
   };
 
   const auto export_markdown = [=] {
+    const auto* codec = &MarkdownCodec({.display_math = true, .inline_math = true, .inline_images = true});
     const auto snapshot = editor.Document();
-    auto strict = MarkdownCodec({.display_math = true}).Export(snapshot);
+    auto strict = codec->Export(snapshot);
     const SaveFileOptions options{
         .suggested_name = "article.md",
         .filter = {.name = "Markdown", .extensions = {"md"}, .content_types = {"text/markdown"}}};
@@ -957,7 +990,7 @@ View Preview() {
       return;
     }
     dialog.Show("Export Markdown with loss?", IssueMessage(strict.issues), "Export with loss", "Cancel", [=] {
-      save_document(snapshot, MarkdownCodec({.display_math = true}).Export(snapshot, LossPolicy::AllowLoss), options);
+      save_document(snapshot, codec->Export(snapshot, LossPolicy::AllowLoss), options);
     });
   };
 
@@ -1086,7 +1119,13 @@ View Preview() {
     FormattingBar(editor, focus, !working, picker->CanOpenFiles(), pick_image),
     RichEditor(editor, {.style = StudioEditorStyle(theme, compact), .document_directory = directory,
                         .extensions = {.decorations = std::move(decoration_providers),
-                                       .custom_blocks = {{std::string(latex_block_type), folio::FormulaRenderer()}}}})
+                                       .custom_blocks = {{std::string(latex_block_type), folio::FormulaRenderer()}},
+                                       .inline_objects = {folio::InlineFormulaExtension()}}})
+        .On<RichEditorEvents::InlineObjectActivated>([=](const InlineObjectSelection& object) {
+          if (object.data.type == latex_block_type && object.data.version == 1) {
+            dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true, .object = object});
+          }
+        })
         .With(focus, Grow(), Enabled(!working), Semantics{.label = "Article", .identifier = "article-editor"}),
     Text(working ? "Working…" : status.Get(), TextRole::Label)
         .Align(TextAlign::Center)
