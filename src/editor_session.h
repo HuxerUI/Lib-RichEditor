@@ -67,7 +67,8 @@ public:
   bool Apply(std::span<const TextInputCommand> commands);
   bool Select(TextSelection selection);
   bool BreakLine(bool hard_break);
-  bool ExitAtCaret();
+  bool BackspaceAtStart();
+  bool AppendTableRow();
   bool ExitCode();
   bool SetCodeLanguage(BlockId block, std::string_view language);
   void FinishComposition();

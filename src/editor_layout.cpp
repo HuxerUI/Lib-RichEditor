@@ -485,8 +485,8 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         boxes.push_back(std::move(box));
         metrics.push_back(measure);
       }
-      auto layout = measurer.CreateTextLayout(metrics.empty() ? attributed : attributed.WithInlineObjects(metrics),
-                                               base, available, options);
+      auto text = metrics.empty() ? attributed : attributed.WithInlineObjects(metrics);
+      auto layout = measurer.CreateTextLayout(text, base, available, options);
       const auto fills = CustomInlineFills(data, theme.colors, style);
       InlineOffsets offsets;
       if (std::ranges::any_of(fills, [](const InlineFillRange& fill) { return fill.fill.horizontal_padding > 0.0F; })) {
@@ -498,8 +498,8 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
             for (auto& object : metrics) {
               object.offset = offsets.ToLayout({object.offset, TextAffinity::Downstream}).offset;
             }
-            layout = measurer.CreateTextLayout(metrics.empty() ? padded : padded.WithInlineObjects(metrics),
-                                               base, available, options);
+            text = metrics.empty() ? padded : padded.WithInlineObjects(metrics);
+            layout = measurer.CreateTextLayout(text, base, available, options);
           }
         }
       }
@@ -514,8 +514,10 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
           graphic = (*presenter->render)(*data.custom, base.foreground, base.font.Size());
         }
       }
+      auto linked_text = data.links.empty() ? nullptr
+          : std::make_shared<const CachedLayout::LinkedText>(CachedLayout::LinkedText{std::move(text), base});
       return CachedLayout{leaf.block, available, std::move(layout), std::move(offsets), std::move(backgrounds),
-                          std::move(boxes), sources, std::move(graphic), header};
+                          std::move(boxes), sources, std::move(graphic), header, std::move(linked_text)};
     };
     auto cached = found != cache_.end() && found->second.width == available && found->second.block == leaf.block &&
             found->second.header == header && found->second.inline_sources == sources ? found->second : create();
@@ -821,6 +823,55 @@ TextPosition EditorLayout::Hit(const RichDocument& document, std::size_t index, 
   auto result = row.offsets.ToSource(row.layout.HitTest(point - Origin(row)));
   result.offset += DocumentAccess::Get(document).index.At(index).start;
   return result;
+}
+
+std::optional<EditorLayout::LinkLocation> EditorLayout::LinkAt(const RichDocument& document, Point point) const {
+  const auto row = LeafIndex(document, Hit(document, point).offset);
+  const auto leaf = DocumentAccess::Get(document).index.At(row);
+  const auto& links = leaf.block.Data().links;
+  for (std::size_t i = 0; i < links.size(); ++i) {
+    if (std::ranges::any_of(TextFragments(rows_[row], links[i].range),
+                            [point](Rect fragment) { return fragment.Contains(point); })) {
+      return LinkLocation{row, i};
+    }
+  }
+  return std::nullopt;
+}
+
+void EditorLayout::PaintText(PaintContext& paint, std::size_t index, std::optional<LinkLocation> hovered_link) const {
+  const auto& row = rows_[index];
+  const auto origin = Origin(row);
+  if (!hovered_link || hovered_link->row != index) {
+    paint.DrawText(origin, row.layout);
+    return;
+  }
+  const auto leaf = DocumentAccess::Get(*document_).index.At(index);
+  const auto& cached = cache_.at(DocumentAccess::Id(leaf.block));
+  const auto& text = *cached.linked_text;
+  const auto range = leaf.block.Data().links[hovered_link->link_index].range;
+  const auto start = row.offsets.ToLayout({range.start, TextAffinity::Downstream}).offset;
+  const auto end = row.offsets.ToLayout({range.end, TextAffinity::Upstream}).offset;
+  const auto color = style_.link_hover_color.value_or(theme_.colors.on_primary_container);
+  std::vector<TextStyleRange> styles;
+  styles.reserve(text.text.StyleRanges().size() + 2);
+  for (const auto& run : text.text.StyleRanges()) {
+    if (run.range.end <= start || run.range.start >= end) {
+      styles.push_back(run);
+      continue;
+    }
+    // The SDK can merge equal styles from adjacent links. Keep the other link's color outside this range.
+    if (run.range.start < start) {
+      styles.push_back({{run.range.start, start}, run.style});
+    }
+    auto style = run.style;
+    style.foreground = color;
+    styles.push_back({{std::max(run.range.start, start), std::min(run.range.end, end)}, std::move(style)});
+    if (run.range.end > end) {
+      styles.push_back({{end, run.range.end}, run.style});
+    }
+  }
+  paint.DrawText({origin.x, origin.y, cached.width, row.layout.Metrics().size.height},
+                 text.text.WithStyles(std::move(styles)), text.base, {.shaping = {.locale = locale_}});
 }
 
 Rect EditorLayout::Caret(const RichDocument& document, TextPosition position) const {

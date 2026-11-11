@@ -68,6 +68,12 @@ struct InlineOffsets {
 /// text. Points and rectangles use content coordinates before the view applies its origin and scroll offset.
 class EditorLayout {
 public:
+  struct LinkLocation {
+    std::size_t row;
+    std::size_t link_index;
+    bool operator==(const LinkLocation&) const = default;
+  };
+
   struct ListMarker {
     std::string text;
     float left;
@@ -208,6 +214,10 @@ public:
 
   /// Finds the caret nearest the point. Query the same snapshot used by Prepare().
   TextPosition Hit(const RichDocument& document, Point point) const;
+  /// Hits the laid-out link fragments, including wrapped text and clipped table cells.
+  std::optional<LinkLocation> LinkAt(const RichDocument& document, Point point) const;
+  /// Records the normal row text or replaces the hovered link's foreground using the existing layout inputs.
+  void PaintText(PaintContext& paint, std::size_t index, std::optional<LinkLocation> hovered_link) const;
   /// Finds the caret within a known row, for navigation between visual lines.
   TextPosition Hit(const RichDocument& document, std::size_t index, Point point) const;
   /// Resolves a document position and affinity to a content-local caret rectangle.
@@ -226,6 +236,11 @@ private:
   };
 
   struct CachedLayout {
+    struct LinkedText {
+      AttributedText text;
+      TextStyle base;
+    };
+
     Block block;
     float width;
     TextLayout layout;
@@ -235,6 +250,7 @@ private:
     std::vector<InlineSource> inline_sources;
     std::optional<CustomBlockGraphic> custom_graphic;
     bool header;
+    std::shared_ptr<const LinkedText> linked_text;
   };
 
   std::size_t LeafInRow(std::size_t index, float x) const;

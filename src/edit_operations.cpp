@@ -285,20 +285,29 @@ TreeRange Siblings(const RichDocument& document, TextRange range) {
   return {std::move(parent), a[depth], b[depth]};
 }
 
+std::optional<TreeRange> CommonListItems(const RichDocument& document, std::span<const std::size_t> first_path,
+                                        std::span<const std::size_t> last_path) {
+  std::size_t item_depth = 0;
+  auto siblings = document.Blocks();
+  for (std::size_t depth = 0; depth + 1 < std::min(first_path.size(), last_path.size()) &&
+      first_path[depth] == last_path[depth]; ++depth) {
+    const auto& data = siblings[first_path[depth]].Data();
+    if (data.kind == BlockKind::List) {
+      item_depth = depth + 1;
+    }
+    siblings = data.children;
+  }
+  if (item_depth == 0) {
+    return std::nullopt;
+  }
+  const auto list_path = first_path.first(item_depth);
+  return TreeRange{{list_path.begin(), list_path.end()}, first_path[item_depth], last_path[item_depth]};
+}
+
 std::optional<TreeRange> SelectedItems(const RichDocument& document, TextRange range) {
   const auto [first, last] = TouchedLeaves(document, range);
   const auto& leaves = DocumentAccess::Get(document).index;
-  const auto& a = leaves.At(first).path;
-  const auto& b = leaves.At(last).path;
-  BlockPath common;
-  std::optional<TreeRange> result;
-  for (std::size_t depth = 0; depth + 1 < a.size() && depth + 1 < b.size() && a[depth] == b[depth]; ++depth) {
-    common.push_back(a[depth]);
-    if (BlockAt(document, common).Data().kind == BlockKind::List) {
-      result = TreeRange{common, a[depth + 1], b[depth + 1]};
-    }
-  }
-  return result;
+  return CommonListItems(document, leaves.At(first).path, leaves.At(last).path);
 }
 
 TreeRange ParentSlot(BlockPath path) {
@@ -307,18 +316,42 @@ TreeRange ParentSlot(BlockPath path) {
   return {std::move(path), index, index};
 }
 
-Block ListSlice(const Block& list, std::size_t begin, std::size_t end) {
+Block ListSlice(const Block& list, std::size_t begin, std::size_t end, std::size_t removed_before = 0) {
   auto data = list.Data();
   data.children = BlocksBetween(data.children, begin, end);
   if (data.ordered) {
     data.list_start = static_cast<unsigned>(std::min<std::uint64_t>(
-        static_cast<std::uint64_t>(data.list_start) + begin, std::numeric_limits<unsigned>::max()));
+        static_cast<std::uint64_t>(data.list_start) + (begin - removed_before), std::numeric_limits<unsigned>::max()));
   }
   return Block(std::move(data));
 }
 
 void AppendBlocks(std::vector<Block>& destination, std::span<const Block> blocks) {
   destination.insert(destination.end(), blocks.begin(), blocks.end());
+}
+
+void JoinListItems(const RichDocument& document, const TreeRange& items, Replacements& replacements,
+                   ChildChanges& child_changes) {
+  const auto siblings = ChildrenAt(document, items.parent);
+  const auto& last = siblings[items.last];
+  const auto last_id = DocumentAccess::Id(last);
+  auto suffix = Rewrite(last.Data().children, replacements, last_id, child_changes);
+  replacements[last_id] = {};
+  if (suffix.empty()) {
+    return;
+  }
+
+  // The text replacement joins the boundary leaves. Keep the last item's surviving blocks with that text.
+  const auto& first = siblings[items.first];
+  const auto first_id = DocumentAccess::Id(first);
+  auto data = first.Data();
+  data.children = Rewrite(data.children, replacements, first_id, child_changes);
+  AppendBlocks(data.children, suffix);
+  // Appending the suffix extends the splice through the end of the first item.
+  auto& change = child_changes.at(first_id);
+  change.old_end = first.Data().children.size();
+  change.new_end = data.children.size();
+  replacements[first_id] = {DocumentAccess::WithData(first, std::move(data))};
 }
 
 RichDocument ChangeList(const RichDocument& document, TextRange range, bool ordered, EditChanges& edit) {
@@ -391,13 +424,14 @@ RichDocument Indent(const RichDocument& document, const TreeRange& items, EditCh
                 {DocumentAccess::WithData(previous, std::move(item))}, edit);
 }
 
-RichDocument Outdent(const RichDocument& document, const TreeRange& items, EditChanges& edit) {
+RichDocument Outdent(const RichDocument& document, const TreeRange& items, EditChanges& edit,
+                     bool leave_empty_item = false) {
   const auto& list = BlockAt(document, items.parent);
   const auto& children = list.Data().children;
   const auto slot = ParentSlot(items.parent);
   const auto before = items.first == 0 ? std::nullopt : std::optional(ListSlice(list, 0, items.first));
-  const auto after = items.last + 1 == children.size() ? std::nullopt
-                                                      : std::optional(ListSlice(list, items.last + 1, children.size()));
+  const auto after = items.last + 1 == children.size() ? std::nullopt :
+      std::optional(ListSlice(list, items.last + 1, children.size(), leave_empty_item ? 1 : 0));
   std::vector<Block> replacement;
   if (!slot.parent.empty() && BlockAt(document, slot.parent).Data().kind == BlockKind::ListItem) {
     const auto& parent = BlockAt(document, slot.parent);
@@ -575,7 +609,14 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
     edit.Touch(block);
     replacements[DocumentAccess::Id(block)] = {};
   }
-  return {Rewrite(document, replacements, edit), range.start + inserted_length};
+  ChildChanges child_changes;
+  if (first != last) {
+    const auto items = CommonListItems(document, storage.index.At(first).path, storage.index.At(last).path);
+    if (items && items->first != items->last) {
+      JoinListItems(document, *items, replacements, child_changes);
+    }
+  }
+  return {Rewrite(document, replacements, edit, std::move(child_changes)), range.start + inserted_length};
 }
 
 bool CanInsertInlineObject(const RichDocument& document, TextRange range) {
@@ -965,40 +1006,70 @@ RichDocument ChangeContainer(const RichDocument& document, TextRange range, cons
   return Outdent(document, *items, edit);
 }
 
-RichDocument SplitListItem(const RichDocument& document, TextOffset new_paragraph, EditChanges& edit) {
-  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, new_paragraph));
+std::optional<RichDocument> InsertListItemBefore(const RichDocument& document, const Leaf& leaf, EditChanges& edit) {
+  if (leaf.path.size() < 3 || leaf.path.back() != 0 || leaf.block.Data().text.empty()) {
+    return std::nullopt;
+  }
+  const auto slot = ParentSlot(leaf.path);
+  const auto& item = BlockAt(document, slot.parent);
+  if (item.Data().kind != BlockKind::ListItem) {
+    return std::nullopt;
+  }
+  return Splice(document, ParentSlot(slot.parent),
+                {Block(BlockData{.kind = BlockKind::ListItem, .children = {Block(BlockData{})}}), item}, edit);
+}
+
+EditResult SplitListItem(EditResult result, EditChanges& edit) {
+  const auto& document = result.document;
+  const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, result.caret));
   const auto slot = ParentSlot(leaf.path);
   if (slot.parent.empty() || slot.first == 0) {
-    return document;
+    return result;
   }
   const auto& item = BlockAt(document, slot.parent);
   if (item.Data().kind != BlockKind::ListItem) {
-    return document;
+    return result;
   }
+  const auto caret = PositionAt(document, result.caret);
   auto data = item.Data();
-  auto next = BlocksBetween(data.children, slot.first, data.children.size());
-  data.children.erase(data.children.begin() + static_cast<std::ptrdiff_t>(slot.first), data.children.end());
-  return Splice(document, ParentSlot(slot.parent),
-                {DocumentAccess::WithData(item, std::move(data)),
-                 Block(BlockData{.kind = BlockKind::ListItem, .children = std::move(next)})}, edit);
+  // Return at the end of the text adds a sibling below the existing sublist and continuation blocks.
+  const auto end = leaf.block.Data().text.empty() ? slot.first + 1 : data.children.size();
+  auto next = BlocksBetween(data.children, slot.first, end);
+  data.children.erase(data.children.begin() + static_cast<std::ptrdiff_t>(slot.first),
+                      data.children.begin() + static_cast<std::ptrdiff_t>(end));
+  result.document = Splice(document, ParentSlot(slot.parent),
+                           {DocumentAccess::WithData(item, std::move(data)),
+                            Block(BlockData{.kind = BlockKind::ListItem, .children = std::move(next)})}, edit);
+  result.caret = Absolute(result.document, caret);
+  return result;
 }
 
 RichDocument ExitContainer(const RichDocument& document, TextOffset caret, bool empty_only, EditChanges& edit) {
   const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, caret));
-  if (caret != leaf.start || (empty_only && !leaf.block.Data().text.empty())) {
+  const bool empty = leaf.block.Data().text.empty();
+  if (caret != leaf.start || (empty_only && !empty)) {
     return document;
   }
   const auto slot = ParentSlot(leaf.path);
   if (!slot.parent.empty() && BlockAt(document, slot.parent).Data().kind == BlockKind::Quote &&
-      (empty_only ? slot.last + 1 == ChildrenAt(document, slot.parent).size() : slot.first == 0)) {
+      (empty_only ? slot.last + 1 == ChildrenAt(document, slot.parent).size() : empty || slot.first == 0)) {
     return ChangeQuote(document, {caret, caret}, edit);
   }
-  if (const auto items = SelectedItems(document, {caret, caret}); items && slot.first == 0 &&
-      !slot.parent.empty() && BlockAt(document, slot.parent).Data().kind == BlockKind::ListItem &&
-      (empty_only ? ChildrenAt(document, slot.parent).size() == 1 : items->first == 0)) {
-    return Outdent(document, *items, edit);
+  if (slot.parent.empty() || slot.first != 0 || BlockAt(document, slot.parent).Data().kind != BlockKind::ListItem) {
+    return document;
   }
-  return document;
+  const bool empty_item = empty && ChildrenAt(document, slot.parent).size() == 1;
+  const auto items = ParentSlot(slot.parent);
+  if (!empty_item && (empty_only || items.first != 0)) {
+    return document;
+  }
+  const auto list_slot = ParentSlot(items.parent);
+  if (!empty_only && empty_item && items.last + 1 < ChildrenAt(document, items.parent).size() &&
+      !list_slot.parent.empty() && BlockAt(document, list_slot.parent).Data().kind == BlockKind::ListItem) {
+    // Keep the following subitems under their parent and place the caret in the next item.
+    return Splice(document, items, {}, edit);
+  }
+  return Outdent(document, items, edit, empty);
 }
 
 EditResult ExitCodeBlock(const RichDocument& document, TextOffset caret, EditChanges& edit) {
@@ -1053,7 +1124,7 @@ CommandState TableStatus(const RichDocument& document, TextRange range, const Ed
 }
 
 RichDocument ChangeTable(const RichDocument& document, Selection& selection, const EditorCommand& command,
-                         EditChanges& edit) {
+                         EditChanges& edit, bool select_inserted_row) {
   const auto& storage = DocumentAccess::Get(document);
   const auto& leaf = storage.index.At(storage.index.IndexOf(selection.active.block).value());
   auto index = leaf.path.front();
@@ -1103,6 +1174,10 @@ RichDocument ChangeTable(const RichDocument& document, Selection& selection, con
   if (const auto* insert = std::get_if<InsertTableRow>(&command)) {
     const auto at = row + (insert->side == TableInsertSide::After);
     rows.insert(rows.begin() + static_cast<std::ptrdiff_t>(at), EmptyRow(column_count));
+    if (select_inserted_row) {
+      row = at;
+      column = 0;
+    }
   } else if (std::holds_alternative<DeleteTableRow>(command)) {
     edit.Touch(rows[row]);
     rows.erase(rows.begin() + static_cast<std::ptrdiff_t>(row));
@@ -1132,7 +1207,7 @@ RichDocument ChangeTable(const RichDocument& document, Selection& selection, con
   }
   blocks[index] = DocumentAccess::WithData(blocks[index], std::move(data));
   auto next = edit.Build(document, std::move(blocks), {{0, {index, index + 1, index + 1}}});
-  if (!DocumentAccess::Get(next).index.FindLeaf(selection.active.block)) {
+  if (select_inserted_row || !DocumentAccess::Get(next).index.FindLeaf(selection.active.block)) {
     SelectBlock(selection, next.Blocks()[index].Data().children[row].Data().children[column]);
   }
   return next;

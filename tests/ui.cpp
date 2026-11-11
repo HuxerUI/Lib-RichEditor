@@ -25,6 +25,7 @@ namespace {
 
 std::optional<RichEditorController> controller;
 std::optional<State<RichEditorStyle>> appearance;
+std::optional<State<std::shared_ptr<const EditorKeymap>>> shortcut_keymap;
 std::shared_ptr<const ImageResolver> initial_image_resolver;
 std::optional<State<std::shared_ptr<const ImageResolver>>> image_resolver_state;
 std::optional<State<std::optional<File>>> image_directory_state;
@@ -347,6 +348,90 @@ void HeadingAndLinkEditing() {
         "The edited heading and links survive a strict Markdown round trip");
 }
 
+std::vector<LinkRange> activated_links;
+std::size_t link_pointer_moves = 0;
+
+View LinkFixture() {
+  const auto document = MarkdownCodec().Import("[A link](https://example.com \"Site\") and plain");
+  const auto editor = UseRichEditor(*document.document);
+  return RichEditor(editor, {.style = {.body_font = Font::Monospace(20), .content_padding = EdgeInsets::All(12),
+                                       .link_hover_color = Color::Rgb(166, 193, 217)}})
+      .On<ViewEvents::Pointer>([](const PointerEvent& event) {
+        if (event.type == PointerEventType::Move) {
+          ++link_pointer_moves;
+        }
+      })
+      .On<RichEditorEvents::LinkActivated>([](const LinkRange& link) {
+        activated_links.push_back(link);
+        return true;
+      }).Key("linked-editor");
+}
+
+void LinkActivation() {
+  const Application app(LinkFixture, {.show_debug_overlay = false});
+  UiTest ui(app, {.viewport = {400, 240}});
+  const auto editor = ui.Find(UiSelector::Key("linked-editor"));
+  const auto bounds = editor.One().bounds;
+  const Point linked{bounds.x + 27, bounds.y + 24};
+  const Point blank{bounds.x + 300, bounds.y + 24};
+  const KeyModifiers command{.meta = true};
+  const KeyModifiers control{.control = true};
+  const auto move = [&](Point point, KeyModifiers modifiers = {}) {
+    ui.SendPointer({.type = PointerEventType::Move, .position = point, .modifiers = modifiers});
+    ui.Pump();
+  };
+  const auto has_hover_color = [&] {
+    return ui.CaptureSnapshot().ToString().find("green=0.756863") != std::string::npos;
+  };
+  move(linked);
+  Check(!has_hover_color(), "Ordinary hover preserves the normal link foreground");
+  move({linked.x + 1, linked.y}, control);
+  Check(!ui.ActiveTextInput() && has_hover_color(), "Control-hover works on an unfocused editor with a pointer listener");
+  Check(link_pointer_moves == 2, "The editor still delivers each pointer move to the caller once");
+  move(blank, control);
+  Check(!has_hover_color(), "Moving off the link clears the hover color");
+
+  const auto pointer = [&](PointerEventType type, Point point, KeyModifiers modifiers) {
+    ui.SendPointer({.type = type, .pointer_id = 7, .position = point, .device_kind = PointerDeviceKind::Mouse,
+                    .changed_button = type == PointerEventType::Down || type == PointerEventType::Up
+                        ? PointerButton::Primary : PointerButton::None,
+                    .pressed_buttons = type == PointerEventType::Down || type == PointerEventType::Move
+                        ? PointerButton::Primary : PointerButton::None,
+                    .modifiers = modifiers});
+    ui.Pump();
+  };
+  ui.TapAt(linked, {.device_kind = PointerDeviceKind::Mouse});
+  Check(activated_links.empty(), "A normal click places the caret without activating the link");
+  move(linked);
+  ui.SendKey({.type = KeyEventType::Down, .key = Key::MetaLeft, .modifiers = command});
+  ui.Pump();
+  Check(has_hover_color(), "Pressing Command over a stationary link updates the color");
+  ui.SendKey({.type = KeyEventType::Up, .key = Key::MetaLeft});
+  ui.Pump();
+  Check(!has_hover_color(), "Releasing Command restores the normal link color");
+  ui.Pump(std::chrono::milliseconds(600));
+  const TextSelection backward{9, 3};
+  editor.SetSelection(backward);
+  pointer(PointerEventType::Down, linked, command);
+  Check(activated_links.empty(), "A modifier press waits for the click to finish");
+  pointer(PointerEventType::Up, linked, command);
+  const LinkRange expected{{0, 6}, "https://example.com", "Site"};
+  Check(activated_links == std::vector{expected} && ui.ActiveTextInput()->selection == backward,
+        "Command-click requests navigation without changing the directed selection");
+
+  ui.Pump(std::chrono::milliseconds(600));
+  pointer(PointerEventType::Down, linked, control);
+  pointer(PointerEventType::Up, linked, control);
+  Check(activated_links == std::vector{expected, expected}, "Control-click requests the same link");
+  pointer(PointerEventType::Down, blank, control);
+  pointer(PointerEventType::Up, blank, control);
+  pointer(PointerEventType::Down, linked, control);
+  pointer(PointerEventType::Move, blank, control);
+  pointer(PointerEventType::Up, blank, control);
+  Check(activated_links.size() == 2 && !ui.ActiveTextInput()->selection.IsCollapsed(),
+        "Whitespace and dragging do not navigate, and the drag still selects text");
+}
+
 void ListEditing() {
   const Application app(App, {.show_debug_overlay = false});
   UiTest ui(app, {.viewport = {400, 290}});
@@ -413,6 +498,176 @@ void DeleteSurrounding() {
   Check(controller->Document().Blocks()[0].Data().text == "A", "Cancel keeps the deletion outside composition");
   Check(controller->Execute(Undo{}) && controller->Document().Blocks()[0].Data().text == "A🙂",
         "Surrounding deletion is reversible");
+}
+
+void LineEditing() {
+  const Application app(App, {.show_debug_overlay = false});
+  UiTest ui(app);
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  const auto replace = [&](std::string_view markdown, TextOffset caret) {
+    controller->ReplaceDocument(*MarkdownCodec().Import(markdown).document);
+    ui.Pump();
+    Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{caret, caret}}});
+  };
+  const auto bold = ToggleMark{Mark::Bold};
+  replace("# Title", 5);
+  Check(controller->Execute(bold), "Enable a pending format at the end of a heading");
+  ui.Pump();
+  ui.PressKey(Key::Enter);
+  const auto heading_and_paragraph = controller->Document();
+  Check(heading_and_paragraph.Blocks()[0].Data().kind == BlockKind::Heading &&
+            heading_and_paragraph.Blocks()[1].Data().kind == BlockKind::Paragraph &&
+            controller->GetCommandState(bold).checked == CheckState::Off,
+        "Return starts a plain paragraph after a heading and clears the pending inline format");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "正文"}});
+  Check(controller->Document().Blocks()[1].Data().marks.empty(), "Typing into the new paragraph stays plain");
+
+  replace("**Line**", 4);
+  ui.PressKey(Key::Enter, {.shift = true});
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "continued"}});
+  const auto soft_break = controller->Document();
+  Check(soft_break.Blocks().size() == 1 && soft_break.Blocks()[0].Data().text == "Line\ncontinued" &&
+            soft_break.Blocks()[0].Data().marks == std::vector<MarkRange>{{{0, 14}, Mark::Bold}},
+        "Shift+Return keeps the inline format within the same paragraph");
+
+  replace("3. Item", 4);
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .selection_after = TextSelection{5, 5}, .text = "\n"}});
+  const auto list = controller->Document();
+  Check(list.Blocks()[0].Data().children.size() == 2, "IME Return creates the next numbered item");
+  Accept(ui, {{.kind = TextInputCommandKind::DeleteSurrounding, .delete_before = 1,
+               .delete_unit = TextInputUnit::UnicodeCodePoint}});
+  const auto left_list = controller->Document();
+  Check(left_list.Blocks().size() == 2 && left_list.Blocks()[0].Data().list_start == 3 &&
+            left_list.Blocks()[0].Data().children.size() == 1 &&
+            left_list.Blocks()[1].Data().kind == BlockKind::Paragraph &&
+            ui.ActiveTextInput()->selection == TextSelection{5, 5},
+        "IME Backspace leaves the empty item without merging or moving the caret to the previous item");
+  Check(controller->Execute(Undo{}) && controller->Document() == list, "Leaving the list is one undoable edit");
+  ui.Pump();
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .selection_after = TextSelection{6, 6}, .text = "\n"}});
+  Check(controller->Document() == left_list && ui.ActiveTextInput()->selection == TextSelection{5, 5},
+        "IME Return on the empty item exits the list at the resulting caret");
+
+  replace("3. Item\n   - Bullet\n4. Tail\n", 4);
+  const auto mixed_list = controller->Document();
+  const auto& original_item = mixed_list.Blocks()[0].Data().children[0];
+  Check(original_item.Data().children.size() == 2 &&
+            original_item.Data().children[1].Data().kind == BlockKind::List &&
+            !original_item.Data().children[1].Data().ordered, "The fixture has an unordered sublist");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .selection_after = TextSelection{5, 5}, .text = "\n"}});
+  const auto split_mixed_list = controller->Document();
+  Check(split_mixed_list.Blocks()[0].Data().children[0] == original_item &&
+            split_mixed_list.Blocks()[0].Data().children.size() == 3 &&
+            ui.ActiveTextInput()->selection == TextSelection{12, 12},
+        "Return after the item text places a new sibling below the sublist");
+  Accept(ui, {{.kind = TextInputCommandKind::DeleteSurrounding, .delete_before = 1}});
+  const auto left_mixed_list = controller->Document();
+  Check(left_mixed_list.Blocks().size() == 3 &&
+            left_mixed_list.Blocks()[0].Data().children == std::vector{original_item} &&
+            left_mixed_list.Blocks()[1].Data().kind == BlockKind::Paragraph &&
+            left_mixed_list.Blocks()[2].Data().list_start == 4 &&
+            ui.ActiveTextInput()->selection == TextSelection{12, 12},
+        "Removing the empty item's marker preserves the sublist and the next original number");
+  Check(controller->Execute(Undo{}) && controller->Document() == split_mixed_list &&
+            controller->Execute(Redo{}) && controller->Document() == left_mixed_list,
+        "Undo and redo preserve the mixed-list structure");
+
+  replace("3. Item\n   - Bullet\n4. Tail\n", 5);
+  const auto& original_list = original_item.Data().children[1];
+  const auto check_inserted_bullet = [&] {
+    const auto current = controller->Document();
+    const auto& list = current.Blocks()[0].Data();
+    const auto& nested = list.children[0].Data().children[1].Data();
+    Check(list.list_start == 3 && list.children.size() == 2 && !nested.ordered && nested.children.size() == 2 &&
+              nested.children[0].Data().children[0].Data().text.empty() &&
+              nested.children[1] == original_list.Data().children[0] &&
+              ui.ActiveTextInput()->selection == TextSelection{5, 5},
+          "Return at the first bullet creates a sibling above it with the caret in the new item");
+  };
+  const auto check_removed_bullet = [&] {
+    Check(controller->Document() == mixed_list && ui.ActiveTextInput()->selection == TextSelection{5, 5},
+          "Backspace removes the empty first bullet and leaves the original sublist and numbering in place");
+    CheckDocumentIndex(controller->Document());
+  };
+  ui.PressKey(Key::Enter);
+  check_inserted_bullet();
+  const auto with_empty_bullet = controller->Document();
+  ui.PressKey(Key::Backspace);
+  check_removed_bullet();
+  Check(controller->Execute(Undo{}) && controller->Document() == with_empty_bullet &&
+            controller->Execute(Undo{}) && controller->Document() == mixed_list &&
+            controller->Execute(Redo{}) && controller->Document() == with_empty_bullet &&
+            controller->Execute(Redo{}) && controller->Document() == mixed_list,
+        "Undo and redo keep the insertion and removal as separate edits");
+  ui.Pump();
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .selection_after = TextSelection{6, 6}, .text = "\n"}});
+  check_inserted_bullet();
+  Accept(ui, {{.kind = TextInputCommandKind::DeleteSurrounding, .delete_before = 1}});
+  check_removed_bullet();
+  Check(controller->Execute(Undo{}), "Undo an IME Backspace");
+  ui.Pump();
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "First"}});
+  Check(controller->Document().Blocks()[0].Data().children[0].Data().children[1].Data().children[0]
+            .Data().children[0].Data().text == "First", "Typing fills the inserted bullet");
+
+  replace("3. Alpha beta\n   - Bullet\n4. Tail\n", 6);
+  const auto before_join = controller->Document();
+  ui.PressKey(Key::Enter);
+  ui.PressKey(Key::Backspace);
+  Check(controller->Document() == before_join && ui.ActiveTextInput()->selection == TextSelection{6, 6},
+        "Joining a split item restores its nested list without leaving a numbered wrapper");
+
+  replace("3. Alpha\n4. Beta\n   - **Bullet**\n5. Tail\n", 0);
+  const auto before_delete = controller->Document();
+  const TextSelection crossed_items{8, 4};
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = crossed_items}});
+  ui.PressKey(Key::Backspace);
+  const auto joined = controller->Document();
+  const auto expected_join = MarkdownCodec().Import("3. Alphta\n   - **Bullet**\n4. Tail\n").document;
+  Check(joined == expected_join && ui.ActiveTextInput()->selection == TextSelection{4, 4},
+        "Deleting text across numbered items keeps the bulleted suffix under the joined item");
+  CheckDocumentIndex(joined);
+  const auto markdown = MarkdownCodec().Export(joined);
+  Check(markdown.text && MarkdownCodec().Import(*markdown.text).document == joined,
+        "The joined list retains its structure and styles through strict Markdown");
+  Check(controller->Execute(Undo{}) && controller->Document() == before_delete,
+        "One undo restores the two numbered items and their original sublist");
+  ui.Pump();
+  Check(ui.ActiveTextInput()->selection == crossed_items, "Undo restores the directed cross-item selection");
+
+  replace("3. Alpha\n4. Removed\n5. Beta\n   - **Bullet**\n6. Tail\n", 0);
+  const auto before_composition = controller->Document();
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{16, 4}},
+              {.kind = TextInputCommandKind::UpdateComposition, .text = "zhong"}});
+  Check(controller->Document() == before_composition, "IME preedit retains the committed list");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "中文"}});
+  Check(controller->Document() == MarkdownCodec().Import("3. Alph中文ta\n   - **Bullet**\n4. Tail\n").document &&
+            ui.ActiveTextInput()->selection == TextSelection{6, 6},
+        "IME replacement over multiple items merges the remaining text and keeps the sublist");
+  CheckDocumentIndex(controller->Document());
+  Check(controller->Execute(Undo{}) && controller->Document() == before_composition,
+        "One undo restores a list edited by IME");
+
+  replace("> Note", 4);
+  ui.PressKey(Key::Enter);
+  ui.PressKey(Key::Backspace);
+  const auto quote_and_paragraph = controller->Document();
+  Check(quote_and_paragraph.Blocks().size() == 2 &&
+            quote_and_paragraph.Blocks()[0].Data().kind == BlockKind::Quote &&
+            quote_and_paragraph.Blocks()[1].Data().kind == BlockKind::Paragraph &&
+            ui.ActiveTextInput()->selection == TextSelection{5, 5},
+        "Backspace in the trailing empty quote paragraph exits the quote in place");
+  ui.PressKey(Key::Backspace);
+  Check(controller->Document().Blocks().size() == 1 && ui.ActiveTextInput()->selection.active == 4,
+        "Backspace at a plain paragraph boundary still joins paragraphs");
+
+  replace("Previous\n\n# Title", 9);
+  ui.PressKey(Key::Backspace);
+  Check(controller->Document().Blocks().size() == 2 &&
+            controller->Document().Blocks()[1].Data().kind == BlockKind::Paragraph &&
+            controller->Document().Blocks()[1].Data().text == "Title" &&
+            ui.ActiveTextInput()->selection.active == 9,
+        "Backspace at the start of a heading removes the heading style in place");
 }
 
 void CodeEditing() {
@@ -685,6 +940,20 @@ void TableEditing() {
   ui.PressKey(Key::Tab, {.shift = true});
   Check(active() == 0, "Up and Shift+Tab return to the first cell");
 
+  select(14, 14);
+  ui.PressKey(Key::Tab);
+  const auto appended = controller->Document();
+  Check(appended.Blocks()[0].Data().children.size() == 3 && cell(appended, 2, 0).text.empty() && active() == 16,
+        "Tab from the last cell adds a row and focuses its first cell");
+  Check(controller->Execute(Undo{}) && controller->Document() == original.document, "Undo removes the appended row");
+  ui.Pump();
+  Check(active() == 14 && controller->Execute(Redo{}) && controller->Document() == appended,
+        "Undo restores the original caret and redo restores the appended row");
+  ui.Pump();
+  Check(active() == 16 && controller->Execute(Undo{}), "Redo restores the caret to the appended row");
+  ui.Pump();
+  select(0, 0);
+
   const auto bounds = ui.Find(UiSelector::Key("editor")).One().bounds;
   const Point at_right{bounds.x + 178.0F, bounds.y + 30.0F};
   Check(ui.SendScroll({.position = at_right, .delta_x = 200.0F}).x > 0.0F,
@@ -832,6 +1101,87 @@ code
   Accept(ui, {{.kind = TextInputCommandKind::CancelComposition}});
   Check(controller->Execute(Undo{}) && controller->Document() == initial, "Style updates preserve undo history");
   appearance.reset();
+}
+
+void EditorShortcuts() {
+  const Application app([]() -> View {
+    const auto editor = UseRichEditor();
+    const auto focus = UseViewHandle();
+    const auto bindings = UseState(std::shared_ptr<const EditorKeymap>{});
+    const auto query = UseState(TextEditingValue{});
+    shortcut_keymap = bindings;
+    controller = editor;
+    return Column {
+      Button("Focus editor").OnClick([focus] { Check(focus.RequestFocus(), "Focus the shortcut fixture"); }),
+      TextField(query).Label("Search").OnChanged([query](const TextEditingValue& value) { query = value; }).Key("query"),
+      RichEditor(editor, {.keymap = bindings.Get()}).With(focus, Grow()),
+    }.With(CrossAlign(CrossAxisAlignment::Stretch));
+  }, {.show_debug_overlay = false});
+  UiTest ui(app, {.viewport = {480.0F, 340.0F}});
+  ui.Find(UiSelector::Text("Focus editor")).Tap();
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "你好"},
+              {.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{0, 2}}});
+  const auto unformatted = controller->Document();
+  const auto bold = ToggleMark{Mark::Bold};
+  ui.PressKey(Key::B, {.meta = true});
+  Check(controller->GetCommandState(bold).checked == CheckState::On, "Command+B is a default alias");
+  const auto formatted = controller->Document();
+  ui.PressKey(Key::Z, {.control = true});
+  Check(controller->Document() == unformatted, "Control+Z undoes formatting");
+  ui.PressKey(Key::Y, {.control = true});
+  Check(controller->Document() == formatted, "Control+Y remains a redo alias");
+  ui.PressKey(Key::Z, {.meta = true});
+
+  Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "zhongwen"}});
+  const auto composing = ui.ActiveTextInput();
+  *shortcut_keymap = std::make_shared<const EditorKeymap>(EditorKeymap{
+      {{Key::J, {.control = true}}, bold},
+      {{Key::K, {.control = true}}, Undo{}},
+      {{Key::L, {.control = true}}, Redo{}},
+  });
+  ui.Pump();
+  const auto updated = ui.ActiveTextInput();
+  Check(composing && updated && composing->session_id == updated->session_id && composing->composition &&
+            updated->composition == composing->composition && controller->Document() == unformatted,
+        "Replacing shortcuts preserves the input session and Chinese preedit");
+  ui.PressKey(Key::K, {.control = true});
+  Check(!ui.ActiveTextInput()->composition && controller->Document() == unformatted,
+        "Remapped Undo cancels the preedit without undoing committed text");
+  ui.PressKey(Key::B, {.control = true});
+  ui.PressKey(Key::B, {.meta = true});
+  Check(controller->Document() == unformatted, "Rebinding removes both old bold aliases");
+  ui.PressKey(Key::J, {.control = true});
+  Check(controller->Document() == formatted, "The new key executes the existing formatting command");
+  ui.PressKey(Key::K, {.control = true});
+  Check(controller->Document() == unformatted, "Remapped Undo uses the existing history");
+  ui.PressKey(Key::L, {.control = true});
+  Check(controller->Document() == formatted, "Remapped Redo uses the existing history");
+
+  ui.Find(UiSelector::Key("query")).Tap();
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "中文"}});
+  ui.PressKey(Key::J, {.control = true});
+  ui.PressKey(Key::K, {.control = true});
+  Check(controller->Document() == formatted, "Editor shortcuts cannot act while a text field owns focus");
+  ui.Find(UiSelector::Text("Focus editor")).Tap();
+  *shortcut_keymap = std::make_shared<const EditorKeymap>();
+  ui.Pump();
+  ui.PressKey(Key::Z, {.control = true});
+  ui.PressKey(Key::K, {.control = true});
+  Check(controller->Document() == formatted, "An empty map clears configurable shortcuts");
+  *shortcut_keymap = std::shared_ptr<const EditorKeymap>{};
+  ui.Pump();
+  ui.PressKey(Key::Z, {.control = true});
+  Check(controller->Document() == unformatted, "Resetting the map restores defaults and preserves history");
+  controller->ReplaceDocument(RichDocument{});
+  ui.Pump();
+  ui.PressKey(Key::T, {.shift = true, .meta = true});
+  ui.PressKey(Key::R, {.shift = true, .control = true});
+  ui.PressKey(Key::Backslash, {.shift = true, .control = true});
+  const auto table = controller->Document();
+  Check(table.Blocks()[0].Data().kind == BlockKind::Table && table.Blocks()[0].Data().children.size() == 3 &&
+            table.Blocks()[0].Data().children[0].Data().children.size() == 3,
+        "Default table shortcuts insert a table, row, and column through the editor");
+  shortcut_keymap.reset();
 }
 
 void InlineCodePadding() {
@@ -1373,7 +1723,7 @@ void RevealTextRange() {
   static const auto document = [] {
     std::string markdown;
     for (int i = 0; i < 40; ++i) {
-      markdown += "A paragraph of text\n\n";
+      markdown += i == 20 ? "First match line  \nsecond match line\n\n" : "A paragraph of text\n\n";
     }
     markdown += "尾行🙂 target\n";
     return *MarkdownCodec().Import(markdown).document;
@@ -1408,6 +1758,39 @@ void RevealTextRange() {
   Check(controller->RevealTextRange(target, {5, 11}), "Reveal accepts a range in an offscreen block");
   ui.Pump();
   Check(scroll.One().scroll->offset > 0.0F, "Reveal scrolls the target into the viewport");
+  const auto& middle = document.Blocks()[20];
+  const TextRange lines{0, static_cast<TextOffset>(middle.Data().text.size())};
+  const auto reveal_at = [&](const Block& block, TextRange range, ScrollAlignment alignment) {
+    Check(controller->RevealTextRange(block, range, alignment), "An explicit range alignment is accepted");
+    ui.Pump();
+    return *scroll.One().scroll;
+  };
+  const auto start = reveal_at(middle, lines, ScrollAlignment::Start);
+  const auto center = reveal_at(middle, lines, ScrollAlignment::Center);
+  const auto end = reveal_at(middle, lines, ScrollAlignment::End);
+  const auto first_line = reveal_at(middle, {0, 1}, ScrollAlignment::End);
+  Check(start.offset > center.offset && center.offset > end.offset &&
+            std::abs(2 * center.offset - start.offset - end.offset) < 0.1F && end.offset > first_line.offset,
+        "The complete multi-line range aligns to the top, center, and bottom");
+  const auto last_start = reveal_at(target, {5, 11}, ScrollAlignment::Start);
+  const auto first_end = reveal_at(document.Blocks().front(), {0, 1}, ScrollAlignment::End);
+  Check(last_start.offset == last_start.maximum_offset && first_end.offset == 0.0F,
+        "Explicit alignment clamps to either end of the document");
+  const auto centered = reveal_at(middle, lines, ScrollAlignment::Center);
+  ui.SetWindowMetrics({.viewport = {420.0F, 460.0F}});
+  ui.Pump();
+  const auto expanded = *scroll.One().scroll;
+  Check(std::abs((centered.offset + centered.viewport_extent / 2) -
+                 (expanded.offset + expanded.viewport_extent / 2)) < 0.1F,
+        "Center alignment follows a viewport resize");
+  const auto bounds = scroll.One().bounds;
+  ui.SendScroll({.position = {bounds.x + bounds.width / 2, bounds.y + bounds.height / 2}, .delta_y = 36});
+  ui.Pump();
+  const auto browsed = scroll.One().scroll->offset;
+  ui.SetWindowMetrics({.viewport = {420.0F, 400.0F}});
+  ui.Pump();
+  Check(browsed != expanded.offset && scroll.One().scroll->offset == browsed,
+        "Manual scrolling takes over from explicit alignment");
   Check(ui.ActiveTextInput()->session_id == query_session->session_id && editor.One().text_selection == TextRange{0, 3},
         "Reveal preserves input focus and the editor selection");
   controller->ReplaceDocument(RichDocument{});
@@ -1423,10 +1806,13 @@ int main() {
     Workflow();
     controller.reset();
     HeadingAndLinkEditing();
+    LinkActivation();
     controller.reset();
     ListEditing();
     controller.reset();
     DeleteSurrounding();
+    controller.reset();
+    LineEditing();
     controller.reset();
     CodeEditing();
     controller.reset();
@@ -1443,6 +1829,8 @@ int main() {
     TableEditing();
     controller.reset();
     AppearanceChanges();
+    controller.reset();
+    EditorShortcuts();
     controller.reset();
     InlineCodePadding();
     controller.reset();

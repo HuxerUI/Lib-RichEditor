@@ -7,6 +7,37 @@ if (TARGET HuxerUI::testing)
     add_executable(richeditor_ui_tests ui.cpp ${folio_formula_source})
     target_link_libraries(richeditor_ui_tests PRIVATE HuxerUI::RichEditor HuxerUI::testing)
     add_test(NAME richeditor.ui COMMAND richeditor_ui_tests)
+
+    add_executable(folio_appearance_tests folio_appearance.cpp
+        ../examples/preview/src/appearance.cpp
+        ../examples/preview/src/labels.cpp
+        ../examples/preview/src/settings.cpp
+        ../examples/preview/src/shortcut_settings.cpp
+        ../examples/preview/src/shortcuts.cpp)
+    huxerui_enable_codegen(folio_appearance_tests)
+    target_link_libraries(folio_appearance_tests PRIVATE HuxerUI::RichEditor HuxerUI::testing)
+    add_test(NAME folio.appearance COMMAND folio_appearance_tests)
+
+    file(GLOB folio_preview_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../examples/preview/src/*.cpp")
+    if (APPLE)
+        enable_language(OBJCXX)
+        list(APPEND folio_preview_sources ../examples/preview/src/browser_apple.mm)
+    endif ()
+    add_executable(folio_command_palette_tests folio_command_palette.cpp ${folio_preview_sources})
+    huxerui_enable_codegen(folio_command_palette_tests)
+    huxerui_add_resources(folio_command_palette_tests ROOT ../examples/preview/resources NAMESPACE app)
+    target_link_libraries(folio_command_palette_tests PRIVATE HuxerUI::RichEditor HuxerUI::testing)
+    if (APPLE)
+        set_property(TARGET folio_command_palette_tests PROPERTY OBJCXX_STANDARD 20)
+    elseif (WIN32)
+        target_link_libraries(folio_command_palette_tests PRIVATE shell32)
+    elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(FOLIO_GIO REQUIRED IMPORTED_TARGET gio-2.0)
+        target_link_libraries(folio_command_palette_tests PRIVATE PkgConfig::FOLIO_GIO)
+    endif ()
+    get_property(folio_resources TARGET folio_command_palette_tests PROPERTY HUXERUI_RESOURCE_PACKAGE)
+    add_test(NAME folio.command_palette COMMAND folio_command_palette_tests "${folio_resources}")
 else ()
     message(STATUS "Lib-RichEditor mounted tests require HuxerUI::testing")
 endif ()

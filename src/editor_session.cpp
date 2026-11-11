@@ -29,6 +29,61 @@ void SetSelection(EditState& edit, TextSelection selection, bool reset_marks) {
   edit.selection = positions;
 }
 
+bool ExitBlockAtCaret(Draft& draft, bool empty_only) {
+  const auto selection = Offsets(draft.edit);
+  if (draft.composition || !selection.IsCollapsed()) {
+    return false;
+  }
+  const auto range = selection.Range();
+  auto& edit = draft.edit;
+  const auto leaf = DocumentAccess::Get(edit.document).index.AtOffset(range.start);
+  const auto& data = leaf.block.Data();
+  if (range.start != leaf.start || (empty_only && (!data.text.empty() || data.kind == BlockKind::CodeBlock))) {
+    return false;
+  }
+  auto document = data.kind == BlockKind::Heading
+      ? Format(edit.document, range, SetBlockKind{BlockKind::Paragraph}, false, draft.changes)
+      : ExitContainer(edit.document, range.start, empty_only, draft.changes);
+  if (DocumentAccess::Same(edit.document, document) &&
+      (empty_only || data.kind != BlockKind::Paragraph || !data.text.empty() ||
+       edit.pending.value_or(Mark::None) == Mark::None)) {
+    return false;
+  }
+  edit.document = std::move(document);
+  SetSelection(edit, selection, false);
+  edit.pending.reset();
+  return true;
+}
+
+void InsertLineBreak(Draft& draft, bool hard_break) {
+  if (!hard_break && ExitBlockAtCaret(draft, true)) {
+    return;
+  }
+  auto& edit = draft.edit;
+  const auto selected = Offsets(edit).Range();
+  const auto& index = DocumentAccess::Get(edit.document).index;
+  const auto leaf = index.AtOffset(selected.start);
+  const auto kind = leaf.block.Data().kind;
+  if (!hard_break && kind != BlockKind::CodeBlock && selected.IsCollapsed() && selected.start == leaf.start) {
+    if (auto inserted = InsertListItemBefore(edit.document, index.At(leaf.ordinal), draft.changes)) {
+      edit.document = std::move(*inserted);
+      SetSelection(edit, {selected.start, selected.start}, true);
+      return;
+    }
+  }
+  auto result = selected.IsCollapsed() && IsAtomicBlock(kind)
+      ? InsertParagraphAtAtomicBlock(edit.document, selected.start, draft.changes)
+      : ReplaceText(edit.document, selected, "\n", edit.pending, hard_break, draft.changes);
+  if (!hard_break && kind != BlockKind::CodeBlock) {
+    result = SplitListItem(std::move(result), draft.changes);
+  }
+  edit.document = std::move(result.document);
+  SetSelection(edit, {result.caret, result.caret}, false);
+  if (edit.selection.active.block != DocumentAccess::Id(leaf.block)) {
+    edit.pending.reset();
+  }
+}
+
 const EditState& Committed(const Draft& draft) {
   return draft.composition ? draft.composition->original : draft.edit;
 }
@@ -108,6 +163,9 @@ void DeleteSurrounding(Draft& draft, const TextInputCommand& command) {
   if (command.delete_before < 0 || command.delete_after < 0) {
     throw std::invalid_argument("Negative surrounding deletion");
   }
+  if (command.delete_before == 1 && command.delete_after == 0 && ExitBlockAtCaret(draft, false)) {
+    return;
+  }
   TextOffset first;
   TextOffset last;
   switch (command.delete_unit) {
@@ -165,6 +223,12 @@ void ApplyCommand(Draft& draft, const TextInputCommand& command) {
     }
     if (kind == TextInputCommandKind::UpdateComposition && !draft.composition) {
       BeginComposition(draft, target);
+    }
+    // An IME can deliver Return as a single newline with the resulting caret after it.
+    if (kind == TextInputCommandKind::CommitText && !draft.composition && !command.target && command.text == "\n" &&
+        (!command.selection_after || command.selection_after == TextSelection{target.start + 1, target.start + 1})) {
+      InsertLineBreak(draft, false);
+      return;
     }
     auto result = ReplaceText(draft.edit.document, target, command.text, draft.edit.pending, false, draft.changes);
     draft.edit.document = std::move(result.document);
@@ -364,43 +428,32 @@ bool EditorSession::Select(TextSelection selection) {
 bool EditorSession::BreakLine(bool hard_break) {
   auto next = draft_;
   next.composition.reset();
-  const auto selected = Offsets(next.edit).Range();
   try {
-    if (!hard_break && selected.IsCollapsed()) {
-      auto exited = ExitContainer(next.edit.document, selected.start, true, next.changes);
-      if (!DocumentAccess::Same(next.edit.document, exited)) {
-        next.edit.document = std::move(exited);
-        return Publish(std::move(next), true);
-      }
-    }
-    const auto& leaf = DocumentAccess::Get(next.edit.document).index.At(LeafIndex(next.edit.document, selected.start));
-    const bool split_item = !hard_break && leaf.block.Data().kind != BlockKind::CodeBlock;
-    auto result = selected.IsCollapsed() && IsAtomicBlock(leaf.block.Data().kind)
-        ? InsertParagraphAtAtomicBlock(next.edit.document, selected.start, next.changes)
-        : ReplaceText(next.edit.document, selected, "\n", next.edit.pending, hard_break, next.changes);
-    next.edit.document = split_item ? SplitListItem(result.document, result.caret, next.changes) : std::move(result.document);
-    SetSelection(next.edit, {result.caret, result.caret}, false);
+    InsertLineBreak(next, hard_break);
     return Publish(std::move(next), true);
   } catch (const std::invalid_argument&) {
     return false;
   }
 }
 
-bool EditorSession::ExitAtCaret() {
-  if (draft_.composition) {
-    return false;
-  }
-  const auto range = SelectionOffsets().Range();
-  if (!range.IsCollapsed()) {
-    return false;
-  }
+bool EditorSession::BackspaceAtStart() {
   auto next = draft_;
   try {
-    next.edit.document = ExitContainer(next.edit.document, range.start, false, next.changes);
-    return Publish(std::move(next), true);
+    return ExitBlockAtCaret(next, false) && Publish(std::move(next), true);
   } catch (const std::invalid_argument&) {
     return false;
   }
+}
+
+bool EditorSession::AppendTableRow() {
+  const EditorCommand insert = InsertTableRow{};
+  if (!CommandStatus(insert).enabled) {
+    return false;
+  }
+  auto next = draft_;
+  next.edit.document = ChangeTable(next.edit.document, next.edit.selection, insert, next.changes, true);
+  next.edit.pending.reset();
+  return Publish(std::move(next), true);
 }
 
 bool EditorSession::ExitCode() {

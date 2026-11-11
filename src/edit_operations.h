@@ -54,13 +54,16 @@ RichDocument Format(const RichDocument& document, TextRange range, const EditorC
 std::optional<unsigned> ListStartAt(const RichDocument& document, TextRange range);
 CommandState ContainerStatus(const RichDocument& document, TextRange range, const EditorCommand& command);
 RichDocument ChangeContainer(const RichDocument& document, TextRange range, const EditorCommand& command, EditChanges& edit);
-RichDocument SplitListItem(const RichDocument& document, TextOffset new_paragraph, EditChanges& edit);
+/// Inserts an empty sibling before an item whose leading text is at the caret.
+std::optional<RichDocument> InsertListItemBefore(const RichDocument& document, const Leaf& leaf, EditChanges& edit);
+/// Places the paragraph created by Return in a sibling list item and relocates its flattened caret when needed.
+EditResult SplitListItem(EditResult result, EditChanges& edit);
 RichDocument ExitContainer(const RichDocument& document, TextOffset caret, bool empty_only, EditChanges& edit);
 EditResult ExitCodeBlock(const RichDocument& document, TextOffset caret, EditChanges& edit);
 bool IsTableCommand(const EditorCommand& command);
 CommandState TableStatus(const RichDocument& document, TextRange range, const EditorCommand& command);
 RichDocument ChangeTable(const RichDocument& document, Selection& selection, const EditorCommand& command,
-                         EditChanges& edit);
+                         EditChanges& edit, bool select_inserted_row = false);
 bool IsImageCommand(const EditorCommand& command);
 std::optional<std::size_t> SelectedImageIndex(const RichDocument& document, TextRange range);
 std::optional<std::size_t> SelectedAtomicIndex(const RichDocument& document, TextRange range);

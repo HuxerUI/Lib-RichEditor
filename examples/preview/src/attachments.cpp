@@ -1,5 +1,6 @@
 #include "attachments.h"
 #include "formula.h"
+#include "web_url.h"
 
 #include <algorithm>
 #include <atomic>
@@ -13,20 +14,6 @@ using namespace huxerui::richeditor;
 
 namespace folio {
 namespace {
-
-char LowerAscii(char value) {
-  return value >= 'A' && value <= 'Z' ? static_cast<char>(value + ('a' - 'A')) : value;
-}
-
-bool External(std::string_view source) {
-  const auto uri = Uri::Parse(source);
-  if (!uri || !uri->Authority() || uri->Authority()->empty()) {
-    return false;
-  }
-  const auto scheme = uri->Scheme();
-  return std::ranges::equal(scheme, std::string_view("https"), {}, LowerAscii) ||
-      std::ranges::equal(scheme, std::string_view("http"), {}, LowerAscii);
-}
 
 std::optional<std::vector<std::string>> RelativePath(std::string_view source) {
   if (source.empty() || source.front() == '/' || source.find_first_of("\\:?#") != source.npos) {
@@ -129,7 +116,7 @@ Task<IoResult<FileReference>> FindAttachment(FileReference directory, std::vecto
 std::set<std::string> LocalReferences(const RichDocument& document) {
   std::set<std::string> sources;
   const auto add = [&](const std::string& source) {
-    if (!External(source)) {
+    if (!ParseWebUrl(source)) {
       sources.insert(source);
     }
   };

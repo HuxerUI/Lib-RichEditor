@@ -21,11 +21,14 @@ struct InlineRendering;
 
 struct EditorViewport {
   using ScrollInputHandler = std::function<bool(const ScrollInputEvent&)>;
-  using RevealTextHandler = std::function<bool(const RichDocument&, TextOffset)>;
+  using PointerInputHandler = std::function<void(const PointerEvent&)>;
+  using RevealTextHandler = std::function<bool(const RichDocument&, TextRange, std::optional<ScrollAlignment>)>;
 
   ScrollController scroll;
   /// The mounted surface owns the handler and its node-local coordinate mapping.
   std::weak_ptr<ScrollInputHandler> scroll_input;
+  /// Forwards pointer input from the internal scroll view to the mounted surface.
+  std::weak_ptr<PointerInputHandler> pointer_input;
   State<float> height{80.0F};
   ThemeSpec theme;
   RichEditorStyle style;

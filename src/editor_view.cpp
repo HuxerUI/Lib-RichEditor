@@ -25,6 +25,27 @@ namespace {
 
 constexpr std::uint64_t inline_semantic_id = std::uint64_t{1} << 63;
 
+const EditorKeymap& BuiltinKeymap() {
+  static const auto bindings = [] {
+    EditorKeymap result;
+    for (const auto& shortcut : DefaultEditorShortcuts()) {
+      for (const auto keys : shortcut.defaults) {
+        result.push_back({keys, shortcut.command});
+      }
+    }
+    return result;
+  }();
+  return bindings;
+}
+
+bool IsConfigurableKey(Key key) {
+  if (key == Key::A || key == Key::C || key == Key::V || key == Key::X) {
+    return false;
+  }
+  return (key >= Key::A && key <= Key::Z) || (key >= Key::Digit0 && key <= Key::Digit9) ||
+      (key >= Key::Backquote && key <= Key::Slash) || (key >= Key::F1 && key <= Key::F12);
+}
+
 enum class WordUnit { Space, Word, Single };
 
 WordUnit Classify(std::string_view grapheme) {
@@ -45,11 +66,18 @@ WordUnit Classify(std::string_view grapheme) {
 
 Point ResizeCorner(Rect bounds) { return {bounds.x + bounds.width, bounds.y + bounds.height}; }
 
+bool LinkActivationModifier(KeyModifiers modifiers) {
+  return (modifiers.control || modifiers.meta) && !modifiers.shift && !modifiers.alt;
+}
+
 class EditorClient final : public TextInputClient, public TextSelectionClient {
 public:
-  EditorClient(std::shared_ptr<EditorSession> editor, ScrollController scroll)
-      : editor_(std::move(editor)), scroll_(std::move(scroll)), generation_(editor_->Generation()) {}
+  EditorClient(std::shared_ptr<EditorSession> editor, ScrollController scroll,
+               std::shared_ptr<const EditorKeymap> keymap)
+      : editor_(std::move(editor)), scroll_(std::move(scroll)), keymap_(std::move(keymap)),
+        generation_(editor_->Generation()) {}
 
+  void SetKeymap(std::shared_ptr<const EditorKeymap> keymap) { keymap_ = std::move(keymap); }
   EditorSession& Editor() const { return *editor_; }
   bool Current() const { return generation_ == editor_->Generation(); }
   bool HasGeometry() const { return Current() && layout_.IsCurrent(editor_->VisibleDocument()); }
@@ -182,6 +210,10 @@ public:
 
   Point ContentPoint(Point point) const { return point - ContentOrigin(); }
   Rect ToNode(Rect rect) const { return AtOrigin(rect, ContentOrigin()); }
+
+  std::optional<EditorLayout::LinkLocation> LinkAt(Point point) const {
+    return layout_.LinkAt(editor_->VisibleDocument(), ContentPoint(point));
+  }
 
   bool HitsAtomicBlock(Point point) const {
     const auto index = LeafIndex(editor_->VisibleDocument(), Hit(point).offset);
@@ -377,6 +409,7 @@ private:
 
   std::shared_ptr<EditorSession> editor_;
   ScrollController scroll_;
+  std::shared_ptr<const EditorKeymap> keymap_;
   std::uint64_t generation_;
   std::uint64_t geometry_revision_ = 0;
   TextInputSessionId session_ = 0;
@@ -477,7 +510,7 @@ TextInputKeyResult EditorClient::EditKey(const KeyEvent& event, TextSelection se
       return unhandled;
     }
     if (selection.IsCollapsed()) {
-      if (event.key == Key::Backspace && !word && editor_->ExitAtCaret()) {
+      if (event.key == Key::Backspace && !word && !event.modifiers.meta && editor_->BackspaceAtStart()) {
         return handled;
       }
       if (!HasGeometry()) {
@@ -508,37 +541,23 @@ TextInputKeyResult EditorClient::HandleTextKey(const KeyEvent& event) {
   }
   const auto mods = event.modifiers;
   if ((mods.control || mods.meta) && !mods.alt) {
-    switch (event.key) {
-    case Key::Z:
-      mods.shift ? editor_->Execute(Redo{}) : editor_->Execute(Undo{});
-      return handled;
-    case Key::Y:
-      if (mods.control && !mods.shift) {
-        editor_->Execute(Redo{});
-        return handled;
-      }
-      break;
-    case Key::Enter:
-      if (!mods.shift && editor_->SelectedInlineObject()) {
+    if (event.key == Key::Enter && !mods.shift) {
+      if (editor_->SelectedInlineObject()) {
         return unhandled;
       }
-      if (!mods.shift && (editor_->Execute(ExitTable{}) || editor_->ExitCode())) {
+      if (editor_->Execute(ExitTable{}) || editor_->ExitCode()) {
         return handled;
       }
-      break;
-    case Key::B:
-    case Key::I:
-    case Key::U:
-      if (!mods.shift) {
-        if (!event.repeat) {
-          editor_->Execute(ToggleMark{event.key == Key::B ? Mark::Bold : event.key == Key::I ? Mark::Italic
-                                                                                           : Mark::Underline});
+    } else if (IsConfigurableKey(event.key)) {
+      const auto& bindings = keymap_ ? *keymap_ : BuiltinKeymap();
+      const auto match = std::ranges::find(bindings, KeyCombination{event.key, mods}, &EditorKeyBinding::keys);
+      if (match != bindings.end()) {
+        const auto& command = match->command;
+        if (!event.repeat || std::holds_alternative<Undo>(command) || std::holds_alternative<Redo>(command)) {
+          editor_->Execute(command);
         }
         return handled;
       }
-      break;
-    default:
-      break;
     }
   }
 
@@ -566,8 +585,15 @@ TextInputKeyResult EditorClient::HandleTextKey(const KeyEvent& event) {
       return changed ? handled : unhandled;
     }
     const auto& table = layout_.Tables()[row.cell->table];
-    if (mods.shift ? index == table.first : index + 1 == table.first + table.rows * table.columns) {
+    if (mods.shift && index == table.first) {
       return unhandled;
+    }
+    if (!mods.shift && index + 1 == table.first + table.rows * table.columns) {
+      if (!event.repeat && range.IsCollapsed() && editor_->AppendTableRow()) {
+        preferred_x_.reset();
+        return handled;
+      }
+      return event.repeat ? handled : unhandled;
     }
     const auto next = mods.shift ? index - 1 : index + 1;
     preferred_x_.reset();
@@ -671,7 +697,7 @@ public:
     const auto image_revision = viewport_->image_revision.Get();
     const auto previous_scroll = viewport_->scroll.Metrics().offset;
     std::optional<std::pair<std::size_t, float>> anchor;
-    if (!edited && !follow_caret_ && layout.IsCurrent(editor_->VisibleDocument()) &&
+    if (!edited && !follow_caret_ && !aligned_reveal_ && layout.IsCurrent(editor_->VisibleDocument()) &&
         (observed_inline_revision_ != inline_revision || observed_image_revision_ != image_revision)) {
       const auto& rows = layout.Rows();
       const auto row = std::ranges::lower_bound(rows, previous_scroll, {}, &EditorLayout::Row::Bottom);
@@ -701,6 +727,7 @@ public:
     const bool revealed = (edited || laid_out) && follow_focused_caret &&
         layout.RevealCaret(editor_->VisibleDocument(), caret);
     const bool scrolled = UpdateScroll(follow_focused_caret, caret, edited, laid_out);
+    const bool hover_changed = UpdateHoveredLink();
     if (laid_out || revealed || scrolled) {
       client_->GeometryChanged();
     }
@@ -710,7 +737,7 @@ public:
     if (appearance_changed) {
       return PaintInvalidation::Both;
     }
-    return edited || laid_out || revealed || scrolled || decorations_changed
+    return edited || laid_out || revealed || scrolled || decorations_changed || hover_changed
         ? PaintInvalidation::Foreground : PaintInvalidation::None;
   }
 
@@ -718,18 +745,30 @@ public:
     return node.IsEnabled() && node.ContentBounds().Contains(point);
   }
 
+  bool HoverHitTest(ViewNode& node, Point point) const override { return HitTest(node, point); }
+  void OnHover(ViewNode&, const HoverEvent& event) override {
+    if (event.type == HoverEventType::Leave) {
+      SetLinkHover(std::nullopt, false);
+    } else {
+      SetLinkHover(event.window_position, hover_modifier_);
+    }
+  }
   PointerResult OnPointer(ViewNode& node, const PointerEvent& event) override;
   bool OnKey(ViewNode&, const KeyEvent& event) override {
-    const auto modifiers = event.modifiers;
+    const bool modified = LinkActivationModifier(event.modifiers);
+    SetLinkHover(hover_pointer_, modified);
     return event.type == KeyEventType::Down && event.key == Key::Enter &&
-        (modifiers.control || modifiers.meta) && !modifiers.shift && !modifiers.alt &&
+        modified &&
         editor_->SelectedInlineObject() && ActivateInline(editor_->SelectionOffsets().Range().start);
   }
   FrameResult OnFrame(ViewNode& node, const FrameInfo& frame) override;
 
-  void OnFocusChanged(ViewNode&, bool, bool) override {
+  void OnFocusChanged(ViewNode&, bool focused, bool) override {
     blink_start_.reset();
     caret_visible_ = true;
+    if (!focused) {
+      SetLinkHover(hover_pointer_, false);
+    }
     InvalidatePaint();
   }
 
@@ -741,6 +780,17 @@ public:
   bool OnSemanticAction(std::uint64_t local_id, const SemanticAction& action) override;
 
 private:
+  struct AlignedReveal {
+    TextRange range;
+    ScrollAlignment alignment;
+    float applied_offset;
+  };
+
+  struct LinkPress {
+    PointerEvent down;
+    std::uint64_t content_revision;
+  };
+
   struct ImageResize {
     std::int64_t pointer_id;
     std::uint64_t revision;
@@ -751,19 +801,24 @@ private:
 
   void ResetClient();
   bool UpdateScroll(bool focused, TextPosition position, bool edited, bool laid_out);
-  bool RevealText(const RichDocument& document, TextOffset offset);
+  bool RevealText(const RichDocument& document, TextRange range, std::optional<ScrollAlignment> alignment);
   bool ScrollTable(std::size_t table, float delta);
   bool UpdateDecorations();
   void PaintDecorations(PaintContext& paint, const EditorLayout::Row& row, std::size_t index, bool behind) const;
   std::optional<std::size_t> CodeHeaderAt(Point point) const;
   bool OpenCodeLanguage(std::size_t index);
   bool ActivateInline(TextOffset offset);
+  void SetLinkHover(std::optional<Point> pointer, bool modifier);
+  bool UpdateHoveredLink();
+  PointerResult UpdateLinkPress(ViewNode& node, const PointerEvent& event);
   PointerResult UpdateImageResize(const PointerEvent& event);
   ViewNode& node_;
   std::shared_ptr<EditorClient> client_;
   std::shared_ptr<EditorSession> editor_;
   std::shared_ptr<EditorViewport> viewport_;
+  std::shared_ptr<const EditorKeymap> keymap_;
   std::shared_ptr<EditorViewport::ScrollInputHandler> scroll_input_;
+  std::shared_ptr<EditorViewport::PointerInputHandler> pointer_input_;
   std::shared_ptr<EditorViewport::RevealTextHandler> reveal_text_;
   std::uint64_t observed_revision_ = 0;
   std::shared_ptr<const DecorationAnalysis> decoration_analysis_;
@@ -771,12 +826,17 @@ private:
   std::uint64_t observed_inline_revision_ = 0;
   std::uint64_t observed_image_revision_ = 0;
   ScrollMetrics observed_scroll_;
+  std::optional<AlignedReveal> aligned_reveal_;
   bool focused_ = false;
   bool follow_caret_ = true;
   std::optional<PointerEvent> touch_;
   std::optional<std::size_t> touch_table_;
   float table_drag_x_ = 0.0F;
   std::optional<std::int64_t> drag_id_;
+  std::optional<LinkPress> link_press_;
+  std::optional<Point> hover_pointer_;
+  std::optional<EditorLayout::LinkLocation> hovered_link_;
+  bool hover_modifier_ = false;
   std::optional<ImageResize> resize_;
   Point drag_in_viewport_;
   std::optional<double> blink_start_;
@@ -787,11 +847,14 @@ struct Surface {
   using Extension = EditorExtension;
   std::shared_ptr<EditorSession> editor;
   std::shared_ptr<EditorViewport> viewport;
+  std::shared_ptr<const EditorKeymap> keymap;
   bool operator==(const Surface&) const = default;
 };
 
 void EditorExtension::Update(ViewNode& node, const Surface& surface) {
+  keymap_ = surface.keymap;
   if (editor_ == surface.editor && viewport_ == surface.viewport) {
+    client_->SetKeymap(keymap_);
     return;
   }
   editor_ = surface.editor;
@@ -808,8 +871,19 @@ void EditorExtension::Update(ViewNode& node, const Surface& surface) {
     return table && ScrollTable(*table, delta);
   });
   viewport_->scroll_input = scroll_input_;
+  pointer_input_ = std::make_shared<EditorViewport::PointerInputHandler>([this](const PointerEvent& event) {
+    if (event.type == PointerEventType::Move && event.pressed_buttons == PointerButton::None &&
+        (event.device_kind == PointerDeviceKind::Mouse || event.device_kind == PointerDeviceKind::Pen)) {
+      SetLinkHover(event.position, LinkActivationModifier(event.modifiers));
+    }
+    // Raw pointer input targets the inner view directly. Forward it to the caller's editor binding.
+    EmitEvent<ViewEvents::Pointer>(event);
+  });
+  viewport_->pointer_input = pointer_input_;
   reveal_text_ = std::make_shared<EditorViewport::RevealTextHandler>(
-      [this](const RichDocument& document, TextOffset offset) { return RevealText(document, offset); });
+      [this](const RichDocument& document, TextRange range, std::optional<ScrollAlignment> alignment) {
+        return RevealText(document, range, alignment);
+      });
   viewport_->reveal_text = reveal_text_;
 }
 
@@ -817,10 +891,15 @@ void EditorExtension::ResetClient() {
   if (client_) {
     client_->Detach();
   }
-  client_ = std::make_shared<EditorClient>(editor_, viewport_->scroll);
+  client_ = std::make_shared<EditorClient>(editor_, viewport_->scroll, keymap_);
   touch_.reset();
   touch_table_.reset();
   drag_id_.reset();
+  link_press_.reset();
+  hover_pointer_.reset();
+  hovered_link_.reset();
+  hover_modifier_ = false;
+  aligned_reveal_.reset();
   resize_.reset();
   decoration_analysis_.reset();
   focused_ = false;
@@ -838,20 +917,39 @@ float OffsetToReveal(const ScrollMetrics& metrics, Rect caret) {
   return std::clamp(metrics.offset < bottom ? bottom : std::min(metrics.offset, top), 0.0F, metrics.maximum_offset);
 }
 
-bool EditorExtension::RevealText(const RichDocument& document, TextOffset offset) {
+float OffsetToAlign(const ScrollMetrics& metrics, const EditorLayout& layout, const RichDocument& document,
+                    TextRange range, ScrollAlignment alignment) {
+  const auto first = layout.Caret(document, {range.start, TextAffinity::Downstream});
+  const auto last = layout.Caret(document, {range.end, TextAffinity::Upstream});
+  const float top = std::min(first.y, last.y);
+  const float bottom = std::max(first.y + first.height, last.y + last.height);
+  float offset = top;
+  switch (alignment) {
+  case ScrollAlignment::Start: break;
+  case ScrollAlignment::Center: offset = (top + bottom - metrics.viewport_extent) / 2.0F; break;
+  case ScrollAlignment::End: offset = bottom - metrics.viewport_extent; break;
+  }
+  return std::clamp(offset, 0.0F, metrics.maximum_offset);
+}
+
+bool EditorExtension::RevealText(const RichDocument& document, TextRange range,
+                                 std::optional<ScrollAlignment> alignment) {
   const auto metrics = viewport_->scroll.Metrics();
   if (!client_->HasGeometry() || !DocumentAccess::Same(document, editor_->VisibleDocument()) ||
       metrics.viewport_extent <= 0.0F) {
     return false;
   }
   auto& layout = client_->Layout();
-  const TextPosition position{offset, TextAffinity::Downstream};
+  const TextPosition position{range.start, TextAffinity::Downstream};
   const bool table_moved = layout.RevealCaret(document, position);
-  const auto next = OffsetToReveal(metrics, layout.Caret(document, position));
+  const float next = alignment ? OffsetToAlign(metrics, layout, document, range, *alignment)
+                               : OffsetToReveal(metrics, layout.Caret(document, position));
   follow_caret_ = false;
   if (next != metrics.offset) {
     viewport_->scroll.ScrollTo(next);
   }
+  aligned_reveal_ = alignment ? std::optional(AlignedReveal{range, *alignment, viewport_->scroll.Offset()})
+                              : std::nullopt;
   if (table_moved) {
     client_->GeometryChanged();
     InvalidatePaint(PaintInvalidation::Foreground);
@@ -872,6 +970,19 @@ bool EditorExtension::UpdateScroll(bool focused, TextPosition position, bool edi
   }
   const bool extent_changed = metrics.content_extent != observed_scroll_.content_extent ||
       metrics.viewport_extent != observed_scroll_.viewport_extent;
+  if (aligned_reveal_ && (edited || focus_gained ||
+      metrics.offset != std::min(aligned_reveal_->applied_offset, metrics.maximum_offset))) {
+    aligned_reveal_.reset();
+  }
+  // The software keyboard can resize the viewport after the search action has already run.
+  if (aligned_reveal_ && (laid_out || extent_changed) && metrics.viewport_extent > 0.0F) {
+    const float offset = OffsetToAlign(metrics, client_->Layout(), editor_->VisibleDocument(), aligned_reveal_->range,
+                                       aligned_reveal_->alignment);
+    if (offset != metrics.offset && viewport_->scroll.ScrollTo(offset)) {
+      metrics = viewport_->scroll.Metrics();
+    }
+    aligned_reveal_->applied_offset = metrics.offset;
+  }
   if (focused && follow_caret_ && (edited || focus_gained || laid_out || extent_changed) &&
       metrics.viewport_extent > 0.0F && !editor_->SelectedAtomicBlock()) {
     const auto caret = client_->Layout().Caret(editor_->VisibleDocument(), position);
@@ -1023,12 +1134,71 @@ bool EditorExtension::ActivateInline(TextOffset offset) {
   return true;
 }
 
+void EditorExtension::SetLinkHover(std::optional<Point> pointer, bool modifier) {
+  if (hover_pointer_ != pointer || hover_modifier_ != modifier) {
+    hover_pointer_ = pointer;
+    hover_modifier_ = modifier;
+    if (UpdateHoveredLink()) {
+      InvalidatePaint();
+    }
+  }
+}
+
+bool EditorExtension::UpdateHoveredLink() {
+  std::optional<EditorLayout::LinkLocation> link;
+  if (hover_modifier_ && hover_pointer_ && client_->HasGeometry() && !editor_->CompositionRange()) {
+    if (const auto point = node_.WindowToLocal(*hover_pointer_); point && HitTest(node_, *point)) {
+      link = client_->LinkAt(*point);
+    }
+  }
+  return std::exchange(hovered_link_, link) != link;
+}
+
+NodeExtension::PointerResult EditorExtension::UpdateLinkPress(ViewNode& node, const PointerEvent& event) {
+  const auto press = *link_press_;
+  if (event.type == PointerEventType::Cancel || !node.IsEnabled() || !client_->HasGeometry() ||
+      editor_->ContentRevision() != press.content_revision || editor_->CompositionRange()) {
+    link_press_.reset();
+    return PointerResult::Handled;
+  }
+  const auto delta = event.position - press.down.position;
+  if (std::hypot(delta.x, delta.y) >= GestureSettings{}.pointer_slop) {
+    link_press_.reset();
+    if (event.type == PointerEventType::Move) {
+      drag_id_ = event.pointer_id;
+      drag_in_viewport_ = event.position;
+      client_->Select(press.down.position, false);
+      client_->Select(event.position, true);
+    }
+  } else if (event.type == PointerEventType::Up) {
+    link_press_.reset();
+    if (HitTest(node, event.position)) {
+      const auto link = client_->LinkAt(event.position);
+      if (link && link == client_->LinkAt(press.down.position)) {
+        const auto& index = DocumentAccess::Get(editor_->VisibleDocument()).index;
+        const auto activated = index.At(link->row).block.Data().links[link->link_index];
+        if (EmitEvent<RichEditorEvents::LinkActivated>(activated).value_or(false)) {
+          return PointerResult::Handled;
+        }
+      }
+      client_->Select(event.position, false);
+    }
+  }
+  return PointerResult::Handled;
+}
+
 NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const PointerEvent& event) {
   if (resize_) {
     return UpdateImageResize(event);
   }
+  if (link_press_ && link_press_->down.pointer_id == event.pointer_id) {
+    return UpdateLinkPress(node, event);
+  }
   const bool primary_down = event.type == PointerEventType::Down &&
       (event.changed_button == PointerButton::Primary || event.changed_button == PointerButton::None);
+  if (primary_down) {
+    SetLinkHover(std::nullopt, false);
+  }
   if (primary_down && client_->HasGeometry()) {
     // Keep the keyboard closed before touch selection is resolved on release.
     client_->SetBlockControlActive(CodeHeaderAt(event.position).has_value() ||
@@ -1101,6 +1271,11 @@ NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const Po
     if (event.modifiers.meta || event.modifiers.control) {
       if (const auto object = client_->InlineAt(event.position); object && ActivateInline(*object)) {
         return PointerResult::Handled;
+      }
+      if (LinkActivationModifier(event.modifiers) && !editor_->CompositionRange() &&
+          client_->LinkAt(event.position)) {
+        link_press_ = LinkPress{event, editor_->ContentRevision()};
+        return PointerResult::Capture;
       }
     }
     if (const auto header = CodeHeaderAt(event.position); header && OpenCodeLanguage(*header)) {
@@ -1324,7 +1499,7 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
       paint.DrawRect(AtOrigin(fill.bounds, origin), fill.color, CornerRadii{fill.corner_radius});
     }
     PaintDecorations(paint, row, index, true);
-    paint.DrawText(origin, row.layout);
+    layout.PaintText(paint, index, hovered_link_);
     for (const auto& object : row.inline_objects) {
       const auto rect = AtOrigin(object.bounds, origin);
       if (rect.IsEmpty()) {
@@ -1555,16 +1730,23 @@ View EditorContent(std::shared_ptr<EditorSession> editor, std::shared_ptr<Editor
 View EditorView(std::shared_ptr<EditorSession> editor, std::shared_ptr<EditorViewport> viewport,
                 RichEditorOptions options) {
   // Keep the text input owner outside the scroll node so the editor can reveal the caret only when needed.
+  auto keymap = std::move(options.keymap);
   const auto content = ScrollView(EditorContent(editor, viewport, std::move(options)))
       .Controller(viewport->scroll)
       .On<ViewEvents::ScrollInput>([viewport](const ScrollInputEvent& event) {
         const auto handler = viewport->scroll_input.lock();
         return handler && (*handler)(event);
       })
+      .On<ViewEvents::Pointer>([viewport](const PointerEvent& event) {
+        if (const auto handler = viewport->pointer_input.lock()) {
+          (*handler)(event);
+        }
+      })
       .With(ScrollBar(), Grow());
   return Column {
     content,
-  }.With(CrossAlign(CrossAxisAlignment::Stretch), Focusable{}, Surface{std::move(editor), std::move(viewport)});
+  }.With(CrossAlign(CrossAxisAlignment::Stretch), Focusable{},
+         Surface{std::move(editor), std::move(viewport), std::move(keymap)});
 }
 
 } // namespace

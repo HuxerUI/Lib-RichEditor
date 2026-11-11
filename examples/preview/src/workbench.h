@@ -1,15 +1,25 @@
 #pragma once
 
+#include <cstdint>
+
 #include <huxerui/huxerui.h>
 #include <huxerui/richeditor.h>
 #include <huxerui/richeditor/format.h>
 
 namespace folio {
 
+struct FindPanelState {
+  bool open = false;
+  bool field_focused = false;
+  std::uint64_t focus_request = 0;
+  bool operator==(const FindPanelState&) const = default;
+};
+
 struct EditorPaneOptions {
   std::optional<huxerui::File> working_directory;
   std::shared_ptr<const huxerui::richeditor::ImageResolver> image_resolver;
-  huxerui::State<bool> find_open;
+  huxerui::State<FindPanelState> find;
+  huxerui::ViewHandle focus;
   bool active;
   bool available;
   bool can_pick_images;
@@ -18,7 +28,8 @@ struct EditorPaneOptions {
 
 huxerui::View EditorPane(huxerui::richeditor::RichEditorController editor, EditorPaneOptions options);
 huxerui::richeditor::ImportResult LoadSample();
-huxerui::View Workbench();
+using WorkbenchKeyHandler = std::function<bool(const huxerui::KeyEvent&)>;
+huxerui::View Workbench(huxerui::State<WorkbenchKeyHandler> dispatch);
 huxerui::WindowOptions FolioWindowOptions();
 void InstallFolio(huxerui::ApplicationContext& context);
 void InstallWorkbench(huxerui::WindowContext& context);

@@ -53,7 +53,7 @@ A top-level `Table` contains a rectangular grid of `TableRow` and `TableCell` bl
 
 Use `InsertTable{.rows = 3, .columns = 2}` at a top-level paragraph caret. Once the selection is inside one cell, `InsertTableRow`, `InsertTableColumn`, `DeleteTableRow`, and `DeleteTableColumn` act on that cell's row or column. Use `ToggleTableHeader` to change the first row's role and `DeleteTable` to remove the whole table. Query `GetCommandState()` before offering an action and pass the same command to `Execute()`.
 
-Tab and Shift+Tab navigate within a table. Enter adds a line break within a cell. Ctrl+Enter, Command+Enter, or `ExitTable` continues in a paragraph after the table. Cross-cell selections can be copied. Text and formatting edits stay inside a single cell. Each grid change is one undoable edit. A table wider than the editor's content area scrolls horizontally with a touch drag, horizontal wheel, or Shift+wheel.
+Tab and Shift+Tab navigate within a table. Tab from the last cell adds a row and moves the caret into its first cell. Enter adds a line break within a cell. Ctrl+Enter, Command+Enter, or `ExitTable` continues in a paragraph after the table. Cross-cell selections can be copied. Text and formatting edits stay inside a single cell. Each grid change is one undoable edit. A table wider than the editor's content area scrolls horizontally with a touch drag, horizontal wheel, or Shift+wheel.
 
 ## Images
 
@@ -78,10 +78,25 @@ style.quote_rule_width = 3.5F;
 style.inline_code_corner_radius = 5.0F;
 style.inline_code_horizontal_padding = 3.0F;
 style.code_block_corner_radius = 12.0F;
+style.link_hover_color = Color::Rgb(105, 66, 32);
 return RichEditor(editor, {.style = style, .document_directory = document_file.Parent()}).With(Grow());
 ```
 
 Unset colors and fonts inherit from the enclosing HuxerUI theme. To change the style while editing, pass the updated value in composition with the same controller. The document and its history belong to the session.
+
+## Links
+
+Subscribe to `RichEditorEvents::LinkActivated` for Control-click or Command-click on linked text. The handler receives the `LinkRange` and returns `true` to handle navigation while keeping the current selection. Holding Control or Command over a link uses `RichEditorStyle::link_hover_color`, which defaults to the theme's `on_primary_container`. Folio opens absolute HTTP and HTTPS links in the system browser. The link menu offers **Open link**, and on Android and iOS the editing toolbar also shows it while the caret or selection is inside a web link.
+
+## Revealing text ranges
+
+Call `editor.RevealTextRange(block, range, ScrollAlignment::Center)` to center a search match or another range from the current document. `ScrollAlignment::Start` and `ScrollAlignment::End` align its top or bottom to the viewport. Omitting the alignment scrolls just far enough to reveal the first line. The editor keeps the selection and focus during navigation. Folio centers search matches as the viewport resizes, including when the software keyboard is dismissed.
+
+## Keyboard shortcuts
+
+`DefaultEditorShortcuts()` lists the configurable editor commands and their default aliases. Pass a shared immutable `EditorKeymap` as `RichEditorOptions::keymap` to supply the complete editor binding table. A null pointer uses the defaults and an empty map clears them. Replace the shared map in composition to apply changes without restarting the text-input session. Use `RichEditorController::Execute()` for the same editing commands from toolbar controls.
+
+Use Ctrl or Command with 0–6 for the paragraph and heading styles. Add Shift with T, R, or Backslash to insert a table, a row below, or a column after the current cell. The other table actions can be assigned in Folio's desktop **Keyboard** settings.
 
 ## Code highlighting
 
@@ -172,9 +187,11 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-The mounted tests use `HuxerUI::testing` when the SDK includes it. The Folio preview uses the Material theme and follows the system light or dark appearance. The editor fills the window inside its content margins. On compact screens, the toolbar pins **Undo** and the overflow menu and puts the actions for the current selection first in the horizontally scrollable area. Hover or long-press an icon to see its command.
+The mounted tests use `HuxerUI::testing` when the SDK includes it. In Folio, open **Settings** from the sidebar or **File actions**. **Appearance** offers **Follow system** and eight themes. **Editor** controls text size and reading width. In **Keyboard**, choose a command and press a combination on a physical keyboard to replace its current shortcuts. Confirming a conflict removes just the overlapping combination from the other command. Clear or restore a command from its shortcut dialog, or use **Restore all defaults** in the keyboard settings. Preferences apply immediately across windows and are restored on launch. On compact screens, the toolbar pins **Undo** and the overflow menu and puts the actions for the current selection first in the horizontally scrollable area. Hover or long-press an icon to see its command.
 
-Folio starts with an empty workspace. **Open file…** accepts RichEditor JSON, `.md`, and `.markdown` and opens a tab. **Open folder…** adds a directory to the sidebar. Expand a directory to list its contents, then select a document to open it. A standalone document with relative image references opens with placeholders. Use **Locate attachments…** to load the images. On compact mobile hosts, use the **Files** drawer and select the file name in the header to switch tabs.
+On desktop, open **Command palette…** from **File actions**, or press **Command+Shift+P** on macOS or **Ctrl+Shift+P** on other platforms. Search by command name or a common Chinese alias. Results show the current shortcut and whether the action can run at the current caret or selection. Use the arrow keys and Enter to run a result, or select it directly. Android and iOS omit the menu entry and the **Keyboard** settings page. The shortcuts, including the palette binding, remain available with a physical keyboard.
+
+Folio starts with an empty workspace. **Open file…** accepts RichEditor JSON, `.md`, and `.markdown` and opens a tab. **Open folder…** adds a directory to the sidebar. Expand a directory to list its contents, then select a document to open it. The control at the sidebar’s upper right hides it, and **Show files** in the title bar restores it. On compact mobile hosts, **Show files** opens the drawer. Select the file name in the header to switch tabs. A standalone document with relative image references opens with placeholders. Use **Locate attachments…** to load the images.
 
 Desktop windows have independent tabs and sidebars. **Recent edits** is shared while Folio is running. **Save** checks the source file before writing back in its original format. **Save as…** creates and binds a file in a writable directory. **Export copy…** creates a separate JSON or Markdown copy. Closing a tab or window prompts for unsaved changes.
 
@@ -188,4 +205,4 @@ To exercise tables, select a cell in the sample. The compact toolbar shows **+ R
 
 To exercise images, place the caret in a top-level paragraph and choose **Insert image** to select a PNG or JPEG. On compact screens, find it under **More formatting** → **Insert**. Selecting an image dismisses the software keyboard and shows **Size**, **Replace**, and **+ Image** on the compact toolbar. Drag a corner or open the size dialog to set the width or height and watch the other dimension update. Size the pair to fit on the same line and undo a resize. Choose **Save as…**, move the resulting subfolder, and open its document from the folder sidebar. A Markdown copy includes the referenced local attachments.
 
-Enter splits ordinary blocks or inserts a literal newline in code. Shift+Enter inserts a paragraph-internal break. Ctrl+Enter or Command+Enter leaves a code block by inserting a paragraph after it.
+Enter starts a new paragraph without carrying over pending inline formats. At the start of a list item's text, Enter creates an empty sibling above it and puts the caret in the new item. At the end of a parent item, Enter adds the next sibling after its sublist. Enter or Backspace on a trailing empty list item or quote paragraph exits that structure at the caret. In code and table cells Enter inserts a literal newline. Shift+Enter keeps the format on a break within a paragraph. Ctrl+Enter or Command+Enter leaves a code block by inserting a paragraph after it.

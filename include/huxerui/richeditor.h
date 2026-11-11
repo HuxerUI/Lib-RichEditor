@@ -6,15 +6,18 @@
 /// Include <huxerui/richeditor.h> and link HuxerUI::RichEditor. Create the session in composition with
 /// UseRichEditor(), then render RichEditor() and bind application controls to RichEditorController.
 /// Use <huxerui/richeditor/format.h> to open or save serialized document content.
-/// Pass RichEditorOptions to RichEditor() for appearance, resources, and presentation providers.
+/// Pass RichEditorOptions to RichEditor() for appearance, resources, presentation providers, and keyboard shortcuts.
 
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <source_location>
+#include <span>
 #include <string>
+#include <string_view>
 #include <variant>
+#include <vector>
 
 #include <huxerui/file.h>
 #include <huxerui/event.h>
@@ -22,6 +25,7 @@
 #include <huxerui/richeditor/extension.h>
 #include <huxerui/richeditor/style.h>
 #include <huxerui/resource.h>
+#include <huxerui/scroll.h>
 #include <huxerui/stream.h>
 #include <huxerui/task.h>
 #include <huxerui/view.h>
@@ -238,7 +242,38 @@ using EditorCommand = std::variant<ToggleMark, ClearFormatting, SetLink, SetBloc
                                    SetListStart, InsertCustomBlock, ReplaceCustomBlock, InsertInlineObject,
                                    ReplaceInlineObject, InsertFragment>;
 
-/// @brief Appearance and resource context for a mounted editor.
+/// @brief A portable key and its complete modifier state.
+///
+/// Matching uses the key identity from KeyEvent, independently of the text produced by the keyboard layout.
+struct KeyCombination {
+  Key key = Key::Unknown;
+  KeyModifiers modifiers{};
+
+  bool operator==(const KeyCombination&) const = default;
+};
+
+/// @brief Associates one key combination with a command while the mounted editor owns text focus.
+struct EditorKeyBinding {
+  KeyCombination keys;
+  EditorCommand command;
+};
+
+/// @brief A complete set of configurable editor shortcuts. The first matching entry owns the key.
+using EditorKeymap = std::vector<EditorKeyBinding>;
+
+/// @brief A command offered by the editor's built-in shortcut catalog.
+struct EditorShortcutDefinition {
+  std::string_view id;       ///< Stable identifier for settings and localization.
+  std::string_view label;    ///< English display label.
+  EditorCommand command;     ///< Typed command passed to the editing session.
+  std::span<const KeyCombination> defaults; ///< Default combinations, including aliases.
+};
+
+/// @brief Returns the built-in shortcut catalog for the lifetime of the library.
+/// A command with an empty default list can be assigned a shortcut by the application.
+std::span<const EditorShortcutDefinition> DefaultEditorShortcuts();
+
+/// @brief Appearance, resources, and keyboard configuration for a mounted editor.
 struct RichEditorOptions {
   /// Unset colors and fonts inherit the enclosing theme.
   RichEditorStyle style;
@@ -248,10 +283,22 @@ struct RichEditorOptions {
   std::optional<File> document_directory;
   /// An explicit image resolver takes precedence over document_directory.
   RichEditorExtensions extensions;
+  /// A null pointer selects the built-in bindings. A supplied immutable map replaces them, including aliases.
+  /// An empty map clears the configurable bindings. Use Control or Meta with a letter, digit, punctuation,
+  /// or function key. Shift can participate. Text entry, navigation, clipboard, and contextual Enter keys
+  /// retain their usual behavior. Changing the map keeps the document, selection, IME, and undo history.
+  std::shared_ptr<const EditorKeymap> keymap{};
 };
 
 /// @brief Typed events emitted by the mounted RichEditor view.
 struct RichEditorEvents {
+  /// @brief Requests navigation after a primary Control-click or Command-click on linked text.
+  ///
+  /// Subscribe with View::On() and return true to handle the click while preserving the editor selection.
+  /// The destination policy belongs to the application. The borrowed link includes its block-local, half-open
+  /// UTF-16 range and is valid for the duration of the callback.
+  struct LinkActivated : Event<bool(const LinkRange&)> {};
+
   /// @brief Requests the application-defined action for an explicitly activated inline object.
   ///
   /// The view selects the object before emitting this event. Control-click or Command-click, the
@@ -340,12 +387,19 @@ public:
   /// @return A rich fragment, or an empty value for a collapsed selection or during IME preedit.
   std::optional<DocumentFragment> SelectedFragment() const;
 
-  /// @brief Scrolls the mounted editor to the start of a nonempty block-local UTF-16 range.
+  /// @brief Reveals a nonempty block-local UTF-16 range in the mounted editor.
   ///
   /// Use a text block from Document() or a decoration request. The editing selection and focus are preserved.
+  /// @param block The text block from the current document snapshot.
+  /// @param range Half-open UTF-16 offsets relative to the block.
+  /// @param alignment Start aligns the first visual line to the viewport top, Center centers the range, and End
+  /// aligns the last visual line to the bottom. The offset is clamped to the scrollable extent. Omit the alignment
+  /// to scroll only as far as necessary to reveal the first line. An explicit alignment follows viewport changes
+  /// until the user scrolls, the editing selection changes, or another range is revealed.
   /// @return True when the mounted editor accepted the range. Returns false for stale blocks, invalid ranges,
   /// unavailable layout, or active IME composition.
-  bool RevealTextRange(const Block& block, TextRange range) const;
+  bool RevealTextRange(const Block& block, TextRange range,
+                       std::optional<ScrollAlignment> alignment = std::nullopt) const;
 
   /// @brief Applies a command to the retained selection or caret.
   /// A formatting command records changes across all affected blocks as one undo entry. An active IME composition

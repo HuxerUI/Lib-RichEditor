@@ -72,6 +72,8 @@ struct RichEditorStyle {
   /// The inset participates in wrapping and applies at the span's start and end. Narrow text columns can reduce
   /// the inset. A highlight takes precedence over the inline code background and its padding.
   float inline_code_horizontal_padding = 0.0F;
+  /// Foreground of a link under the pointer while Control or Command is held. Defaults to on_primary_container.
+  std::optional<Color> link_hover_color{};
   bool operator==(const RichEditorStyle&) const = default;
 };
 
