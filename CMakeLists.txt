@@ -83,6 +83,9 @@ target_include_directories(huxerui_richeditor PUBLIC
         "$<INSTALL_INTERFACE:include>"
 )
 
+if (POLICY CMP0168)
+    cmake_policy(SET CMP0168 NEW)
+endif ()
 include(FetchContent)
 if (NOT TARGET HuxerUI::Markdown)
     function(richeditor_add_markdown_parser)
