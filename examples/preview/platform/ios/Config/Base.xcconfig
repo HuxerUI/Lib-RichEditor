@@ -1,4 +1,6 @@
-PRODUCT_NAME = Lib-RichEditor Preview
+#include "../../../AppName.xcconfig"
+
+PRODUCT_NAME = $(DRAFTSPAN_APP_NAME)
 PRODUCT_BUNDLE_IDENTIFIER = org.huxerui.lib.richeditor.preview
 MARKETING_VERSION = 0.1.0
 CURRENT_PROJECT_VERSION = 1
@@ -15,7 +17,8 @@ HUXERUI_OPTIMIZATION = default
 HUXERUI_ENABLE_LTO = OFF
 HUXERUI_CORE_BUILD_DIR = $(DERIVED_FILE_DIR)/huxerui-core
 HUXERUI_LINK_OPTIONS_FILE = $(HUXERUI_CORE_BUILD_DIR)/huxerui-ios/example_lib_rich_editor/link.rsp
+FOLIO_MATH_LINK_OPTIONS_FILE = $(HUXERUI_CORE_BUILD_DIR)/folio-math/ios-link.rsp
 HEADER_SEARCH_PATHS = $(inherited) "$(HUXERUI_HOME)/include"
-OTHER_LDFLAGS = $(inherited) @"$(HUXERUI_LINK_OPTIONS_FILE)"
+OTHER_LDFLAGS = $(inherited) @"$(HUXERUI_LINK_OPTIONS_FILE)" @"$(FOLIO_MATH_LINK_OPTIONS_FILE)"
 
 #include? "Local.xcconfig"

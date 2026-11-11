@@ -38,7 +38,9 @@ dependencyResolutionManagement {
 gradle.ext.huxeruiHome = huxeruiHome
 gradle.ext.huxeruiUsesSource = huxeruiUsesSource
 gradle.ext.huxeruiAndroidArchive = huxeruiArchive
-rootProject.name = "Lib-RichEditor Preview"
+def appNameConfig = new Properties()
+file("../../AppName.xcconfig").withReader("UTF-8") { appNameConfig.load(it) }
+rootProject.name = appNameConfig.getProperty("DRAFTSPAN_APP_NAME")
 if (huxeruiUsesSource) {
     include(":HuxerUI")
     project(":HuxerUI").projectDir = huxeruiLibrary

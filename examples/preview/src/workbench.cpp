@@ -62,6 +62,9 @@ struct AttachmentLocation {
 
 enum class Operation { Idle, PickImage, LocateAttachments, Save, Export };
 
+struct FolderEntry;
+using Entry = std::shared_ptr<FolderEntry>;
+
 struct DocumentTab {
   DocumentId id;
   std::string draft_name;
@@ -69,6 +72,7 @@ struct DocumentTab {
   RichDocument initial;
   State<std::shared_ptr<const SavedDocument>> saved;
   State<AttachmentLocation> attachments;
+  State<Entry> source_folder{Entry{}};
   State<std::optional<RichEditorController>> editor{std::nullopt};
   State<std::optional<ViewHandle>> editor_focus{std::nullopt};
   State<Operation> operation{Operation::Idle};
@@ -125,9 +129,6 @@ using Tab = std::shared_ptr<DocumentTab>;
 
 enum class FolderLoad { Unloaded, Loading, Loaded, Failed };
 
-struct FolderEntry;
-using Entry = std::shared_ptr<FolderEntry>;
-
 struct FolderEntry {
   std::uint64_t id;
   std::string name;
@@ -139,6 +140,7 @@ struct FolderEntry {
   State<std::vector<Entry>> children{std::vector<Entry>{}};
   State<std::string> error{std::string{}};
   std::uint64_t load_generation = 0;
+  std::weak_ptr<FolderEntry> parent;
 };
 
 struct CloseRequest {
@@ -161,8 +163,7 @@ struct Workspace {
   State<std::vector<Tab>> tabs{std::vector<Tab>{}};
   State<DocumentId> selected{0};
   State<std::vector<Entry>> folders{std::vector<Entry>{}};
-  State<std::uint64_t> selected_entry{0};
-  State<bool> folders_open{true};
+  State<bool> files_open{true};
   State<bool> recents_open{true};
   State<bool> sidebar_visible{true};
   State<bool> drawer_open{false};
@@ -184,9 +185,40 @@ struct Workspace {
 
 struct FolioState {
   State<std::vector<Target>> recent{std::vector<Target>{}};
+  State<std::vector<Target>> pending_files{std::vector<Target>{}};
   std::vector<std::weak_ptr<Workspace>> windows;
+  State<std::uint64_t> window_revision{0};
   DocumentId next_document = 0;
   unsigned next_draft = 0;
+
+  void QueueActivation(const ApplicationActivation& activation) {
+    if (const auto* files = std::get_if<FileActivation>(&activation)) {
+      pending_files.Update([&](auto& pending) {
+        for (const auto& file : files->files) {
+          if (file.Type() == FileType::File && FormatOf(file.Name()) == DocumentFormat::Markdown) {
+            pending.push_back(std::make_shared<DocumentFile>(DocumentFile{file, {}, {}}));
+          }
+        }
+      });
+    }
+  }
+
+  std::shared_ptr<Workspace> ActivationWindow() const {
+    std::shared_ptr<Workspace> first;
+    for (const auto& weak : windows) {
+      const auto owner = weak.lock();
+      if (!owner || !owner->window || !owner->window->IsOpen()) {
+        continue;
+      }
+      if (owner->window->LifecycleState() == WindowLifecycleState::Active) {
+        return owner;
+      }
+      if (!first) {
+        first = owner;
+      }
+    }
+    return first;
+  }
 
   void Remember(Target target) {
     recent.Update([target = std::move(target)](auto& entries) {
@@ -257,7 +289,8 @@ public:
   void NewDocument(bool sample = false) const;
   void NewWindow() const;
   void PickOpen(OpenKind kind) const;
-  void OpenKnown(Target target) const;
+  void OpenKnown(Target target, Entry source_folder = {}) const;
+  void OpenActivated() const;
   void SetExpanded(const Entry& entry, bool expanded) const;
   void RequestNewChild(Entry folder, ChildKind kind) const;
   void Select(const Tab& tab) const;
@@ -272,9 +305,10 @@ private:
   void ShowCommandPalette(bool keyboard) const;
   void Status(const Tab& tab, StringVariant message) const;
   void Launch(bool uses_picker, std::function<Task<void>()> action, std::function<void(std::string)> failed = {}) const;
-  void AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved = {}) const;
-  bool ActivateExisting(const Target& target) const;
-  Task<void> OpenTarget(Target target) const;
+  void AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved = {},
+              Entry source_folder = {}) const;
+  std::shared_ptr<Workspace> ActivateExisting(const Target& target, const Entry& source_folder) const;
+  Task<std::shared_ptr<Workspace>> OpenTarget(Target target, Entry source_folder = {}) const;
   Task<Entry> AddFolder(FileReference directory) const;
   void LoadFolder(Entry entry) const;
   void PromptNewChild(Entry folder, ChildKind kind, std::string name = {}, std::string message = {}) const;
@@ -454,7 +488,8 @@ void WorkbenchActions::Launch(bool uses_picker, std::function<Task<void>()> acti
   });
 }
 
-void WorkbenchActions::AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved) const {
+void WorkbenchActions::AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved,
+                              Entry source_folder) const {
   std::optional<File> directory;
   try {
     directory = application.Directories().temporary_directory.Child(UniqueName("folio-document-"));
@@ -463,6 +498,7 @@ void WorkbenchActions::AddTab(std::string name, RichDocument snapshot, std::shar
   }
   auto tab = std::make_shared<DocumentTab>(++folio->next_document, std::move(name), std::move(directory),
                                            std::move(snapshot), std::move(saved));
+  tab->source_folder = std::move(source_folder);
   workspace->tabs.Update([&](auto& open) { open.push_back(tab); });
   Select(tab);
 }
@@ -507,7 +543,7 @@ void WorkbenchActions::Select(const Tab& tab) const {
   }
 }
 
-bool WorkbenchActions::ActivateExisting(const Target& target) const {
+std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& target, const Entry& source_folder) const {
   for (const auto& weak : folio->windows) {
     const auto owner = weak.lock();
     if (!owner) {
@@ -520,6 +556,9 @@ bool WorkbenchActions::ActivateExisting(const Target& target) const {
           tab->SetAttachmentDirectory(*target->directory);
         }
         if (owner == workspace) {
+          if (source_folder) {
+            tab->source_folder = source_folder;
+          }
           Select(tab);
         } else if (owner->window && owner->window->IsOpen()) {
           owner->selected = tab->id;
@@ -530,41 +569,68 @@ bool WorkbenchActions::ActivateExisting(const Target& target) const {
         } else {
           continue;
         }
-        return true;
+        return owner;
       }
     }
   }
-  return false;
+  return {};
 }
 
-Task<void> WorkbenchActions::OpenTarget(Target target) const {
+Task<std::shared_ptr<Workspace>> WorkbenchActions::OpenTarget(Target target, Entry source_folder) const {
   if (!target->identity) {
     target->identity = co_await LocalIdentity(target->reference);
   }
-  if (ActivateExisting(target)) {
-    co_return;
+  if (auto owner = ActivateExisting(target, source_folder)) {
+    co_return owner;
   }
   auto read = co_await ReadDocument(target->reference);
   if (!read.Succeeded()) {
-    Status({}, read.Error().message);
-    co_return;
+    Status({}, target->reference.Name() + " — " + read.Error().message);
+    co_return nullptr;
   }
-  if (ActivateExisting(target)) {
-    co_return;
+  if (auto owner = ActivateExisting(target, source_folder)) {
+    co_return owner;
   }
   auto source = std::move(read.Value());
   auto original = std::make_shared<const SavedDocument>(
       SavedDocument{target, source.format, source.document, std::move(source.bytes)});
-  AddTab(target->reference.Name(), std::move(source.document), std::move(original));
+  AddTab(target->reference.Name(), std::move(source.document), std::move(original), std::move(source_folder));
+  co_return workspace;
 }
 
-void WorkbenchActions::OpenKnown(Target target) const {
+void WorkbenchActions::OpenKnown(Target target, Entry source_folder) const {
   if (Available()) {
     Status({}, {});
-    Launch(true, [self = *this, target = std::move(target)]() -> Task<void> {
-      co_await self.OpenTarget(target);
+    Launch(true, [self = *this, target = std::move(target), source_folder = std::move(source_folder)]() -> Task<void> {
+      co_await self.OpenTarget(target, source_folder);
     });
   }
+}
+
+void WorkbenchActions::OpenActivated() const {
+  if (folio->pending_files->empty() || !Available() || folio->ActivationWindow() != workspace) {
+    return;
+  }
+  auto files = folio->pending_files.Get();
+  folio->pending_files = std::vector<Target>{};
+  Status({}, {});
+  Launch(true, [self = *this, files = std::move(files)]() -> Task<void> {
+    std::shared_ptr<Workspace> last_owner;
+    for (const auto& file : files) {
+      try {
+        if (auto owner = co_await self.OpenTarget(file)) {
+          last_owner = std::move(owner);
+        }
+      } catch (const std::exception& error) {
+        self.Status({}, file->reference.Name() + " — " + error.what());
+      }
+    }
+    if (last_owner && last_owner->window && last_owner->window->IsOpen()) {
+      last_owner->window->Activate();
+    } else {
+      self.window.Activate();
+    }
+  });
 }
 
 void WorkbenchActions::PickOpen(OpenKind kind) const {
@@ -612,7 +678,7 @@ Task<Entry> WorkbenchActions::AddFolder(FileReference directory) const {
         } else {
           SetExpanded(folder, true);
         }
-        workspace->folders_open = true;
+        workspace->files_open = true;
         workspace->drawer_open = true;
         workspace->sidebar_visible = true;
         co_return folder;
@@ -627,7 +693,7 @@ Task<Entry> WorkbenchActions::AddFolder(FileReference directory) const {
       ++workspace->next_entry, std::move(name), std::move(directory), {}, identity,
   });
   workspace->folders.Update([&](auto& roots) { roots.push_back(folder); });
-  workspace->folders_open = true;
+  workspace->files_open = true;
   workspace->sidebar_visible = true;
   workspace->drawer_open = true;
   SetExpanded(folder, true);
@@ -677,6 +743,7 @@ void WorkbenchActions::LoadFolder(Entry entry) const {
         rows.push_back(*existing);
       } else {
         auto row = std::make_shared<FolderEntry>(FolderEntry{++self.workspace->next_entry, std::move(name), {}, {}, {}});
+        row->parent = entry;
         if (child.Type() == FileType::Directory) {
           row->directory = std::move(child);
         } else {
@@ -996,7 +1063,7 @@ void WorkbenchActions::CreateChild(Entry folder, ChildKind kind, std::string nam
     self.LoadFolder(folder);
     if (kind == ChildKind::File) {
       co_await self.OpenTarget(std::make_shared<DocumentFile>(
-          DocumentFile{std::move(created.Value()), directory, {}}));
+          DocumentFile{std::move(created.Value()), directory, {}}), folder);
     }
   });
 }
@@ -1564,17 +1631,37 @@ View SidebarLabel(const ImageResource& icon, std::string label, Color color) {
   }.With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center));
 }
 
-enum class SidebarSection { Folders, Recent, NoFolders, NoRecent };
-using SidebarItem = std::variant<SidebarSection, Entry, Target>;
+enum class SidebarSection { Workspace, Recent, EmptyWorkspace, NoRecent };
+using SidebarItem = std::variant<SidebarSection, Entry, Tab, Target>;
 
 StringResource SidebarSectionLabel(SidebarSection section) {
   switch (section) {
-  case SidebarSection::Folders: return l10n::folders;
+  case SidebarSection::Workspace: return l10n::workspace;
   case SidebarSection::Recent: return l10n::recent_edits;
-  case SidebarSection::NoFolders: return l10n::no_folders;
+  case SidebarSection::EmptyWorkspace: return l10n::no_files_or_folders;
   case SidebarSection::NoRecent: return l10n::no_recent_documents;
   }
   return l10n::files;
+}
+
+bool IsListed(const Entry& entry, const Workspace& workspace) {
+  const auto parent = entry->parent.lock();
+  const auto& siblings = parent ? parent->children.Get() : workspace.folders.Get();
+  return std::ranges::find(siblings, entry) != siblings.end() && (!parent || IsListed(parent, workspace));
+}
+
+Entry FolderFileRow(const Tab& tab, const Workspace& workspace) {
+  const auto& saved = tab->saved.Get();
+  const auto& folder = tab->source_folder.Get();
+  if (!saved || !folder || !IsListed(folder, workspace)) {
+    return {};
+  }
+  const auto local = saved->target->reference.AsFile();
+  const auto& children = folder->children.Get();
+  const auto found = std::ranges::find_if(children, [&](const Entry& entry) {
+    return entry->file && (SameFile(entry->file, saved->target) || (local && entry->file->reference.AsFile() == local));
+  });
+  return found == children.end() ? Entry{} : *found;
 }
 
 std::vector<MenuEntry> FolderMenu(WorkbenchActions actions, const Entry& folder) {
@@ -1626,29 +1713,34 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
   const float row_height = desktop ? 32.0F : 44.0F;
   const auto workspace = actions.workspace;
   const auto selected = workspace->Selected();
-  const auto selected_file = selected ? selected->saved.Get() : nullptr;
-  const auto selected_entry = workspace->selected_entry.Get();
-  const auto is_selected = [selected_file, selected_entry](const Entry& entry) {
-    return entry->file && entry->id == selected_entry && selected_file && SameFile(entry->file, selected_file->target);
-  };
+  const auto selected_entry = selected ? FolderFileRow(selected, *workspace) : Entry{};
   const auto open = [actions](const SidebarItem& item) {
-    if (const auto* entry = std::get_if<Entry>(&item); entry && (*entry)->file) {
-      actions.workspace->selected_entry = (*entry)->id;
-      actions.OpenKnown((*entry)->file);
+    if (const auto* tab = std::get_if<Tab>(&item)) {
+      if (actions.Available()) {
+        actions.Select(*tab);
+      }
+    } else if (const auto* entry = std::get_if<Entry>(&item); entry && (*entry)->file) {
+      actions.OpenKnown((*entry)->file, (*entry)->parent.lock());
     } else if (const auto* file = std::get_if<Target>(&item)) {
       actions.OpenKnown(*file);
     }
   };
-  auto files = TreeView<SidebarItem>({SidebarSection::Folders, SidebarSection::Recent},
-      [actions, colors, desktop, row_height, is_selected](const SidebarItem& item) -> View {
+  auto files = TreeView<SidebarItem>({SidebarSection::Workspace, SidebarSection::Recent},
+      [actions, colors, desktop, row_height, selected, selected_entry](const SidebarItem& item) -> View {
         if (const auto* node = std::get_if<Entry>(&item)) {
           const auto& entry = *node;
           if (entry->directory) {
             return FolderTreeRow(actions, entry, desktop, row_height).Key(entry->id);
           }
           return SidebarLabel(app::images::file_text, entry->name,
-                              is_selected(entry) ? colors.on_primary_container : colors.on_surface)
+                              entry == selected_entry ? colors.on_primary_container : colors.on_surface)
               .With(Tooltip(LocationLabel(*entry->file))).Key(entry->id);
+        }
+        if (const auto* tab = std::get_if<Tab>(&item)) {
+          const auto& saved = (*tab)->saved.Get();
+          return SidebarLabel(app::images::file_text, (*tab)->Name(),
+                              *tab == selected ? colors.on_primary_container : colors.on_surface)
+              .With(Tooltip(LocationLabel(*saved->target))).Key("open-file-" + std::to_string((*tab)->id));
         }
         if (const auto* target = std::get_if<Target>(&item)) {
           const auto& file = *target;
@@ -1658,23 +1750,27 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
         const auto section = std::get<SidebarSection>(item);
         const auto label = SidebarSectionLabel(section);
         const auto key = "sidebar-section-" + std::to_string(static_cast<int>(section));
-        if (section == SidebarSection::NoFolders || section == SidebarSection::NoRecent) {
+        if (section == SidebarSection::EmptyWorkspace || section == SidebarSection::NoRecent) {
           return Text(label, TextRole::Label).With(FontSize(12.0F), Foreground(colors.on_surface_variant)).Key(key);
         }
-        const bool folders = section == SidebarSection::Folders;
+        const bool files_section = section == SidebarSection::Workspace;
         return Row {
-          Text(folders ? l10n::folders_heading : l10n::recent_edits_heading, TextRole::Label)
+          Text(files_section ? l10n::workspace_heading : l10n::recent_edits_heading, TextRole::Label)
               .With(Grow(), FontSize(11.0F), Foreground(colors.on_surface_variant)),
-          folders ? IconButton(app::images::plus, l10n::add_folder).OnClick([actions] { actions.PickOpen(OpenKind::Folder); })
+          files_section ? IconButton(app::images::plus, l10n::add_folder)
+              .OnClick([actions] { actions.PickOpen(OpenKind::Folder); })
               .With(Frame{.width = row_height, .height = row_height},
                     Enabled(actions.picker->CanOpenDirectories() && actions.Available()), Tooltip(l10n::open_folder)) : View{},
         }.With(CrossAlign(CrossAxisAlignment::Center)).Key(key);
-      }, [workspace, is_selected](const SidebarItem& item) {
+      }, [workspace, selected, selected_entry](const SidebarItem& item) {
         if (const auto* node = std::get_if<Entry>(&item)) {
           const auto& entry = *node;
           return TreeItemInfo{.label = entry->name, .expandable = entry->directory.has_value(),
                               .expanded = entry->expanded.Get(),
-                              .selected = entry->file ? std::optional(is_selected(entry)) : std::nullopt};
+                              .selected = entry->file ? std::optional(entry == selected_entry) : std::nullopt};
+        }
+        if (const auto* tab = std::get_if<Tab>(&item)) {
+          return TreeItemInfo{.label = (*tab)->Name(), .selected = *tab == selected};
         }
         if (const auto* file = std::get_if<Target>(&item)) {
           return TreeItemInfo{.label = (*file)->reference.Name(), .selected = false};
@@ -1682,22 +1778,31 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
         const auto section = std::get<SidebarSection>(item);
         const auto label = SidebarSectionLabel(section);
         switch (section) {
-        case SidebarSection::Folders:
-          return TreeItemInfo{.label = label, .expandable = true, .expanded = workspace->folders_open.Get()};
+        case SidebarSection::Workspace:
+          return TreeItemInfo{.label = label, .expandable = true, .expanded = workspace->files_open.Get()};
         case SidebarSection::Recent:
           return TreeItemInfo{.label = label, .expandable = true, .expanded = workspace->recents_open.Get()};
         default: return TreeItemInfo{.label = label, .enabled = false};
         }
-      }).Children([actions, workspace](const SidebarItem& item) -> std::vector<SidebarItem> {
+      }).Children([actions, workspace, selected, selected_entry](const SidebarItem& item) -> std::vector<SidebarItem> {
         if (const auto* node = std::get_if<Entry>(&item)) {
           const auto& children = (*node)->children.Get();
           return {children.begin(), children.end()};
         }
         switch (std::get<SidebarSection>(item)) {
-        case SidebarSection::Folders: {
+        case SidebarSection::Workspace: {
+          std::vector<SidebarItem> items;
+          for (const auto& tab : workspace->tabs.Get()) {
+            if (tab->saved.Get() && !(tab == selected ? selected_entry : FolderFileRow(tab, *workspace))) {
+              items.emplace_back(tab);
+            }
+          }
           const auto& roots = workspace->folders.Get();
-          return roots.empty() ? std::vector<SidebarItem>{SidebarSection::NoFolders}
-                               : std::vector<SidebarItem>{roots.begin(), roots.end()};
+          items.insert(items.end(), roots.begin(), roots.end());
+          if (items.empty()) {
+            items.emplace_back(SidebarSection::EmptyWorkspace);
+          }
+          return items;
         }
         case SidebarSection::Recent: {
           const auto& recent = actions.folio->recent.Get();
@@ -1709,8 +1814,8 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
       }).OnExpandedChanged([actions, workspace](const SidebarItem& item, bool expanded) {
         if (const auto* entry = std::get_if<Entry>(&item)) {
           actions.SetExpanded(*entry, expanded);
-        } else if (std::get<SidebarSection>(item) == SidebarSection::Folders) {
-          workspace->folders_open = expanded;
+        } else if (std::get<SidebarSection>(item) == SidebarSection::Workspace) {
+          workspace->files_open = expanded;
         } else {
           workspace->recents_open = expanded;
         }
@@ -1980,10 +2085,16 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
 
 void InstallFolio(ApplicationContext& context) {
   RegisterBrowser(context);
-  context.Provide(std::make_shared<FolioState>());
+  const auto folio = std::make_shared<FolioState>();
+  context.Provide(folio);
+  const auto application = UseApplication();
+  if (const auto& startup = application.StartupActivation()) {
+    folio->QueueActivation(*startup);
+  }
+  context.OnActivation([folio](ApplicationActivation activation) { folio->QueueActivation(activation); });
   std::optional<File> directory;
   try {
-    directory = UseApplication().Directories().data_directory;
+    directory = application.Directories().data_directory;
   } catch (const std::logic_error&) {
     // Settings remain available for the session on hosts without application storage.
   }
@@ -1996,7 +2107,7 @@ void InstallWorkbench(WindowContext& context) {
 }
 
 WindowOptions FolioWindowOptions() {
-  return {.title = "Folio", .initial_size = {920.0F, 720.0F}, .minimum_size = Size{360.0F, 360.0F},
+  return {.title = DRAFTSPAN_APP_NAME, .initial_size = {920.0F, 720.0F}, .minimum_size = Size{360.0F, 360.0F},
           .content_mode = WindowContentMode::EdgeToEdge,
           .chrome_mode = WindowChromeMode::Custom};
 }
@@ -2021,12 +2132,14 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
   Lifecycle([folio, workspace, window, application_tasks] {
     workspace->window = window;
     folio->windows.push_back(workspace);
+    folio->window_revision = folio->window_revision.Get() + 1;
     return [folio, workspace, application_tasks] {
       workspace->window.reset();
       std::erase_if(folio->windows, [workspace](const auto& weak) {
         const auto owner = weak.lock();
         return !owner || owner == workspace;
       });
+      folio->window_revision = folio->window_revision.Get() + 1;
       std::vector<File> directories;
       for (const auto& tab : workspace->tabs.Get()) {
         if (tab->working_directory) {
@@ -2042,6 +2155,12 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
       }
     };
   }, workspace);
+  const bool can_open_activated = !folio->pending_files->empty() && actions.Available();
+  Lifecycle([actions, can_open_activated] {
+    if (can_open_activated) {
+      actions.tasks.Post([actions] { actions.OpenActivated(); });
+    }
+  }, can_open_activated, folio->window_revision.Get(), window.LifecycleState());
   window.OnCloseRequest([actions] { return actions.OnCloseRequest(); }, workspace);
 
   const auto on_key = [actions, settings](const KeyEvent& event) {

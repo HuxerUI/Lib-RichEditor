@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Lib-RichEditor Preview
+Name=@DRAFTSPAN_APP_NAME@
 Exec=example_lib_rich_editor
 Icon=example_lib_rich_editor
 Categories=Utility;

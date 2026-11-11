@@ -1,9 +1,10 @@
-set(HUXERUI_WINDOWS_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/app.manifest")
 set(HUXERUI_WINDOWS_ICON "${CMAKE_CURRENT_LIST_DIR}/app.ico")
 set(HUXERUI_WINDOWS_RESOURCE_DIRECTORY
         "${CMAKE_CURRENT_BINARY_DIR}/huxerui-platform/windows"
 )
 file(MAKE_DIRECTORY "${HUXERUI_WINDOWS_RESOURCE_DIRECTORY}")
+set(HUXERUI_WINDOWS_MANIFEST "${HUXERUI_WINDOWS_RESOURCE_DIRECTORY}/app.manifest")
+configure_file("${CMAKE_CURRENT_LIST_DIR}/app.manifest" "${HUXERUI_WINDOWS_MANIFEST}" @ONLY)
 configure_file(
         "${CMAKE_CURRENT_LIST_DIR}/app.rc.in"
         "${HUXERUI_WINDOWS_RESOURCE_DIRECTORY}/app.rc"
@@ -70,6 +71,8 @@ function(huxerui_configure_windows_project_package target_name install_component
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/src/*.cc"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/src/*.cxx"
     )
+    set(installer_brand_resources "${HUXERUI_WINDOWS_RESOURCE_DIRECTORY}/installer-resources")
+    configure_file("${DRAFTSPAN_APP_ICON}" "${installer_brand_resources}/images/app_icon.svg" COPYONLY)
     huxerui_add_windows_installer(${target_name}_installer
             SOURCES
                 ${HUXERUI_WINDOWS_INSTALLER_SOURCES}
@@ -81,11 +84,16 @@ function(huxerui_configure_windows_project_package target_name install_component
             INTEGRATION_OUTPUT
                 "${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/$<CONFIG>/installer.json"
     )
+    huxerui_add_resources(${target_name}_installer
+            ROOT "${installer_brand_resources}"
+            NAMESPACE draftspan
+    )
+    target_compile_definitions(${target_name}_installer PRIVATE DRAFTSPAN_APP_NAME="${DRAFTSPAN_APP_NAME}")
     set_target_properties(${target_name}_installer PROPERTIES
             OUTPUT_NAME "example_lib_rich_editor-Installer"
     )
     file(GENERATE
             OUTPUT "${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/$<CONFIG>/package.json"
-            CONTENT "{\n  \"schema\": 1,\n  \"name\": \"Lib-RichEditor Preview\",\n  \"target\": \"example_lib_rich_editor\",\n  \"version\": \"${PROJECT_VERSION}\",\n  \"installComponent\": \"${install_component}\",\n  \"packageSource\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/Package.wxs\",\n  \"bundleSource\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/Bundle.wxs\",\n  \"installerPlan\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/$<CONFIG>/installer.json\"\n}\n"
+            CONTENT "{\n  \"schema\": 1,\n  \"name\": \"${DRAFTSPAN_APP_NAME}\",\n  \"target\": \"example_lib_rich_editor\",\n  \"version\": \"${PROJECT_VERSION}\",\n  \"installComponent\": \"${install_component}\",\n  \"packageSource\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/Package.wxs\",\n  \"bundleSource\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/Bundle.wxs\",\n  \"installerPlan\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/$<CONFIG>/installer.json\"\n}\n"
     )
 endfunction()

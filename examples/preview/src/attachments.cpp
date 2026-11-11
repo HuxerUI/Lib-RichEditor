@@ -217,7 +217,7 @@ IoResult<void> CheckOriginal(const File& target, const Bytes& expected) {
     return IoResult<void>::Failure(current.Error());
   }
   if (current.Value() != expected) {
-    return IoResult<void>::Failure({IoErrorCode::AlreadyExists, "The original file changed outside Folio"});
+    return IoResult<void>::Failure({IoErrorCode::AlreadyExists, "The original file changed outside " DRAFTSPAN_APP_NAME});
   }
   return IoResult<void>::Success();
 }
@@ -540,7 +540,7 @@ Task<IoResult<DocumentCopy>> WriteCopy(FileReference parent, File staged_file, s
   }
   auto destination = std::move(parent);
   if (!copies.Value().empty()) {
-    auto created = co_await destination.CreateDirectoryAsync(UniqueName("Folio-"));
+    auto created = co_await destination.CreateDirectoryAsync(UniqueName(DRAFTSPAN_APP_NAME "-"));
     if (!created.Succeeded()) {
       co_return IoResult<DocumentCopy>::Failure(created.Error());
     }

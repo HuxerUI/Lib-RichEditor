@@ -1,23 +1,27 @@
+include("${CMAKE_CURRENT_LIST_DIR}/AppName.cmake")
+
 if (HUXERUI_PROJECT_PLAN_OUTPUT)
     get_filename_component(HUXERUI_PROJECT_PLAN_DIRECTORY
             "${HUXERUI_PROJECT_PLAN_OUTPUT}"
             DIRECTORY
     )
     file(MAKE_DIRECTORY "${HUXERUI_PROJECT_PLAN_DIRECTORY}")
-    file(WRITE "${HUXERUI_PROJECT_PLAN_OUTPUT}" [=[
+    file(CONFIGURE OUTPUT "${HUXERUI_PROJECT_PLAN_OUTPUT}" CONTENT [=[
 {
   "schema": 1,
   "kind": "app",
-  "name": "Lib-RichEditor Preview",
+  "name": "@DRAFTSPAN_APP_NAME@",
   "id": "org.huxerui.lib.richeditor.preview",
   "target": "example_lib_rich_editor"
 }
-]=])
+]=] @ONLY)
 endif ()
 
 if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
 endif ()
+
+set(DRAFTSPAN_APP_ICON "${CMAKE_CURRENT_LIST_DIR}/platform/web/favicon.svg")
 
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     enable_language(CXX)
@@ -74,6 +78,7 @@ function(huxerui_configure_project_app target_name)
         return()
     endif ()
 
+    target_compile_definitions(${target_name} PRIVATE DRAFTSPAN_APP_NAME="${DRAFTSPAN_APP_NAME}")
     get_target_property(HUXERUI_PROJECT_APP_INSTALL_COMPONENT
             ${target_name}
             HUXERUI_APPLICATION_INSTALL_COMPONENT

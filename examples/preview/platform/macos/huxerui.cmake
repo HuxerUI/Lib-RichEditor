@@ -2,6 +2,7 @@ set(HUXERUI_MACOS_INFO_PLIST "${CMAKE_CURRENT_LIST_DIR}/Info.plist.in")
 set(HUXERUI_MACOS_APP_ICON "${CMAKE_CURRENT_LIST_DIR}/AppIcon.icns")
 
 function(huxerui_configure_macos_project_package target_name install_component)
+    set_target_properties(${target_name} PROPERTIES OUTPUT_NAME "${DRAFTSPAN_APP_NAME}")
     target_sources(${target_name} PRIVATE "${HUXERUI_MACOS_APP_ICON}")
     set_source_files_properties("${HUXERUI_MACOS_APP_ICON}" PROPERTIES
             MACOSX_PACKAGE_LOCATION Resources

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include <draftspan_resources.h>
 #include <installer_resources.h>
 #include <huxerui/huxerui.h>
 #include <huxerui/windows/installer.h>
@@ -31,18 +32,6 @@ std::optional<std::filesystem::path> ParseInstallPath(std::string_view value) {
   }
 }
 
-View InstallerMark(Color foreground, Color detail) {
-  return Canvas([foreground, detail](PaintContext& paint, Size size) {
-    const float extent = std::min(size.width, size.height);
-    Color tile = foreground;
-    tile.alpha = 0.14F;
-    paint.DrawRect({0.0F, 0.0F, extent, extent}, tile, CornerRadii{18.0F});
-    paint.DrawRect({15.0F, 17.0F, 34.0F, 32.0F}, foreground, CornerRadii{7.0F});
-    paint.DrawLine({15.0F, 28.0F}, {49.0F, 28.0F}, detail, StrokeStyle{.width = 2.0F});
-    paint.DrawLine({32.0F, 17.0F}, {32.0F, 49.0F}, detail, StrokeStyle{.width = 2.0F});
-  }).With(Frame{.width = 64.0F, .height = 64.0F});
-}
-
 View BrandPanel(const ThemeSpec& theme) {
   Color deep_primary = theme.colors.primary;
   deep_primary.red *= 0.52F;
@@ -52,11 +41,11 @@ View BrandPanel(const ThemeSpec& theme) {
   secondary_text.alpha = 0.72F;
 
   return Column {
-    InstallerMark(theme.colors.on_primary, deep_primary),
+    Image(draftspan::images::app_icon).With(Frame{.width = 64.0F, .height = 64.0F}, Semantics{.hidden = true}),
     Column {
       Text(installer_strings::application_setup)
           .Style(TextStyle{Font::System(12.0F).WithWeight(FontWeight::SemiBold), secondary_text}),
-      Text("Lib-RichEditor Preview")
+      Text(DRAFTSPAN_APP_NAME)
           .Style(TextStyle{Font::System(28.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_primary}),
       Text(installer_strings::guided_setup)
           .Style(TextStyle{Font::System(theme.typography.body_medium), secondary_text}),
@@ -103,7 +92,7 @@ View SecondaryAction(View action, const ThemeSpec& theme) {
       .padding = EdgeInsets::Symmetric(20.0F, 8.0F),
       .minimum_width = 72.0F,
       .minimum_height = 40.0F,
-      .corner_radius = theme.shapes.full,
+      .corner_radii = CornerRadii{theme.shapes.full},
       .indication = theme.interactions.indication,
   });
   return Theme {std::move(definition), std::move(action)};
@@ -200,7 +189,8 @@ View InstallerContent() {
     eyebrow = installer_strings::maintenance;
     heading = installer_strings::manage_installation;
     details.push_back(
-        Text(installer_strings::already_installed).With(Foreground(theme.colors.on_surface_variant))
+        Text(StringVariant::Format(installer_strings::already_installed, DRAFTSPAN_APP_NAME))
+            .With(Foreground(theme.colors.on_surface_variant))
     );
     actions.push_back(
         SecondaryAction(Button(installer_strings::cancel).OnClick([window] { window.Close(); }), theme)
@@ -289,17 +279,17 @@ View InstallerContent() {
   } else if (status.phase == InstallerPhase::Planning || status.phase == InstallerPhase::Applying ||
              status.phase == InstallerPhase::Canceling) {
     eyebrow = installer_strings::installing;
-    heading = installer_strings::installing_product;
+    heading = StringVariant::Format(installer_strings::installing_product, DRAFTSPAN_APP_NAME);
     panel_alignment = MainAxisAlignment::Center;
     if (status.phase == InstallerPhase::Canceling) {
       eyebrow = installer_strings::rollback;
       heading = installer_strings::canceling_and_rolling_back;
     } else if (status.action == InstallerAction::Repair) {
       eyebrow = installer_strings::repairing;
-      heading = installer_strings::repairing_product;
+      heading = StringVariant::Format(installer_strings::repairing_product, DRAFTSPAN_APP_NAME);
     } else if (status.action == InstallerAction::Uninstall) {
       eyebrow = installer_strings::removing;
-      heading = installer_strings::uninstalling_product;
+      heading = StringVariant::Format(installer_strings::uninstalling_product, DRAFTSPAN_APP_NAME);
     }
     StringVariant progress_message = status.current_package.empty()
                                          ? StringVariant(installer_strings::operation_may_take_a_moment)
@@ -319,9 +309,10 @@ View InstallerContent() {
       message = status.restart == InstallerRestart::Required ? installer_strings::application_removed_restart_message
                                                               : installer_strings::application_removed_message;
     } else {
-      message = status.restart == InstallerRestart::Required
-                    ? installer_strings::installation_complete_restart_message
-                    : installer_strings::installation_complete_message;
+      message = StringVariant::Format(status.restart == InstallerRestart::Required
+                                          ? installer_strings::installation_complete_restart_message
+                                          : installer_strings::installation_complete_message,
+                                      DRAFTSPAN_APP_NAME);
     }
     details.push_back(Row {CompletionMark(theme)}.With(MainAlign(MainAxisAlignment::Center)));
     details.push_back(Text(std::move(message)).With(Foreground(theme.colors.on_surface_variant)));
@@ -390,7 +381,7 @@ const Application application{
     InstallerPage,
     {
         .window = {
-            .title = "Lib-RichEditor Preview",
+            .title = DRAFTSPAN_APP_NAME,
             .initial_size = {780.0F, 500.0F},
             .minimum_size = Size{720.0F, 460.0F},
         },

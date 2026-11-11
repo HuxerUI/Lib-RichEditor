@@ -25,10 +25,16 @@ function(huxerui_configure_linux_project_package target_name install_component)
             DESTINATION .
             COMPONENT "${install_component}"
     )
-    install(FILES
-            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/example_lib_rich_editor.desktop"
-            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/example_lib_rich_editor.svg"
+    set(desktop_entry "${CMAKE_CURRENT_BINARY_DIR}/huxerui-platform/linux/${target_name}.desktop")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/example_lib_rich_editor.desktop.in"
+            "${desktop_entry}" @ONLY)
+    install(FILES "${desktop_entry}"
             DESTINATION .
+            COMPONENT "${install_component}"
+    )
+    install(FILES "${DRAFTSPAN_APP_ICON}"
+            DESTINATION .
+            RENAME "${target_name}.svg"
             COMPONENT "${install_component}"
     )
 endfunction()

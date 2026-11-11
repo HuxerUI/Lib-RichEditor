@@ -1,11 +1,11 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Bundle Name="Lib-RichEditor Preview" Manufacturer="org.huxerui.lib.richeditor.preview" Version="@HUXERUI_WINDOWS_PROJECT_VERSION@"
+  <Bundle Name="@DRAFTSPAN_APP_NAME@" Manufacturer="org.huxerui.lib.richeditor.preview" Version="@HUXERUI_WINDOWS_PROJECT_VERSION@"
           UpgradeCode="@HUXERUI_WINDOWS_BUNDLE_UPGRADE_CODE@"
           IconSourceFile="!(bindpath.Project)\app.ico">
     <BootstrapperApplication SourceFile="!(bindpath.Installer)\example_lib_rich_editor-Installer.exe">
       <PayloadGroupRef Id="HuxerUIInstallerPayloads" />
     </BootstrapperApplication>
-    <Variable Name="InstallFolder" Type="formatted" Value="[ProgramFiles64Folder]Lib-RichEditor Preview" />
+    <Variable Name="InstallFolder" Type="formatted" Value="[ProgramFiles64Folder]@DRAFTSPAN_APP_NAME@" />
     <Variable Name="CreateDesktopShortcut" Type="numeric" Value="0" />
     <Chain>
       <MsiPackage SourceFile="!(bindpath.Package)\example_lib_rich_editor.msi">

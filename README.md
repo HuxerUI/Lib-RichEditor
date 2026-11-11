@@ -128,7 +128,7 @@ Choose `DecorationScope::Document` for analysis that needs context across blocks
 
 A top-level `Custom` block stores a namespaced type, payload version, UTF-8 payload, and fallback text. JSON v1 preserves these fields even when no renderer is registered. Register a `CustomBlockExtension` per type to display an image or vector asset. Use `InsertCustomBlock`, `SelectedCustomBlock()` and `ReplaceCustomBlock` to build application controls for its content. Edits and removal are undoable.
 
-Folio uses a custom block for standalone LaTeX and offers source editing and copying LaTeX from the formatting bar. Its optional RaTeX renderer runs locally on macOS and Android when the corresponding Rust target is installed. Unsupported expressions and builds without the renderer display editable source. Applications can use the same custom block API with their own types and renderers.
+Folio uses a custom block for standalone LaTeX and offers source editing and copying LaTeX from the formatting bar. RaTeX renders formulas locally on each supported preview platform. Unsupported expressions and builds with rendering disabled display editable source. Applications can use the same custom block API with their own types and renderers.
 
 ## Inline objects
 
@@ -179,8 +179,21 @@ Folio registers its own formula mappings and retains the existing `huxerui.latex
 
 ## Preview and tests
 
-Folio's math renderer uses Cargo and the matching Rust target. For Android arm64, install it with
-`rustup target add aarch64-linux-android`. CMake can disable the preview renderer with `FOLIO_BUILD_MATH_RENDERER=OFF`.
+Folio builds its math renderer by default and requires Cargo and Rust. For native builds, run `rustup target add` with every target selected for the build.
+
+| Preview target | Rust target |
+| --- | --- |
+| Windows x64 | `x86_64-pc-windows-msvc` |
+| Android arm64-v8a / x86_64 | `aarch64-linux-android` / `x86_64-linux-android` |
+| macOS arm64 / x86_64 | `aarch64-apple-darwin` / `x86_64-apple-darwin` |
+| iOS arm64 device | `aarch64-apple-ios` |
+| iOS arm64 / x86_64 simulator | `aarch64-apple-ios-sim` / `x86_64-apple-ios` |
+| Linux arm64 / x86_64 | `aarch64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu` |
+| Web | `wasm32-unknown-emscripten` |
+
+For Web, run `rustup toolchain install nightly --profile minimal --component rust-src`. The build compiles Rust's standard library with HuxerUI's Emscripten toolchain.
+
+For source-only formulas, configure CMake with `-DFOLIO_BUILD_MATH_RENDERER=OFF`. On Android, pass `-PfolioBuildMathRenderer=OFF` to Gradle. On iOS, set `FOLIO_BUILD_MATH_RENDERER = OFF` in `Config/Local.xcconfig`.
 
 ```sh
 huxerui run macos --profile debug
@@ -197,7 +210,9 @@ On desktop, open **Command palette…** from **File actions**, or press **Comman
 
 Folio follows the system language. Its interface supports English, Simplified Chinese, Japanese, Korean, German, French, and Spanish. English is the fallback.
 
-Folio starts with an empty workspace. **Open file…** accepts RichEditor JSON, `.md`, and `.markdown` and opens a tab. **Open folder…** adds a directory to the sidebar. Expand a directory to list its contents, then select a document to open it. The control at the sidebar’s upper right hides it, and **Show files** in the title bar restores it. On compact mobile hosts, **Show files** opens the drawer. Select the file name in the header to switch tabs. A standalone document with relative image references opens with placeholders. Use **Locate attachments…** to load the images.
+Folio starts with an empty workspace. **Open file…** accepts RichEditor JSON, `.md`, and `.markdown` and opens a tab. The **Files** sidebar lists standalone documents alongside authorized folders. Select a standalone file to switch to its tab, or expand a folder to open a document from its tree. Closing a standalone tab removes its row from the workspace. **Recent edits** can reopen it. The control at the sidebar’s upper right hides it, and **Show files** in the title bar restores it. On compact mobile hosts, **Show files** opens the drawer. Select the file name in the header to switch tabs. A standalone document with relative image references opens with placeholders. Use **Locate attachments…** to load the images.
+
+Folio accepts `.md` and `.markdown` files opened from Windows File Explorer, macOS Finder, and Files on iOS. The Windows installer adds Folio to **Open with**. On Android, file managers can open a Markdown document in Folio by sending it as `text/markdown`. Opening a file starts Folio or opens it in the running app. If Folio can identify an already open file, it switches to its tab.
 
 Desktop windows have independent tabs and sidebars. **Recent edits** is shared while Folio is running. **Save** checks the source file before writing back in its original format. **Save as…** creates and binds a file in a writable directory. **Export copy…** creates a separate JSON or Markdown copy. Closing a tab or window prompts for unsaved changes.
 

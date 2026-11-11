@@ -47,7 +47,7 @@ huxerui_add_app(example_lib_rich_editor
             app
         ${HUXERUI_APP_RESOURCE_OUTPUT_ARGUMENTS}
         BUNDLE_NAME
-            "Lib-RichEditor Preview"
+            "${DRAFTSPAN_APP_NAME}"
         BUNDLE_IDENTIFIER
             "org.huxerui.lib.richeditor.preview"
 )

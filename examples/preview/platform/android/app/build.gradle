@@ -57,13 +57,15 @@ android {
         targetSdk = huxeruiTargetSdk
         versionCode = 1
         versionName = "0.1.0"
+        resValue "string", "app_name", rootProject.name
 
         externalNativeBuild {
             cmake {
                 arguments "-DANDROID_STL=${huxeruiStl}",
                         "-DHUXERUI_HOME=${huxeruiHome.absolutePath}",
                         "-DHUXERUI_OPTIMIZATION=${providers.gradleProperty('huxeruiOptimization').orElse('default').get()}",
-                        "-DHUXERUI_ENABLE_LTO=${providers.gradleProperty('huxeruiLto').orElse('OFF').get()}"
+                        "-DHUXERUI_ENABLE_LTO=${providers.gradleProperty('huxeruiLto').orElse('OFF').get()}",
+                        "-DFOLIO_BUILD_MATH_RENDERER=${providers.gradleProperty('folioBuildMathRenderer').orElse('ON').get()}"
             }
         }
 

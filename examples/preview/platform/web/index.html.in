@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <link rel="icon" type="image/svg+xml" href="./@HUXERUI_WEB_FAVICON_FILE@">
   <link rel="apple-touch-icon" href="./@HUXERUI_WEB_APPLE_TOUCH_ICON_FILE@">
-  <title>Lib-RichEditor Preview</title>
+  <title>@DRAFTSPAN_APP_NAME@</title>
   <style>
     html, body {
       width: 100%;

@@ -1,40 +1,65 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="Lib-RichEditor Preview" Manufacturer="org.huxerui.lib.richeditor.preview" Version="@HUXERUI_WINDOWS_PROJECT_VERSION@"
+  <Package Name="@DRAFTSPAN_APP_NAME@" Manufacturer="org.huxerui.lib.richeditor.preview" Version="@HUXERUI_WINDOWS_PROJECT_VERSION@"
            UpgradeCode="@HUXERUI_WINDOWS_MSI_UPGRADE_CODE@" Scope="perMachine">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Lib-RichEditor Preview is already installed." />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of @DRAFTSPAN_APP_NAME@ is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="ApplicationIcon" SourceFile="!(bindpath.Project)\app.ico" />
     <Property Id="ARPPRODUCTICON" Value="ApplicationIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="Lib-RichEditor Preview" />
+      <Directory Id="INSTALLFOLDER" Name="@DRAFTSPAN_APP_NAME@" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="APPLICATIONPROGRAMMENU" Name="Lib-RichEditor Preview" />
+      <Directory Id="APPLICATIONPROGRAMMENU" Name="@DRAFTSPAN_APP_NAME@" />
     </StandardDirectory>
     <StandardDirectory Id="DesktopFolder" />
 
     <ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
       <Files Include="!(bindpath.Application)\**" />
     </ComponentGroup>
+    <Component Id="MarkdownFileAssociation" Directory="INSTALLFOLDER">
+      <RegistryValue Root="HKLM" Key="Software\Classes\org.huxerui.lib.richeditor.preview.Markdown"
+                     Type="string" Value="@DRAFTSPAN_APP_NAME@ Markdown Document" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\org.huxerui.lib.richeditor.preview.Markdown\DefaultIcon"
+                     Type="string" Value="&quot;[INSTALLFOLDER]example_lib_rich_editor.exe&quot;,0" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\org.huxerui.lib.richeditor.preview.Markdown\shell\open\command"
+                     Type="string" Value="&quot;[INSTALLFOLDER]example_lib_rich_editor.exe&quot; &quot;%1&quot;" KeyPath="yes" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\.md\OpenWithProgids"
+                     Name="org.huxerui.lib.richeditor.preview.Markdown" Type="string" Value="" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\.markdown\OpenWithProgids"
+                     Name="org.huxerui.lib.richeditor.preview.Markdown" Type="string" Value="" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\Applications\example_lib_rich_editor.exe"
+                     Name="FriendlyAppName" Type="string" Value="@DRAFTSPAN_APP_NAME@" />
+      <RegistryValue Root="HKLM" Key="Software\RegisteredApplications" Name="@DRAFTSPAN_APP_NAME@"
+                     Type="string" Value="Software\org.huxerui.lib.richeditor.preview\Capabilities" />
+      <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Capabilities"
+                     Name="ApplicationName" Type="string" Value="@DRAFTSPAN_APP_NAME@" />
+      <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Capabilities"
+                     Name="ApplicationDescription" Type="string" Value="Edit Markdown documents in @DRAFTSPAN_APP_NAME@." />
+      <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Capabilities\FileAssociations"
+                     Name=".md" Type="string" Value="org.huxerui.lib.richeditor.preview.Markdown" />
+      <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Capabilities\FileAssociations"
+                     Name=".markdown" Type="string" Value="org.huxerui.lib.richeditor.preview.Markdown" />
+    </Component>
     <Component Id="ApplicationShortcut" Directory="APPLICATIONPROGRAMMENU">
-      <Shortcut Id="ApplicationStartMenuShortcut" Name="Lib-RichEditor Preview"
+      <Shortcut Id="ApplicationStartMenuShortcut" Name="@DRAFTSPAN_APP_NAME@"
                 Target="[INSTALLFOLDER]example_lib_rich_editor.exe" WorkingDirectory="INSTALLFOLDER"
                 Icon="ApplicationIcon" />
       <RemoveFolder Id="RemoveApplicationProgramMenu" On="uninstall" />
-      <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Lib-RichEditor Preview" Name="installed"
+      <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Shortcuts" Name="installed"
                      Type="integer" Value="1" KeyPath="yes" />
     </Component>
     <Component Id="ApplicationDesktopShortcut" Directory="DesktopFolder">
-      <Shortcut Id="ApplicationDesktopShortcutLink" Name="Lib-RichEditor Preview"
+      <Shortcut Id="ApplicationDesktopShortcutLink" Name="@DRAFTSPAN_APP_NAME@"
                 Target="[INSTALLFOLDER]example_lib_rich_editor.exe" WorkingDirectory="INSTALLFOLDER"
                 Icon="ApplicationIcon" />
-      <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Lib-RichEditor Preview" Name="desktopShortcut"
+      <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Shortcuts" Name="desktopShortcut"
                      Type="integer" Value="1" KeyPath="yes" />
     </Component>
 
-    <Feature Id="Application" Title="Lib-RichEditor Preview" Level="1">
+    <Feature Id="Application" Title="@DRAFTSPAN_APP_NAME@" Level="1">
       <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="MarkdownFileAssociation" />
       <ComponentRef Id="ApplicationShortcut" />
     </Feature>
     <Feature Id="DesktopShortcut" Title="Desktop shortcut" Level="2" AllowAbsent="yes">

@@ -25,11 +25,11 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		000000000000000000000200 /* Lib-RichEditor Preview.app */ = {
+		000000000000000000000200 /* Draftspan.app */ = {
 			isa = PBXFileReference;
 			explicitFileType = wrapper.application;
 			includeInIndex = 0;
-			path = "Lib-RichEditor Preview.app";
+			path = "Draftspan.app";
 			sourceTree = BUILT_PRODUCTS_DIR;
 		};
 		000000000000000000000201 /* main.mm */ = {
@@ -141,7 +141,7 @@
 		000000000000000000000403 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000200 /* Lib-RichEditor Preview.app */,
+				000000000000000000000200 /* Draftspan.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -174,8 +174,8 @@
 			packageProductDependencies = (
 				000000000000000000000901 /* HuxerUILibraries */,
 			);
-			productName = "Lib-RichEditor Preview";
-			productReference = 000000000000000000000200 /* Lib-RichEditor Preview.app */;
+			productName = "Draftspan";
+			productReference = 000000000000000000000200 /* Draftspan.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
