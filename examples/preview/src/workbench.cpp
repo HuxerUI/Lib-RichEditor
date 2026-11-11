@@ -19,6 +19,8 @@ using namespace huxerui::richeditor;
 
 View App();
 
+namespace l10n = app::strings;
+
 namespace folio {
 namespace {
 
@@ -218,7 +220,7 @@ struct SavePayload {
 enum class ChoiceTone { Cancel, Secondary, Primary, Destructive };
 
 struct Choice {
-  std::string label;
+  StringVariant label;
   std::function<void()> action;
   ChoiceTone tone = ChoiceTone::Cancel;
 };
@@ -241,6 +243,7 @@ public:
   ApplicationHandle application;
   WindowHandle window;
   std::shared_ptr<FilePicker> picker;
+  std::shared_ptr<Resources> resources;
   TaskScope tasks;
   DialogHandle dialog;
   ViewHandle file_menu_focus;
@@ -267,7 +270,7 @@ public:
 
 private:
   void ShowCommandPalette(bool keyboard) const;
-  void Status(const Tab& tab, std::string message) const;
+  void Status(const Tab& tab, StringVariant message) const;
   void Launch(bool uses_picker, std::function<Task<void>()> action, std::function<void(std::string)> failed = {}) const;
   void AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved = {}) const;
   bool ActivateExisting(const Target& target) const;
@@ -291,7 +294,7 @@ private:
                                SavePayload payload) const;
   void OfferSaveAs(Save request, std::string message) const;
 
-  void ShowChoices(std::string title, std::string message, std::vector<Choice> choices) const;
+  void ShowChoices(StringVariant title, StringVariant message, std::vector<Choice> choices) const;
   void ContinueClose() const;
   void SaveBeforeClose(std::shared_ptr<const std::vector<Tab>> dirty, std::size_t index) const;
   void FinishClose() const;
@@ -417,11 +420,11 @@ void WorkbenchActions::ShowCommandPalette(bool keyboard) const {
   workspace->palette_open = true;
 }
 
-void WorkbenchActions::Status(const Tab& tab, std::string message) const {
+void WorkbenchActions::Status(const Tab& tab, StringVariant message) const {
   if (tab) {
-    tab->status = std::move(message);
+    tab->status = resources->GetString(message);
   } else {
-    workspace->status = std::move(message);
+    workspace->status = resources->GetString(message);
   }
 }
 
@@ -479,7 +482,11 @@ void WorkbenchActions::NewDocument(bool sample) const {
     return;
   }
   const auto number = ++folio->next_draft;
-  AddTab(number == 1 ? std::string("Untitled") : "Untitled " + std::to_string(number), RichDocument{});
+  auto name = resources->GetString(l10n::untitled);
+  if (number != 1) {
+    name += " " + std::to_string(number);
+  }
+  AddTab(std::move(name), RichDocument{});
 }
 
 void WorkbenchActions::NewWindow() const {
@@ -568,7 +575,7 @@ void WorkbenchActions::PickOpen(OpenKind kind) const {
   Launch(true, [self = *this, kind]() -> Task<void> {
     if (kind == OpenKind::File) {
       const auto file = co_await self.picker->OpenFileAsync({
-          .name = "RichEditor documents", .extensions = {"json", "md", "markdown"},
+          .name = self.resources->GetString(l10n::rich_editor_documents), .extensions = {"json", "md", "markdown"},
           .content_types = {"application/json", "text/markdown", "text/plain"},
       });
       if (file) {
@@ -614,7 +621,7 @@ Task<Entry> WorkbenchActions::AddFolder(FileReference directory) const {
   }
   auto name = directory.Name();
   if (name.empty()) {
-    name = identity ? identity->Path() : "Folder";
+    name = identity ? identity->Path() : resources->GetString(l10n::folder);
   }
   auto folder = std::make_shared<FolderEntry>(FolderEntry{
       ++workspace->next_entry, std::move(name), std::move(directory), {}, identity,
@@ -702,7 +709,7 @@ void WorkbenchActions::PickImage(Tab tab, RichEditorController editor, ViewHandl
   tab->operation = Operation::PickImage;
   Launch(true, [self = *this, tab, editor, focus, replace, inline_image]() -> Task<void> {
     const auto selected = co_await self.picker->OpenFileAsync({
-        .name = "PNG and JPEG images", .extensions = {"png", "jpg", "jpeg"},
+        .name = self.resources->GetString(l10n::png_jpeg_images), .extensions = {"png", "jpg", "jpeg"},
         .content_types = {"image/png", "image/jpeg"},
     });
     if (selected) {
@@ -711,8 +718,8 @@ void WorkbenchActions::PickImage(Tab tab, RichEditorController editor, ViewHandl
         const ImageBlockData image{std::move(saved.Value()), selected->Name(), {}};
         const auto command = replace ? EditorCommand{ReplaceImage{image.source}}
             : inline_image ? EditorCommand{InsertInlineObject{InlineImage(image)}} : EditorCommand{InsertImage{image}};
-        self.Status(tab, editor.Execute(command) ? (replace ? "Image replaced" : "Image inserted")
-                                                : "Select an image or place the caret in a paragraph");
+        self.Status(tab, editor.Execute(command) ? (replace ? l10n::image_replaced : l10n::image_inserted)
+                                                : l10n::select_image_or_paragraph);
       } else {
         self.Status(tab, saved.Error().message);
       }
@@ -735,7 +742,7 @@ void WorkbenchActions::LocateAttachments(Tab tab) const {
   Launch(true, [self = *this, tab]() -> Task<void> {
     if (auto folder = co_await self.picker->OpenDirectoryAsync()) {
       tab->SetAttachmentDirectory(std::move(*folder));
-      self.Status(tab, "Attachment folder linked");
+      self.Status(tab, l10n::attachment_folder_linked);
     }
     tab->operation = Operation::Idle;
   }, [self = *this, tab](std::string error) {
@@ -761,8 +768,8 @@ std::string CopyName(std::string name, DocumentFormat format) {
 }
 
 [[huxerui::composable]]
-View OutputDialog(DialogContext context, std::string title, std::string name, DocumentFormat preferred,
-                  std::string message, std::string action_label,
+View OutputDialog(DialogContext context, StringVariant title, std::string name, DocumentFormat preferred,
+                  std::string message, StringVariant action_label,
                   std::function<void(DocumentFormat, std::string)> action, std::function<void()> cancel) {
   const auto& theme = UseTheme();
   const auto format = UseState(preferred);
@@ -773,7 +780,7 @@ View OutputDialog(DialogContext context, std::string title, std::string name, Do
       filename = TextEditingValue::FromText(NameForFormat(filename->text, next));
     }
   };
-  const auto format_button = [&](const char* label, DocumentFormat value) {
+  const auto format_button = [&](StringVariant label, DocumentFormat value) {
     const bool selected = format.Get() == value;
     return Button(label).OnClick([choose, value] { choose(value); }).With(
         Background(selected ? theme.colors.primary_container : theme.colors.surface_container),
@@ -795,11 +802,11 @@ View OutputDialog(DialogContext context, std::string title, std::string name, Do
       format_button("RichEditor JSON", DocumentFormat::Json),
       format_button("Markdown", DocumentFormat::Markdown),
     }.With(Spacing(6.0F)),
-    TextField(filename).Label("File name").Variant(TextFieldVariant::Outlined)
+    TextField(filename).Label(l10n::file_name).Variant(TextFieldVariant::Outlined)
         .OnChanged([filename](const TextEditingValue& next) { filename = next; })
         .OnSubmitted(submit),
     DialogActions(theme,
-      Button("Cancel").OnClick([context, cancel] {
+      Button(l10n::cancel).OnClick([context, cancel] {
         context.Dismiss();
         cancel();
       }),
@@ -808,7 +815,7 @@ View OutputDialog(DialogContext context, std::string title, std::string name, Do
 }
 
 [[huxerui::composable]]
-View ChoiceDialog(DialogContext context, const std::string& title, const std::string& message,
+View ChoiceDialog(DialogContext context, const StringVariant& title, const StringVariant& message,
                   const std::vector<Choice>& choices) {
   const auto& theme = UseTheme();
   const auto cancel_focus = UseViewHandle();
@@ -843,7 +850,7 @@ View ChoiceDialog(DialogContext context, const std::string& title, const std::st
     theme, 440.0F);
 }
 
-void WorkbenchActions::ShowChoices(std::string title, std::string message, std::vector<Choice> choices) const {
+void WorkbenchActions::ShowChoices(StringVariant title, StringVariant message, std::vector<Choice> choices) const {
   dialog.Show(DialogFactory{[title = std::move(title), message = std::move(message),
                             choices = std::move(choices)](DialogContext context) {
     return ChoiceDialog(context, title, message, choices);
@@ -861,7 +868,8 @@ View NewChildDialog(DialogContext context, ChildKind kind, std::string folder, s
                     std::function<void(std::string)> create) {
   const auto& theme = UseTheme();
   const bool file = kind == ChildKind::File;
-  auto initial = TextEditingValue::FromText(name.empty() ? (file ? "Untitled.md" : "New folder") : name);
+  auto initial = TextEditingValue::FromText(name.empty()
+      ? (file ? UseString(l10n::untitled) + ".md" : UseString(l10n::new_folder)) : name);
   initial.selection.anchor = 0;
   const auto value = UseState(std::move(initial));
   const auto candidate = file && !FormatOf(value->text) ? value->text + ".md" : value->text;
@@ -874,15 +882,15 @@ View NewChildDialog(DialogContext context, ChildKind kind, std::string folder, s
     }
   };
   return DialogPanel(Column {
-    Text(file ? "New file" : "New folder", TextRole::Title),
-    Text("Create in " + folder, TextRole::Label).With(Foreground(theme.colors.on_surface_variant)),
+    Text(file ? l10n::new_file : l10n::new_folder, TextRole::Title),
+    Text(StringVariant::Format(l10n::create_in, folder), TextRole::Label).With(Foreground(theme.colors.on_surface_variant)),
     message.empty() ? View{} : Text(std::move(message), TextRole::Label).With(Foreground(theme.colors.error)),
-    TextField(value).Label(file ? "File name" : "Folder name").Variant(TextFieldVariant::Outlined)
+    TextField(value).Label(file ? l10n::file_name : l10n::folder_name).Variant(TextFieldVariant::Outlined)
         .OnChanged([value](const TextEditingValue& next) { value = next; })
         .OnSubmitted(submit).Key("name"),
     DialogActions(theme,
-      Button("Cancel").OnClick([context] { context.Dismiss(); }),
-      Button("Create").OnClick(submit).With(Enabled(valid))).Key("actions"),
+      Button(l10n::cancel).OnClick([context] { context.Dismiss(); }),
+      Button(l10n::create).OnClick(submit).With(Enabled(valid))).Key("actions"),
   }, theme, 400.0F);
 }
 
@@ -897,9 +905,9 @@ void WorkbenchActions::RequestNewChild(Entry folder, ChildKind kind) const {
   if (!picker->CanOpenDirectories(true)) {
     return;
   }
-  ShowChoices("Allow folder changes", "Choose " + folder->name + " with write access.", {
-      {"Cancel", [] {}},
-      {"Choose folder…", [self = *this, folder, kind] {
+  ShowChoices(l10n::allow_folder_changes, StringVariant::Format(l10n::choose_writable_folder, folder->name), {
+      {l10n::cancel, [] {}},
+      {l10n::choose_folder, [self = *this, folder, kind] {
         self.Launch(true, [self, folder, kind]() -> Task<void> {
           const auto granted = co_await self.picker->OpenDirectoryAsync(true);
           if (!granted) {
@@ -907,7 +915,7 @@ void WorkbenchActions::RequestNewChild(Entry folder, ChildKind kind) const {
           }
           const auto expected = co_await LocalIdentity(*folder->directory);
           if (expected && (co_await LocalIdentity(*granted)) != expected) {
-            self.Status({}, "Choose the folder you opened in the sidebar");
+            self.Status({}, l10n::choose_sidebar_folder);
             co_return;
           }
           if (expected) {
@@ -978,7 +986,7 @@ void WorkbenchActions::CreateChild(Entry folder, ChildKind kind, std::string nam
         : co_await CreateNamedFolder(directory, name);
     if (!created.Succeeded()) {
       if (created.Error().code == IoErrorCode::AlreadyExists) {
-        self.PromptNewChild(folder, kind, name, "A file or folder already uses that name. Choose another name.");
+        self.PromptNewChild(folder, kind, name, self.resources->GetString(l10n::name_already_used));
       } else {
         self.Status({}, created.Error().message);
       }
@@ -1043,7 +1051,7 @@ void WorkbenchActions::MarkSaved(const Save& request, Target target, SavePayload
     request->tab->BindAttachmentDirectory(*target->directory);
   }
   folio->Remember(std::move(target));
-  Status(request->tab, "Saved " + request->tab->Name());
+  Status(request->tab, StringVariant::Format(l10n::saved_document, request->tab->Name()));
   FinishSave(request, true);
 }
 
@@ -1053,18 +1061,18 @@ void WorkbenchActions::ChooseOutput(Save request, WriteKind kind, DocumentFormat
     if (!message.empty()) {
       message += "\n\n";
     }
-    message += "Choose a writable folder to bind a new save target. This host can only export a copy.";
-    std::vector<Choice> choices{{"Cancel", cancel}};
+    message += resources->GetString(l10n::save_folder_required);
+    std::vector<Choice> choices{{l10n::cancel, cancel}};
     if (picker->CanSaveFiles()) {
-      choices.push_back({"Export copy…", [self = *this, request, preferred] {
+      choices.push_back({l10n::export_copy_menu, [self = *this, request, preferred] {
         self.ChooseOutput(request, WriteKind::Export, preferred);
       }, ChoiceTone::Primary});
     }
-    ShowChoices("Save as", std::move(message), std::move(choices));
+    ShowChoices(l10n::save_as, std::move(message), std::move(choices));
     return;
   }
-  const auto title = kind == WriteKind::Export ? "Export copy" : "Save as";
-  const auto action = kind == WriteKind::Export ? "Export copy…" : "Choose folder and save…";
+  const auto title = kind == WriteKind::Export ? l10n::export_copy : l10n::save_as;
+  const auto action = kind == WriteKind::Export ? l10n::export_copy_menu : l10n::choose_folder_and_save;
   auto name = request->tab->Name();
   if (kind == WriteKind::Export) {
     name = CopyName(std::move(name), preferred);
@@ -1096,14 +1104,14 @@ void WorkbenchActions::ExplainMarkdownLoss(Save request, WriteKind kind, RichDoc
   if (kind != WriteKind::Export) {
     name = CopyName(std::move(name), DocumentFormat::Markdown);
   }
-  std::vector<Choice> choices{{"Cancel", [self = *this, request] { self.FinishSave(request, false); }}};
+  std::vector<Choice> choices{{l10n::cancel, [self = *this, request] { self.FinishSave(request, false); }}};
   if (kind != WriteKind::Export && picker->CanOpenDirectories(true)) {
-    choices.push_back({"Save as JSON…", [self = *this, request] {
+    choices.push_back({l10n::save_as_json, [self = *this, request] {
       self.ChooseOutput(request, WriteKind::SaveAs, DocumentFormat::Json);
     }, ChoiceTone::Primary});
   }
   if (picker->CanSaveFiles() || picker->CanOpenDirectories(true)) {
-    choices.push_back({"Export with loss…", [self = *this, request, snapshot = std::move(snapshot), name = std::move(name)] {
+    choices.push_back({l10n::export_with_loss, [self = *this, request, snapshot = std::move(snapshot), name = std::move(name)] {
       const auto& codec = Codec(DocumentFormat::Markdown);
       auto encoded = codec.Export(snapshot, LossPolicy::AllowLoss);
       if (encoded.text) {
@@ -1118,20 +1126,20 @@ void WorkbenchActions::ExplainMarkdownLoss(Save request, WriteKind kind, RichDoc
       self.FinishSave(request, false);
     }, ChoiceTone::Destructive});
   }
-  ShowChoices("Markdown cannot preserve this document", std::move(message), std::move(choices));
+  ShowChoices(l10n::markdown_cannot_preserve, std::move(message), std::move(choices));
 }
 
 void WorkbenchActions::WriteNew(Save request, WriteKind kind, std::string name, SavePayload payload) const {
   const bool export_copy = kind == WriteKind::Export;
   const bool picker_export = export_copy && picker->CanSaveFiles() && !HasLocalAttachments(payload.snapshot);
   if (workspace->picking.Get() || (!picker_export && !picker->CanOpenDirectories(true))) {
-    Status(request->tab, "This operation requires a writable folder");
+    Status(request->tab, l10n::writable_folder_required);
     FinishSave(request, false);
     return;
   }
   request->tab->operation = export_copy ? Operation::Export : Operation::Save;
   if (!request->tab->working_directory) {
-    Status(request->tab, "Temporary storage is unavailable");
+    Status(request->tab, l10n::temporary_storage_unavailable);
     FinishSave(request, false);
     return;
   }
@@ -1145,7 +1153,7 @@ void WorkbenchActions::WriteNew(Save request, WriteKind kind, std::string name, 
   if (picker_export) {
     // Present the picker in the same user gesture on Web.
     if (!temporary.CreateDirectories() || !staged.WriteString(payload.text)) {
-      failed("Could not prepare the export");
+      failed(resources->GetString(l10n::prepare_export_failed));
       return;
     }
     const bool markdown = payload.format == DocumentFormat::Markdown;
@@ -1159,7 +1167,7 @@ void WorkbenchActions::WriteNew(Save request, WriteKind kind, std::string name, 
     Launch(true, [self = *this, request, staged, options]() -> Task<void> {
       const bool exported = co_await self.picker->SaveFileAsync(staged, options);
       (void)co_await staged.DeleteAsync();
-      self.Status(request->tab, exported ? "Exported a copy" : "Export canceled or unsuccessful");
+      self.Status(request->tab, exported ? l10n::exported_copy : l10n::export_unsuccessful);
       self.FinishSave(request, false);
     }, failed);
     return;
@@ -1173,7 +1181,7 @@ void WorkbenchActions::WriteNew(Save request, WriteKind kind, std::string name, 
     }
     if (!(co_await temporary.CreateDirectoriesAsync()) || !(co_await staged.WriteStringAsync(payload.text))) {
       (void)co_await staged.DeleteAsync();
-      self.Status(request->tab, "Could not prepare the document");
+      self.Status(request->tab, l10n::prepare_document_failed);
       self.FinishSave(request, false);
       co_return;
     }
@@ -1184,7 +1192,7 @@ void WorkbenchActions::WriteNew(Save request, WriteKind kind, std::string name, 
       self.Status(request->tab, copied.Error().message);
       self.FinishSave(request, false);
     } else if (export_copy) {
-      self.Status(request->tab, "Exported " + copied.Value().directory.Name() + "/" + name);
+      self.Status(request->tab, StringVariant::Format(l10n::exported_document, copied.Value().directory.Name() + "/" + name));
       self.FinishSave(request, false);
     } else {
       auto target = std::make_shared<DocumentFile>(
@@ -1203,7 +1211,7 @@ void WorkbenchActions::SaveOriginal(Save request) const {
   }
   auto snapshot = request->tab->Snapshot();
   if (snapshot == original->snapshot) {
-    Status(request->tab, "Document is already saved");
+    Status(request->tab, l10n::document_already_saved);
     FinishSave(request, true);
     return;
   }
@@ -1221,7 +1229,7 @@ void WorkbenchActions::SaveOriginal(Save request) const {
   SavePayload payload{std::move(snapshot), original->format, std::move(*encoded.text)};
   const auto& target = original->target;
   if (!target->reference.AsFile()) {
-    OfferSaveAs(request, "This file provider does not support safe replacement of the original.");
+    OfferSaveAs(request, resources->GetString(l10n::provider_cannot_replace));
     return;
   }
   if (!target->reference.CanWrite() ||
@@ -1239,14 +1247,14 @@ void WorkbenchActions::SaveOriginal(Save request) const {
 void WorkbenchActions::ChooseOriginalFolder(Save request, std::shared_ptr<const SavedDocument> original,
                                            SavePayload payload) const {
   if (!picker->CanOpenDirectories(true)) {
-    OfferSaveAs(request, "The original requires a folder with write access.");
+    OfferSaveAs(request, resources->GetString(l10n::original_needs_folder));
     return;
   }
-  ShowChoices("Authorize the original folder", "Choose the directory containing " + request->tab->Name() +
-      " to save back to that file and its attachments.", {
-      {"Cancel", [self = *this, request] { self.FinishSave(request, false); }},
-      {"Save as…", [self = *this, request] { self.OfferSaveAs(request, {}); }, ChoiceTone::Secondary},
-      {"Choose folder…", [self = *this, request, original, payload = std::move(payload)] {
+  ShowChoices(l10n::authorize_original_folder,
+      StringVariant::Format(l10n::authorize_original_folder_hint, request->tab->Name()), {
+      {l10n::cancel, [self = *this, request] { self.FinishSave(request, false); }},
+      {l10n::save_as_menu, [self = *this, request] { self.OfferSaveAs(request, {}); }, ChoiceTone::Secondary},
+      {l10n::choose_folder, [self = *this, request, original, payload = std::move(payload)] {
         self.Launch(true, [self, request, original, payload]() mutable -> Task<void> {
           const auto folder = co_await self.picker->OpenDirectoryAsync(true);
           if (!folder) {
@@ -1255,7 +1263,7 @@ void WorkbenchActions::ChooseOriginalFolder(Save request, std::shared_ptr<const 
           }
           const auto identity = co_await LocalIdentity(*folder);
           if (!identity || !original->target->identity || original->target->identity->Parent() != identity) {
-            self.OfferSaveAs(request, "The chosen folder does not contain the original file.");
+            self.OfferSaveAs(request, self.resources->GetString(l10n::original_not_in_folder));
             co_return;
           }
           auto file = co_await FindChild(*folder, original->target->reference.Name(), FileType::File);
@@ -1327,7 +1335,7 @@ void WorkbenchActions::ContinueClose() const {
     FinishClose();
     return;
   }
-  const auto title = request->tab ? "Save changes before closing?" : "Save changes before closing the window?";
+  const auto title = request->tab ? l10n::save_before_close : l10n::save_before_close_window;
   std::string message;
   for (const auto& tab : *dirty) {
     if (!message.empty()) {
@@ -1336,9 +1344,9 @@ void WorkbenchActions::ContinueClose() const {
     message += tab->Name();
   }
   ShowChoices(title, std::move(message), {
-      {"Cancel", [self = *this] { self.CancelClose(); }},
-      {dirty->size() == 1 ? "Discard" : "Discard all", [self = *this] { self.FinishClose(); }, ChoiceTone::Destructive},
-      {dirty->size() == 1 ? "Save" : "Save all", [self = *this, dirty] { self.SaveBeforeClose(dirty, 0); },
+      {l10n::cancel, [self = *this] { self.CancelClose(); }},
+      {dirty->size() == 1 ? l10n::discard : l10n::discard_all, [self = *this] { self.FinishClose(); }, ChoiceTone::Destructive},
+      {dirty->size() == 1 ? l10n::save : l10n::save_all, [self = *this, dirty] { self.SaveBeforeClose(dirty, 0); },
        ChoiceTone::Primary},
   });
 }
@@ -1354,7 +1362,7 @@ void WorkbenchActions::SaveBeforeClose(std::shared_ptr<const std::vector<Tab>> d
     if (!saved || current->Dirty()) {
       self.CancelClose();
       if (saved) {
-        self.Status(current, "New changes still need to be saved");
+        self.Status(current, l10n::new_changes_need_saving);
       } else if (!current->status->empty()) {
         self.Status({}, current->Name() + ": " + current->status.Get());
       }
@@ -1409,8 +1417,8 @@ View DocumentPage(WorkbenchActions actions, Tab tab, bool active) {
   View notice;
   if (needs_attachments) {
     notice = Row {
-      Text("Local images need access to their folder.", TextRole::Label).With(Grow()),
-      Button("Locate attachments…").OnClick([actions, tab] { actions.LocateAttachments(tab); })
+      Text(l10n::local_images_need_folder, TextRole::Label).With(Grow()),
+      Button(l10n::locate_attachments).OnClick([actions, tab] { actions.LocateAttachments(tab); })
           .With(Enabled(actions.picker->CanOpenDirectories() && actions.Available() && !tab->Busy())),
     }.With(Padding(EdgeInsets::Symmetric(14.0F, 8.0F)), Spacing(8.0F),
            CrossAlign(CrossAxisAlignment::Center), Background(UseTheme().colors.surface_container));
@@ -1446,8 +1454,8 @@ View ClickableRow(View row, const ThemeSpec& theme, Semantics semantics, std::fu
 
 View OpenRow(const WorkbenchActions& actions, const ThemeSpec& theme, OpenKind kind) {
   const bool file = kind == OpenKind::File;
-  const char* label = file ? "Open file…" : "Open folder…";
-  const char* detail = file ? "Markdown or RichEditor JSON" : "Browse documents in a folder";
+  StringVariant label = file ? l10n::open_file_menu : l10n::open_folder_menu;
+  const auto detail = file ? l10n::supported_documents : l10n::browse_folder;
   const bool enabled = file ? actions.CanExecute(FolioCommand::OpenFile)
                             : actions.Available() && actions.picker->CanOpenDirectories();
   const auto& colors = theme.colors;
@@ -1479,10 +1487,10 @@ View EmptyWorkspace(const WorkbenchActions& actions, const ThemeSpec& theme) {
   const bool enabled = actions.CanExecute(FolioCommand::NewDocument);
   auto create = ClickableRow(Row {
     Glyph(app::images::plus, colors.on_primary),
-    Text("New document", TextRole::Label).With(Foreground(colors.on_primary)),
+    Text(l10n::new_document, TextRole::Label).With(Foreground(colors.on_primary)),
   }.With(Frame{.min_height = 40.0F}, Padding(EdgeInsets::Symmetric(12.0F, 5.0F)),
          Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center)),
-      theme, {.role = SemanticRole::Button, .label = "New document"},
+      theme, {.role = SemanticRole::Button, .label = l10n::new_document},
       [actions] { actions.Execute(FolioCommand::NewDocument); })
       .With(Enabled(enabled), Opacity(enabled ? 1.0F : 0.48F));
   const View welcome = Column {
@@ -1490,7 +1498,7 @@ View EmptyWorkspace(const WorkbenchActions& actions, const ThemeSpec& theme) {
         .With(Frame{.width = 42.0F, .height = 42.0F}, MainAlign(MainAxisAlignment::Center),
               CrossAlign(CrossAxisAlignment::Center), Background(colors.primary_container),
               CornerRadius(theme.shapes.medium)),
-    Text("Start writing", TextRole::Title).Style(TextStyle{
+    Text(l10n::start_writing, TextRole::Title).Style(TextStyle{
         Font::FromFamily(theme.typography.family, theme.typography.headline_small).WithWeight(FontWeight::SemiBold),
         colors.on_surface}),
     PrimaryAction(std::move(create), theme),
@@ -1531,11 +1539,11 @@ View DocumentArea(WorkbenchActions actions) {
   }
   auto status = actions.workspace->status.Get();
   if (actions.workspace->picking.Get()) {
-    status = "Working…";
+    status = UseString(l10n::working);
   } else if (active) {
     switch (active->operation.Get()) {
-    case Operation::Save: status = "Saving…"; break;
-    case Operation::Export: status = "Exporting…"; break;
+    case Operation::Save: status = UseString(l10n::saving); break;
+    case Operation::Export: status = UseString(l10n::exporting); break;
     default:
       if (status.empty()) {
         status = active->status.Get();
@@ -1559,24 +1567,24 @@ View SidebarLabel(const ImageResource& icon, std::string label, Color color) {
 enum class SidebarSection { Folders, Recent, NoFolders, NoRecent };
 using SidebarItem = std::variant<SidebarSection, Entry, Target>;
 
-const char* SidebarSectionLabel(SidebarSection section) {
+StringResource SidebarSectionLabel(SidebarSection section) {
   switch (section) {
-  case SidebarSection::Folders: return "Folders";
-  case SidebarSection::Recent: return "Recent edits";
-  case SidebarSection::NoFolders: return "No folders yet";
-  case SidebarSection::NoRecent: return "No recent documents";
+  case SidebarSection::Folders: return l10n::folders;
+  case SidebarSection::Recent: return l10n::recent_edits;
+  case SidebarSection::NoFolders: return l10n::no_folders;
+  case SidebarSection::NoRecent: return l10n::no_recent_documents;
   }
-  return "";
+  return l10n::files;
 }
 
 std::vector<MenuEntry> FolderMenu(WorkbenchActions actions, const Entry& folder) {
   const bool available = actions.Available();
   const bool can_create = available && (folder->directory->CanWrite() || actions.picker->CanOpenDirectories(true));
   return {
-      MenuItem("New file…", [actions, folder] { actions.RequestNewChild(folder, ChildKind::File); }).Enabled(can_create),
-      MenuItem("New folder…", [actions, folder] { actions.RequestNewChild(folder, ChildKind::Folder); })
+      MenuItem(l10n::new_file_menu, [actions, folder] { actions.RequestNewChild(folder, ChildKind::File); }).Enabled(can_create),
+      MenuItem(l10n::new_folder_menu, [actions, folder] { actions.RequestNewChild(folder, ChildKind::Folder); })
           .Enabled(can_create),
-      MenuItem("Refresh", [actions, folder] { actions.SetExpanded(folder, true); })
+      MenuItem(l10n::refresh, [actions, folder] { actions.SetExpanded(folder, true); })
           .Enabled(available && folder->load.Get() != FolderLoad::Loading),
   };
 }
@@ -1597,7 +1605,7 @@ View FolderTreeRow(WorkbenchActions actions, Entry entry, bool desktop, float ro
   auto row = Row {
     SidebarLabel(expanded ? app::images::folder_open : app::images::folder, std::move(label), colors.on_surface)
         .With(Grow(), Tooltip(tooltip)),
-    desktop ? View{} : IconButton(app::images::more, "Actions for " + entry->name)
+    desktop ? View{} : IconButton(app::images::more, StringVariant::Format(l10n::actions_for, entry->name))
         .OnClick([actions, entry, menu, anchor] { menu.Show(anchor, FolderMenu(actions, entry)); })
         .With(anchor, Frame{.width = row_height, .height = row_height}, Enabled(actions.Available())),
   }.With(Frame{.height = row_height}, CrossAlign(CrossAxisAlignment::Center));
@@ -1648,18 +1656,19 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
               .With(Tooltip(LocationLabel(*file))).Key(reinterpret_cast<std::uintptr_t>(file.get()));
         }
         const auto section = std::get<SidebarSection>(item);
-        const auto* label = SidebarSectionLabel(section);
+        const auto label = SidebarSectionLabel(section);
+        const auto key = "sidebar-section-" + std::to_string(static_cast<int>(section));
         if (section == SidebarSection::NoFolders || section == SidebarSection::NoRecent) {
-          return Text(label, TextRole::Label).With(FontSize(12.0F), Foreground(colors.on_surface_variant)).Key(label);
+          return Text(label, TextRole::Label).With(FontSize(12.0F), Foreground(colors.on_surface_variant)).Key(key);
         }
         const bool folders = section == SidebarSection::Folders;
         return Row {
-          Text(folders ? "FOLDERS" : "RECENT EDITS", TextRole::Label)
+          Text(folders ? l10n::folders_heading : l10n::recent_edits_heading, TextRole::Label)
               .With(Grow(), FontSize(11.0F), Foreground(colors.on_surface_variant)),
-          folders ? IconButton(app::images::plus, "Add folder").OnClick([actions] { actions.PickOpen(OpenKind::Folder); })
+          folders ? IconButton(app::images::plus, l10n::add_folder).OnClick([actions] { actions.PickOpen(OpenKind::Folder); })
               .With(Frame{.width = row_height, .height = row_height},
-                    Enabled(actions.picker->CanOpenDirectories() && actions.Available()), Tooltip("Open folder")) : View{},
-        }.With(CrossAlign(CrossAxisAlignment::Center)).Key(label);
+                    Enabled(actions.picker->CanOpenDirectories() && actions.Available()), Tooltip(l10n::open_folder)) : View{},
+        }.With(CrossAlign(CrossAxisAlignment::Center)).Key(key);
       }, [workspace, is_selected](const SidebarItem& item) {
         if (const auto* node = std::get_if<Entry>(&item)) {
           const auto& entry = *node;
@@ -1671,7 +1680,7 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
           return TreeItemInfo{.label = (*file)->reference.Name(), .selected = false};
         }
         const auto section = std::get<SidebarSection>(item);
-        const auto* label = SidebarSectionLabel(section);
+        const auto label = SidebarSectionLabel(section);
         switch (section) {
         case SidebarSection::Folders:
           return TreeItemInfo{.label = label, .expandable = true, .expanded = workspace->folders_open.Get()};
@@ -1710,21 +1719,21 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
           open(item);
         }
       }).OnActivated(open)
-      .DisclosureIcon(app::images::chevron_right).ItemExtent(row_height).Label("Files")
+      .DisclosureIcon(app::images::chevron_right).ItemExtent(row_height).Label(l10n::files)
       .With(Grow(), ScrollBar());
   auto settings = ClickableRow(Row {
-    Text("Settings", TextRole::Label).With(Grow()),
+    Text(l10n::settings, TextRole::Label).With(Grow()),
     Glyph(app::images::chevron_right, colors.on_surface_variant, 13.0F),
   }.With(Frame{.min_height = row_height}, Padding(EdgeInsets::Symmetric(9.0F, 3.0F)),
          CrossAlign(CrossAxisAlignment::Center)),
-      theme, {.role = SemanticRole::Button, .label = "Settings", .identifier = "open-settings"},
+      theme, {.role = SemanticRole::Button, .label = l10n::settings, .identifier = "open-settings"},
       [actions] { actions.Execute(FolioCommand::Settings); })
       .With(Enabled(actions.CanExecute(FolioCommand::Settings)));
   return Column {
     Row {
-      Text("Files", TextRole::Label).With(Grow()),
-      IconButton(app::images::panel_left, "Hide files").OnClick([actions] { actions.Execute(FolioCommand::ToggleSidebar); })
-          .With(Frame{.min_width = row_height, .min_height = row_height}, Tooltip("Hide files"),
+      Text(l10n::files, TextRole::Label).With(Grow()),
+      IconButton(app::images::panel_left, l10n::hide_files).OnClick([actions] { actions.Execute(FolioCommand::ToggleSidebar); })
+          .With(Frame{.min_width = row_height, .min_height = row_height}, Tooltip(l10n::hide_files),
                 Enabled(actions.CanExecute(FolioCommand::ToggleSidebar)),
                 Semantics{.identifier = "hide-files", .expanded = true}),
     }.With(Padding(EdgeInsets::Symmetric(8.0F, 2.0F)), CrossAlign(CrossAxisAlignment::Center)),
@@ -1747,7 +1756,7 @@ View TabHeader(WorkbenchActions actions, Tab tab, bool only_tab) {
   const auto name = tab->Name();
   const bool dirty = tab->Dirty();
   const bool active = actions.workspace->selected.Get() == tab->id;
-  const auto label = dirty ? name + ", unsaved changes" : name;
+  const auto label = dirty ? StringVariant::Format(l10n::unsaved_document, name) : StringVariant{name};
   const bool enabled = !actions.workspace->closing.Get();
   const auto foreground = active ? colors.on_primary_container : colors.on_surface_variant;
   View name_row = Row {
@@ -1767,8 +1776,8 @@ View TabHeader(WorkbenchActions actions, Tab tab, bool only_tab) {
     Row{}.With(Frame{.height = 2.0F}, Background(active ? colors.primary : Color::Transparent())),
     Row {
       std::move(name_row).With(Grow(), Tooltip(name)),
-      IconButton(app::images::close, "Close " + name).OnClick([actions, tab] { actions.RequestClose(tab); })
-          .With(Enabled(enabled), Tooltip("Close " + name)),
+      IconButton(app::images::close, StringVariant::Format(l10n::close_document, name)).OnClick([actions, tab] { actions.RequestClose(tab); })
+          .With(Enabled(enabled), Tooltip(StringVariant::Format(l10n::close_document, name))),
     }.With(Grow(), Padding(EdgeInsets::Symmetric(3.0F, 0.0F)), CrossAlign(CrossAxisAlignment::Center)),
   }.With(Frame{.height = 38.0F}, CrossAlign(CrossAxisAlignment::Stretch), ClipChildren(),
          CornerRadius(CornerRadii::Top(theme.shapes.small)),
@@ -1798,7 +1807,7 @@ View TabStrip(WorkbenchActions actions) {
   }
   return VirtualList(tabs, [actions](const Tab& tab) { return TabHeader(actions, tab, false).Key(tab->id); })
       .ScrollAxis(Axis::Horizontal).ItemExtent(tab_width).Controller(scroll)
-      .With(Grow(), Frame{.height = 38.0F}, Semantics{.role = SemanticRole::TabList, .label = "Open documents"});
+      .With(Grow(), Frame{.height = 38.0F}, Semantics{.role = SemanticRole::TabList, .label = l10n::open_documents});
 }
 
 [[huxerui::composable]]
@@ -1817,26 +1826,26 @@ View DocumentSwitcher(DialogContext context, WorkbenchActions actions) {
       DirtyDot(theme, dirty),
     }.With(Frame{.min_height = 44.0F}, Padding(EdgeInsets::Symmetric(9.0F, 4.0F)), Spacing(7.0F),
            CrossAlign(CrossAxisAlignment::Center)),
-        theme, {.role = SemanticRole::Button, .label = dirty ? name + ", unsaved changes" : name, .selected = selected},
+        theme, {.role = SemanticRole::Button, .label = dirty ? StringVariant::Format(l10n::unsaved_document, name) : StringVariant{name}, .selected = selected},
         [context, actions, tab] {
           context.Dismiss();
           actions.Select(tab);
         }).With(Grow(), Background(selected ? colors.primary_container : Color::Transparent()));
     rows.Add(Row {
       row,
-      IconButton(app::images::close, "Close " + name).OnClick([context, actions, tab] {
+      IconButton(app::images::close, StringVariant::Format(l10n::close_document, name)).OnClick([context, actions, tab] {
         context.Dismiss();
         actions.RequestClose(tab);
       }).With(Frame{.min_width = 44.0F, .min_height = 44.0F}),
     }.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center)).Key(tab->id));
   }
   return ScrollableDialogPanel(
-    Text("Open documents", TextRole::Title),
+    Text(l10n::open_documents, TextRole::Title),
     ScrollView(Column {std::move(rows)}.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)))
         .With(Frame{.max_height = 280.0F}, ScrollBar()),
     DialogActions(theme,
-      Button("Done").OnClick([context] { context.Dismiss(); }),
-      Button("New document").OnClick([context, actions] {
+      Button(l10n::done).OnClick([context] { context.Dismiss(); }),
+      Button(l10n::new_document).OnClick([context, actions] {
         context.Dismiss();
         actions.Execute(FolioCommand::NewDocument);
       }).With(Enabled(actions.CanExecute(FolioCommand::NewDocument)))),
@@ -1864,9 +1873,9 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
     const float tabs_width = count == 1 ? single_title_width : tab_width * static_cast<float>(count);
     const View strip = Row {
       TabStrip(actions).Key("tab-strip"),
-      show_new ? IconButton(app::images::plus, "New document").OnClick([actions] {
+      show_new ? IconButton(app::images::plus, l10n::new_document).OnClick([actions] {
         actions.Execute(FolioCommand::NewDocument);
-      }).With(icon_frame, Tooltip("New document"), Enabled(actions.CanExecute(FolioCommand::NewDocument))) : View{},
+      }).With(icon_frame, Tooltip(l10n::new_document), Enabled(actions.CanExecute(FolioCommand::NewDocument))) : View{},
     }.With(Frame{.max_width = tabs_width + (show_new ? control_size : 0.0F)},
            CrossAlign(CrossAxisAlignment::Center), ClipChildren());
     title = Column {strip}.With(Grow(), CrossAlign(CrossAxisAlignment::Start));
@@ -1889,7 +1898,7 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
     }.With(Frame{.min_width = control_size, .max_width = switcher_width, .min_height = control_size},
            Padding(EdgeInsets::Symmetric(padding, 0.0F)), Spacing(spacing), CrossAlign(CrossAxisAlignment::Center)),
         theme, {.role = SemanticRole::Button,
-                .label = dirty ? name + ", unsaved changes, switch document" : name + ", switch document",
+                .label = StringVariant::Format(dirty ? l10n::switch_unsaved_document : l10n::switch_document, name),
                 .identifier = "document-switcher"},
         [actions] { actions.dialog.Show(DocumentSwitcher, actions); })
         .With(CornerRadius(control_size / 2.0F), Enabled(!workspace->closing.Get()), Tooltip(name));
@@ -1898,41 +1907,41 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
     title = Spacer().With(Grow());
   }
   const auto menu = [actions, file_menu, active, available, document_actions, desktop, narrow_desktop] {
-    const auto item = [&actions](const char* label, FolioCommand command) {
+    const auto item = [&actions](StringVariant label, FolioCommand command) {
       return MenuItem(label, [actions, command] { actions.Execute(command); }).Enabled(actions.CanExecute(command));
     };
     std::vector<MenuEntry> entries{
-        item("New document", FolioCommand::NewDocument),
-        item("Open file…", FolioCommand::OpenFile),
-        MenuItem("Open folder…", [actions] { actions.PickOpen(OpenKind::Folder); })
+        item(l10n::new_document, FolioCommand::NewDocument),
+        item(l10n::open_file_menu, FolioCommand::OpenFile),
+        MenuItem(l10n::open_folder_menu, [actions] { actions.PickOpen(OpenKind::Folder); })
             .Enabled(available && actions.picker->CanOpenDirectories()),
-        MenuItem("Open Folio document package…", [actions] { actions.PickOpen(OpenKind::Package); })
+        MenuItem(l10n::open_package, [actions] { actions.PickOpen(OpenKind::Package); })
             .Enabled(available && actions.picker->CanOpenDirectories()),
         MenuSection{},
-        item("Save", FolioCommand::Save),
-        item("Save as…", FolioCommand::SaveAs),
-        MenuItem("Export copy…", [actions, active] { actions.RequestSave(active, WriteKind::Export); })
+        item(l10n::save, FolioCommand::Save),
+        item(l10n::save_as_menu, FolioCommand::SaveAs),
+        MenuItem(l10n::export_copy_menu, [actions, active] { actions.RequestSave(active, WriteKind::Export); })
             .Enabled(document_actions && (actions.picker->CanSaveFiles() || actions.picker->CanOpenDirectories(true))),
-        MenuItem("Locate attachment folder…", [actions, active] { actions.LocateAttachments(active); })
+        MenuItem(l10n::locate_attachment_folder, [actions, active] { actions.LocateAttachments(active); })
             .Enabled(document_actions && actions.picker->CanOpenDirectories()),
         MenuSection{},
-        MenuItem("Load sample", [actions] { actions.NewDocument(true); }).Enabled(available),
+        MenuItem(l10n::load_sample, [actions] { actions.NewDocument(true); }).Enabled(available),
     };
     if (!IsMobilePlatform()) {
-      entries.insert(entries.begin(), {item("Command palette…", FolioCommand::OpenCommandPalette), MenuSection{}});
+      entries.insert(entries.begin(), {item(l10n::command_palette_menu, FolioCommand::OpenCommandPalette), MenuSection{}});
     }
     if (narrow_desktop && active) {
-      entries.emplace_back(item("Find in document", FolioCommand::Find));
+      entries.emplace_back(item(l10n::find_in_document, FolioCommand::Find));
     }
     if (desktop) {
-      entries.emplace_back(MenuItem("New window", [actions] { actions.NewWindow(); }).Enabled(available));
+      entries.emplace_back(MenuItem(l10n::new_window, [actions] { actions.NewWindow(); }).Enabled(available));
     }
     entries.emplace_back(MenuSection{});
-    entries.emplace_back(item("Settings…", FolioCommand::Settings));
+    entries.emplace_back(item(l10n::settings_menu, FolioCommand::Settings));
     file_menu.Show(actions.file_menu_focus, std::move(entries));
   };
   const bool files_visible = actions.sidebar_open.Get();
-  const char* files_label = files_visible ? "Hide files" : "Show files";
+  const auto files_label = files_visible ? l10n::hide_files : l10n::show_files;
   std::vector<View> controls{
     actions.modal_sidebar || !files_visible ? IconButton(app::images::panel_left, files_label)
         .OnClick([actions] { actions.Execute(FolioCommand::ToggleSidebar); })
@@ -1940,15 +1949,15 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
               Semantics{.identifier = "show-files", .expanded = files_visible})
         : View{},
     std::move(title).Key("title"),
-    active && !narrow_desktop ? IconButton(app::images::search, "Find in document")
+    active && !narrow_desktop ? IconButton(app::images::search, l10n::find_in_document)
         .OnClick([actions] { actions.Execute(FolioCommand::Find); })
-        .With(icon_frame, Tooltip("Find in document"), Enabled(actions.CanExecute(FolioCommand::Find)))
+        .With(icon_frame, Tooltip(l10n::find_in_document), Enabled(actions.CanExecute(FolioCommand::Find)))
         .Key("find") : View{},
-    active && !narrow_desktop && !compact_mobile ? IconButton(app::images::save, "Save")
+    active && !narrow_desktop && !compact_mobile ? IconButton(app::images::save, l10n::save)
         .OnClick([actions] { actions.Execute(FolioCommand::Save); })
-        .With(icon_frame, Tooltip("Save"), Enabled(actions.CanExecute(FolioCommand::Save))).Key("save") : View{},
-    IconButton(app::images::more, "File actions").OnClick(menu)
-        .With(actions.file_menu_focus, icon_frame, Tooltip("File actions"), Enabled(!workspace->closing.Get()))
+        .With(icon_frame, Tooltip(l10n::save), Enabled(actions.CanExecute(FolioCommand::Save))).Key("save") : View{},
+    IconButton(app::images::more, l10n::file_actions).OnClick(menu)
+        .With(actions.file_menu_focus, icon_frame, Tooltip(l10n::file_actions), Enabled(!workspace->closing.Get()))
         .Key("file-menu"),
   };
   auto bar = desktop ? View(WindowTitleBar(std::move(controls))) : View(Row(std::move(controls)));
@@ -2005,7 +2014,8 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
   const bool modal_sidebar = !desktop && UseViewportClass() == ViewportClass::Compact;
   const auto sidebar_open = modal_sidebar ? workspace->drawer_open : workspace->sidebar_visible;
   const WorkbenchActions actions{
-      folio, workspace, application, window, UseService<FilePicker>(), UseTaskScope(), UseDialog(), UseViewHandle(),
+      folio, workspace, application, window, UseService<FilePicker>(), UseService<Resources>(),
+      UseTaskScope(), UseDialog(), UseViewHandle(),
       UseViewHandle(), sidebar_open, modal_sidebar,
   };
   Lifecycle([folio, workspace, window, application_tasks] {

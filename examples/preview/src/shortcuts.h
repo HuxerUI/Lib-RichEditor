@@ -47,7 +47,8 @@ struct ResolvedShortcuts {
 };
 
 std::span<const ShortcutCommand> ShortcutCommands();
-std::string_view CommandGroup(const ShortcutCommand& command);
+huxerui::StringVariant CommandLabel(const ShortcutCommand& command);
+huxerui::StringResource CommandGroup(const ShortcutCommand& command);
 std::span<const huxerui::richeditor::KeyCombination> EffectiveShortcuts(
     const ShortcutOverrides& overrides, const ShortcutCommand& command);
 

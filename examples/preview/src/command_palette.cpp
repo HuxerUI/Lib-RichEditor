@@ -7,9 +7,12 @@
 
 #include "appearance.h"
 #include "settings.h"
+#include "app_resources.h"
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
+
+namespace l10n = app::strings;
 
 namespace folio {
 namespace {
@@ -75,8 +78,12 @@ std::optional<MatchRank> RankMatch(std::string_view query, std::string_view text
   return MatchRank{3, end - start - matched};
 }
 
-std::optional<MatchRank> RankCommand(std::string_view query, const ShortcutCommand& command) {
-  auto rank = RankMatch(query, command.label);
+std::optional<MatchRank> RankCommand(std::string_view query, const ShortcutCommand& command,
+                                     std::string_view label, std::string_view group_label) {
+  auto rank = RankMatch(query, label);
+  if (const auto original = RankMatch(query, command.label); original && (!rank || *original < *rank)) {
+    rank = original;
+  }
   auto aliases = command.search_aliases;
   while (!aliases.empty()) {
     const auto separator = aliases.find('|');
@@ -88,7 +95,7 @@ std::optional<MatchRank> RankCommand(std::string_view query, const ShortcutComma
     }
     aliases.remove_prefix(separator + 1);
   }
-  const auto group = RankMatch(query, CommandGroup(command));
+  const auto group = RankMatch(query, group_label);
   if (group && !rank) {
     return MatchRank{4, group->second};
   }
@@ -97,11 +104,13 @@ std::optional<MatchRank> RankCommand(std::string_view query, const ShortcutComma
 
 struct CommandResult {
   const ShortcutCommand* command;
+  std::string label;
   CommandState state;
   MatchRank rank;
 };
 
-std::vector<CommandResult> FindCommands(std::string_view query, const CommandPaletteOptions& options) {
+std::vector<CommandResult> FindCommands(std::string_view query, const CommandPaletteOptions& options,
+                                        const Resources& resources, const ResourceConfiguration& configuration) {
   const auto normalized = NormalizeSearch(query);
   std::vector<CommandResult> results;
   for (const auto& command : ShortcutCommands()) {
@@ -109,11 +118,13 @@ std::vector<CommandResult> FindCommands(std::string_view query, const CommandPal
         action && *action == FolioCommand::OpenCommandPalette) {
       continue;
     }
-    const auto rank = normalized.empty() ? std::optional{MatchRank{}} : RankCommand(normalized, command);
+    auto label = resources.GetString(CommandLabel(command), configuration);
+    const auto rank = normalized.empty() ? std::optional{MatchRank{}} : RankCommand(
+        normalized, command, label, resources.GetString(CommandGroup(command), configuration));
     if (rank) {
       const auto state = options.state(command);
       if (state.enabled || !normalized.empty()) {
-        results.push_back({&command, state, *rank});
+        results.push_back({&command, std::move(label), state, *rank});
       }
     }
   }
@@ -137,7 +148,7 @@ void RevealResult(const ScrollController& scroll, std::size_t index, float row_h
 View CommandRow(const CommandResult& result, std::span<const KeyCombination> keys, bool selected,
                 float height, const ThemeSpec& theme, std::function<void()> run) {
   const auto& colors = theme.colors;
-  const auto name = std::string(result.command->label);
+  const auto& name = result.label;
   const auto shortcut = keys.empty() ? std::string{} : PreferredShortcutLabel(keys);
   const auto id = "palette-" + std::string(result.command->id);
   std::optional<SemanticCheckedState> checked;
@@ -150,7 +161,7 @@ View CommandRow(const CommandResult& result, std::span<const KeyCombination> key
   }
   View status;
   if (!result.state.enabled) {
-    status = Text("Unavailable here", TextRole::Label)
+    status = Text(l10n::unavailable_here, TextRole::Label)
         .With(FontSize(11.0F), Foreground(colors.on_surface_variant));
   } else if (result.state.checked && *result.state.checked != CheckState::Off) {
     status = Text(*result.state.checked == CheckState::On ? "✓" : "–", TextRole::Label)
@@ -175,7 +186,7 @@ View CommandRow(const CommandResult& result, std::span<const KeyCombination> key
       Semantics{.role = SemanticRole::Button, .label = name,
                 .value = shortcut.empty() ? std::nullopt : std::optional<StringVariant>{shortcut},
                 .state_description = result.state.enabled ? std::nullopt
-                    : std::optional<StringVariant>{"Unavailable in the current context"},
+                    : std::optional<StringVariant>{l10n::unavailable_in_context},
                 .identifier = id, .checked = checked, .selected = selected,
                 .descendants = SemanticDescendantPolicy::Exclude}
   ).Key(id);
@@ -204,7 +215,10 @@ View CommandPalette(DialogContext context, CommandPaletteOptions options) {
     };
   }, completion);
   const auto query = search->text;
-  const auto results = FindCommands(query, options);
+  const auto resources = UseService<Resources>();
+  auto configuration = resources->Configuration();
+  configuration.locale = UseEnvironment<Locale>();
+  const auto results = FindCommands(query, options, *resources, configuration);
   const auto current = std::ranges::find_if(results, [id = selected.Get()](const auto& result) {
     return result.command->id == id;
   });
@@ -252,7 +266,7 @@ View CommandPalette(DialogContext context, CommandPaletteOptions options) {
       .background = colors.surface_container_low, .border = colors.outline, .hovered_border = colors.outline,
       .focused_border = colors.primary, .corner_radii = CornerRadii{theme.shapes.medium}, .minimum_height = 44.0F,
   };
-  View field = TextField(search).Label("Search commands").Placeholder("Search commands")
+  View field = TextField(search).Label(l10n::search_commands).Placeholder(l10n::search_commands)
       .Variant(TextFieldVariant::Outlined)
       .InputConfiguration({.action = TextInputAction::Search, .autocorrect = false})
       .OnChanged([search, selected, scroll](const TextEditingValue& value) {
@@ -265,9 +279,9 @@ View CommandPalette(DialogContext context, CommandPaletteOptions options) {
       .On<ViewEvents::KeyIntercept>(on_key)
       .With(options.initial_focus, Grow(), Semantics{.role = SemanticRole::SearchField, .identifier = "palette-query"})
       .Key("palette-query");
-  View close = Button("Close").OnClick([context] { context.Dismiss(); })
+  View close = Button(l10n::close).OnClick([context] { context.Dismiss(); })
       .With(Frame{.min_height = 44.0F}, Background(Color::Transparent()),
-            Semantics{.label = "Close command palette", .identifier = "palette-close"});
+            Semantics{.label = l10n::close_palette, .identifier = "palette-close"});
   const auto header = Row {
     ProvideEnvironment(field_style, field),
     close,
@@ -280,14 +294,14 @@ View CommandPalette(DialogContext context, CommandPaletteOptions options) {
                         [invoke, command = result.command] { invoke(*command); }));
   }
   if (results.empty()) {
-    rows.Add(Text("No matching commands", TextRole::Label)
+    rows.Add(Text(l10n::no_matching_commands, TextRole::Label)
         .With(Padding(EdgeInsets::Symmetric(9.0F, 14.0F)), Foreground(colors.on_surface_variant),
               Semantics{.live_region = SemanticLiveRegion::Polite}));
   }
   const auto list = ScrollView(Column {rows}.With(CrossAlign(CrossAxisAlignment::Stretch)))
       .Controller(scroll).With(Frame{.max_height = compact ? 460.0F : 380.0F}, ScrollBar());
   return ScrollableDialogPanel(header, list, {}, theme, compact ? 420.0F : 570.0F)
-      .With(Semantics{.label = "Command palette", .identifier = "command-palette"}).Key("command-palette");
+      .With(Semantics{.label = l10n::command_palette, .identifier = "command-palette"}).Key("command-palette");
 }
 
 } // namespace folio

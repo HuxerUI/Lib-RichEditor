@@ -28,6 +28,8 @@ using folio::LatexBlock;
 using folio::LatexInline;
 using folio::latex_type;
 
+namespace l10n = app::strings;
+
 namespace {
 
 constexpr std::string_view sample_markdown = R"markdown(# Field notes
@@ -159,7 +161,7 @@ View ImageSizeDialog(DialogContext context, RichEditorController editor, Size in
       context.Dismiss();
     }
   };
-  const auto field = [&](bool width, const char* label) {
+  const auto field = [&](bool width, StringVariant label) {
     return TextField(width ? draft->width : draft->height)
         .Label(label)
         .Variant(TextFieldVariant::Outlined)
@@ -171,19 +173,19 @@ View ImageSizeDialog(DialogContext context, RichEditorController editor, Size in
   };
   return DialogPanel(Column {
     Column {
-      Text("Image size", TextRole::Title),
-      Text("Original proportions are locked.", TextRole::Label).With(Foreground(colors.on_surface_variant)),
+      Text(l10n::image_size, TextRole::Title),
+      Text(l10n::image_proportions, TextRole::Label).With(Foreground(colors.on_surface_variant)),
     }.With(Spacing(4.0F)),
     Row {
-      field(true, "Width (px)"),
-      field(false, "Height (px)"),
+      field(true, l10n::width_pixels),
+      field(false, l10n::height_pixels),
     }.With(Spacing(10.0F)),
-    Text("Adjacent images share a line when they fit.", TextRole::Label)
+    Text(l10n::images_share_line, TextRole::Label)
         .With(Foreground(colors.on_surface_variant)),
     DialogActions(theme,
-      Button("Cancel").OnClick([context] { context.Dismiss(); }),
-      Button("Apply").OnClick(apply).With(Enabled(draft->preferred_width.has_value())),
-      Button("Auto size").OnClick([context, editor] {
+      Button(l10n::cancel).OnClick([context] { context.Dismiss(); }),
+      Button(l10n::apply).OnClick(apply).With(Enabled(draft->preferred_width.has_value())),
+      Button(l10n::auto_size).OnClick([context, editor] {
         editor.Execute(ResizeImage{});
         context.Dismiss();
       })),
@@ -215,49 +217,48 @@ View ListStartDialog(DialogContext context, RichEditorController editor, ViewHan
   };
   return DialogPanel(Column {
     Column {
-      Text("List numbering", TextRole::Title),
-      Text("Items count up from the number you enter.", TextRole::Label)
+      Text(l10n::list_numbering, TextRole::Title),
+      Text(l10n::numbering_hint, TextRole::Label)
           .With(Foreground(theme.colors.on_surface_variant)),
     }.With(Spacing(4.0F)),
     TextField(value)
-        .Label("Start at")
+        .Label(l10n::start_at)
         .Variant(TextFieldVariant::Outlined)
         .MaxLength(std::numeric_limits<unsigned>::digits10 + 1)
         .InputConfiguration({.type = TextInputType::Number, .autocorrect = false})
         .Validation(!proposed && !current.text.empty() && !current.composition
-            ? ValidationResult::Invalid("Enter a whole number from 0 to " +
-                                        std::to_string(std::numeric_limits<unsigned>::max()))
+            ? ValidationResult::Invalid(StringVariant::Format(l10n::numbering_range, std::numeric_limits<unsigned>::max()))
             : ValidationResult::None())
         .OnChanged([value](const TextEditingValue& next) { value = next; })
         .OnSubmitted(apply),
     DialogActions(theme,
-      Button("Cancel").OnClick([context] { context.Dismiss(); }),
-      Button("Apply").OnClick(apply).With(Enabled(proposed && *proposed != initial))),
+      Button(l10n::cancel).OnClick([context] { context.Dismiss(); }),
+      Button(l10n::apply).OnClick(apply).With(Enabled(proposed && *proposed != initial))),
   }, theme, 340.0F);
 }
 
 [[huxerui::composable]]
 View TextStylePicker(RichEditorController editor, ViewHandle focus, bool available, bool compact) {
   struct Choice {
-    const char* label;
-    const char* short_label;
+    StringVariant label;
+    StringVariant short_label;
     SetBlockKind command;
   };
   static const std::array choices{
-      Choice{"Paragraph", "Body", {BlockKind::Paragraph}},
-      Choice{"Heading 1", "H1", {BlockKind::Heading, 1}},
-      Choice{"Heading 2", "H2", {BlockKind::Heading, 2}},
-      Choice{"Heading 3", "H3", {BlockKind::Heading, 3}},
-      Choice{"Heading 4", "H4", {BlockKind::Heading, 4}},
-      Choice{"Heading 5", "H5", {BlockKind::Heading, 5}},
-      Choice{"Heading 6", "H6", {BlockKind::Heading, 6}},
-      Choice{"Code block", "Code", {BlockKind::CodeBlock}},
+      Choice{l10n::paragraph, l10n::body, {BlockKind::Paragraph}},
+      Choice{l10n::heading_1, "H1", {BlockKind::Heading, 1}},
+      Choice{l10n::heading_2, "H2", {BlockKind::Heading, 2}},
+      Choice{l10n::heading_3, "H3", {BlockKind::Heading, 3}},
+      Choice{l10n::heading_4, "H4", {BlockKind::Heading, 4}},
+      Choice{l10n::heading_5, "H5", {BlockKind::Heading, 5}},
+      Choice{l10n::heading_6, "H6", {BlockKind::Heading, 6}},
+      Choice{l10n::code_block, l10n::code, {BlockKind::CodeBlock}},
   };
   const auto& theme = UseTheme();
   const auto menu = UseMenu();
   const auto anchor = UseViewHandle();
-  const char* label = "Style";
-  const char* description = "Text style";
+  StringVariant label = l10n::style;
+  StringVariant description = l10n::text_style;
   for (const auto& choice : choices) {
     const auto state = editor.GetCommandState(choice.command);
     if (state.checked == CheckState::On) {
@@ -266,12 +267,12 @@ View TextStylePicker(RichEditorController editor, ViewHandle focus, bool availab
       break;
     }
     if (state.checked == CheckState::Mixed) {
-      label = "Mixed";
-      description = "Mixed text styles";
+      label = l10n::mixed;
+      description = l10n::mixed_text_styles;
     }
   }
 
-  return Button(std::string(label) + " ▾")
+  return Button(UseString(label) + " ▾")
       .OnClick([editor, focus, menu, anchor] {
         std::vector<MenuEntry> items;
         items.reserve(choices.size());
@@ -288,13 +289,13 @@ View TextStylePicker(RichEditorController editor, ViewHandle focus, bool availab
       })
       .With(
           anchor,
-          Frame{.width = compact ? 76.0F : 98.0F, .min_height = compact ? 44.0F : 30.0F},
+          Frame{.min_width = compact ? 76.0F : 98.0F, .min_height = compact ? 44.0F : 30.0F},
           Padding(EdgeInsets::Symmetric(6.0F, 4.0F)),
-          Tooltip("Text style"),
+          Tooltip(l10n::text_style),
           Enabled(available && editor.GetCommandState(choices.front().command).enabled),
           Background(Color::Transparent()),
           Foreground(theme.colors.on_surface),
-          Semantics{.label = std::string("Text style, ") + description}
+          Semantics{.label = StringVariant::Format(l10n::text_style_description, UseString(description))}
       );
 }
 
@@ -333,17 +334,17 @@ View LinkDialog(DialogContext context, RichEditorController editor, ViewHandle f
     }
   };
   return DialogPanel(Column {
-    Text(original ? "Edit link" : "Insert link", TextRole::Title),
+    Text(original ? l10n::edit_link : l10n::insert_link, TextRole::Title),
     TextField(address)
-        .Label("Link address")
+        .Label(l10n::link_address)
         .Placeholder("https://example.com")
         .Variant(TextFieldVariant::Outlined)
         .InputConfiguration({.type = TextInputType::Url, .autocorrect = false})
         .OnChanged([address](const TextEditingValue& next) { address = next; })
         .OnSubmitted(apply),
     DialogActions(theme,
-      Button("Cancel").OnClick([context] { context.Dismiss(); }),
-      Button(original ? "Apply" : "Insert").OnClick(apply)
+      Button(l10n::cancel).OnClick([context] { context.Dismiss(); }),
+      Button(original ? l10n::apply : l10n::insert).OnClick(apply)
           .With(Enabled(!current.empty() && (!original || current != original->target)))),
   }, theme, 360.0F);
 }
@@ -358,7 +359,7 @@ View LinkTool(RichEditorController editor, ViewHandle focus, bool available, boo
   const auto clipboard = UseApplication().Clipboard();
   const float size = compact ? 44.0F : 30.0F;
   const bool linked = editor.CurrentLink().has_value();
-  const char* label = linked ? "Link actions" : "Insert link";
+  StringVariant label = linked ? l10n::link_actions : l10n::insert_link;
 
   return IconButton(app::images::link, label)
       .OnClick([=] {
@@ -369,19 +370,19 @@ View LinkTool(RichEditorController editor, ViewHandle focus, bool available, boo
         }
         const auto url = folio::ParseWebUrl(current->target);
         std::vector<MenuEntry> items{
-            MenuItem("Edit link…", [=] { dialog.Show(LinkDialog, editor, focus, current); }),
-            MenuItem("Copy link address", [clipboard, toast, target = current->target] {
+            MenuItem(l10n::edit_link_menu, [=] { dialog.Show(LinkDialog, editor, focus, current); }),
+            MenuItem(l10n::copy_link, [clipboard, toast, target = current->target] {
               const bool copied = clipboard->WriteText(target);
-              toast.Show(copied ? "Link address copied" : "Could not copy the link address");
+              toast.Show(copied ? l10n::link_copied : l10n::link_copy_failed);
             }).Enabled(clipboard && clipboard->IsAvailable() && !current->target.empty()),
-            MenuItem("Remove link", [editor, focus] {
+            MenuItem(l10n::remove_link, [editor, focus] {
               if (editor.Execute(SetLink{})) {
                 focus.RequestFocus();
               }
             }),
         };
         if (url) {
-          items.insert(items.begin(), MenuItem("Open link", [toast, url = *url] { folio::OpenBrowser(url, toast); }));
+          items.insert(items.begin(), MenuItem(l10n::open_link, [toast, url = *url] { folio::OpenBrowser(url, toast); }));
         }
         menu.Show(anchor, std::move(items));
       })
@@ -419,16 +420,16 @@ View FormulaDialog(DialogContext context, RichEditorController editor, FormulaRe
   const bool enabled = draft->text.find_first_not_of(" \t\r\n") != std::string::npos &&
       !draft->composition && editor.GetCommandState(command).enabled;
   return DialogPanel(Column {
-    Text(editing ? "Edit formula" : request.inline_math ? "Insert inline formula" : "Insert display formula", TextRole::Title),
+    Text(editing ? l10n::edit_formula : request.inline_math ? l10n::insert_inline_formula : l10n::insert_display_formula, TextRole::Title),
     TextField(draft)
-        .Label("LaTeX source")
+        .Label(l10n::latex_source)
         .Variant(TextFieldVariant::Outlined)
         .LineLimits(request.inline_math ? TextFieldLineLimits::SingleLine() : TextFieldLineLimits::MultiLine(2, 5))
         .InputConfiguration({.autocorrect = false})
         .OnChanged([draft](const TextEditingValue& value) { draft = value; }),
     DialogActions(theme,
-      Button("Cancel").OnClick([context] { context.Dismiss(); }),
-      Button(editing ? "Apply" : "Insert").OnClick([=] {
+      Button(l10n::cancel).OnClick([context] { context.Dismiss(); }),
+      Button(editing ? l10n::apply : l10n::insert).OnClick([=] {
         if (editor.Execute(command)) {
           context.Dismiss();
         }
@@ -490,8 +491,8 @@ View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelSta
   style.icon_spacing = 7.0F;
 
   const auto field = TextField(query)
-      .Label("Find in document")
-      .Placeholder(compact ? "Find text" : "Find in document")
+      .Label(l10n::find_in_document)
+      .Placeholder(compact ? l10n::find_text : l10n::find_in_document)
       .LeadingIcon(app::images::search)
       .Variant(TextFieldVariant::Standard)
       .InputConfiguration({.action = TextInputAction::Search, .autocorrect = false})
@@ -509,40 +510,41 @@ View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelSta
         return true;
       })
       .With(focus, Grow(), Semantics{.role = SemanticRole::SearchField, .identifier = "find-query"});
-  std::string count;
-  std::string announcement;
+  StringVariant count;
+  StringVariant announcement;
   if (!query->text.empty()) {
     if (!navigation.ready) {
       count = "…";
-      announcement = "Searching";
+      announcement = l10n::searching;
     } else if (navigation.selected && *navigation.selected < navigation.count) {
       count = std::to_string(*navigation.selected + 1) + " / " + std::to_string(navigation.count);
-      announcement = "Match " + std::to_string(*navigation.selected + 1) + " of " + std::to_string(navigation.count);
+      announcement = StringVariant::Format(l10n::match_position, *navigation.selected + 1, navigation.count);
     } else {
-      count = navigation.count == 0 ? "No matches" : std::to_string(navigation.count);
-      announcement = std::to_string(navigation.count) + (navigation.count == 1 ? " match" : " matches");
+      count = navigation.count == 0 ? StringVariant{l10n::no_matches} : StringVariant{std::to_string(navigation.count)};
+      announcement = StringVariant::Format(navigation.count == 1 ? l10n::match_count_one : l10n::match_count_many,
+                                           navigation.count);
     }
   }
   const bool can_navigate = navigation.count != 0 && !query->composition;
-  const auto arrow = [&](const ImageResource& icon, const char* label, bool forward) {
+  const auto arrow = [&](const ImageResource& icon, StringVariant label, bool forward) {
     return IconButton(icon, label).OnClick([move = navigation.move, forward] { move(forward); })
         .With(button_size, Focusable(!touch), Enabled(can_navigate), Tooltip(label));
   };
   const auto group = Row {
     ProvideEnvironment(std::move(style), field),
     Text(count, TextRole::Label).Align(TextAlign::Center).VerticalAlign(TextVerticalAlign::Center).With(
-        Frame{.width = compact ? 57.0F : 72.0F, .height = 18.0F}, FontSize(11.0F), ClipChildren(),
+        Frame{.height = 18.0F, .min_width = compact ? 57.0F : 72.0F}, FontSize(11.0F), ClipChildren(),
         Foreground(colors.on_surface_variant),
         Semantics{.label = announcement, .identifier = "find-count", .live_region = SemanticLiveRegion::Polite,
-                  .hidden = announcement.empty()}),
-    arrow(app::images::chevron_up, "Previous match", false),
-    arrow(app::images::chevron_down, "Next match", true),
+                  .hidden = query->text.empty()}),
+    arrow(app::images::chevron_up, l10n::previous_match, false),
+    arrow(app::images::chevron_down, l10n::next_match, true),
   }.With(Grow(), CrossAlign(CrossAxisAlignment::Center), Background(colors.surface),
          Border{find->field_focused ? colors.primary : colors.outline, 1.0F}, CornerRadius(theme.shapes.medium));
   return Column {
     Row {
       group,
-      IconButton(app::images::close, "Close find").OnClick(close).With(button_size, Tooltip("Close find")),
+      IconButton(app::images::close, l10n::close_find).OnClick(close).With(button_size, Tooltip(l10n::close_find)),
     }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center)),
   }.On<ViewEvents::KeyIntercept>([close, query](const KeyEvent& event) {
     if (event.type == KeyEventType::Down && event.key == Key::Escape && !query->composition) {
@@ -575,7 +577,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const auto tool_frame = Frame{.min_width = tool_size, .min_height = tool_size};
   const auto selected_link = folio::IsMobilePlatform() ? editor.CurrentLink() : std::nullopt;
   const auto selected_url = selected_link ? folio::ParseWebUrl(selected_link->target) : std::nullopt;
-  const View open_link = selected_url ? View(Button("Open link")
+  const View open_link = selected_url ? View(Button(l10n::open_link)
       .OnClick([toast, url = *selected_url] { folio::OpenBrowser(url, toast); })
       .With(tool_frame, Enabled(available), Background(theme.colors.primary_container),
             Foreground(theme.colors.on_primary_container))) : View{};
@@ -589,12 +591,12 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       focus.RequestFocus();
     }
   };
-  const auto command_item = [editor, run](const char* label, EditorCommand command) {
+  const auto command_item = [editor, run](StringVariant label, EditorCommand command) {
     const auto state = editor.GetCommandState(command);
     auto item = MenuItem(label, [run, command = std::move(command)] { run(command); }).Enabled(state.enabled);
     return state.checked ? std::move(item).Checked(state.checked == CheckState::On) : std::move(item);
   };
-  const auto format_tool = [&](const ImageResource& icon, const char* label, CommandState state, auto on_click) {
+  const auto format_tool = [&](const ImageResource& icon, StringVariant label, CommandState state, auto on_click) {
     Color foreground = theme.colors.on_surface_variant;
     Color background = Color::Transparent();
     std::optional<SemanticCheckedState> checked;
@@ -620,11 +622,11 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
             Semantics{.checked = checked}
         );
   };
-  const auto tool = [&](const ImageResource& icon, const char* label, EditorCommand command) {
+  const auto tool = [&](const ImageResource& icon, StringVariant label, EditorCommand command) {
     const auto state = editor.GetCommandState(command);
     return format_tool(icon, label, state, [run, command = std::move(command)] { run(command); });
   };
-  const auto menu_tool = [&](const ImageResource& icon, const char* label, ViewHandle anchor,
+  const auto menu_tool = [&](const ImageResource& icon, StringVariant label, ViewHandle anchor,
                              bool enabled, bool active, auto on_click) {
     return IconButton(icon, label)
         .OnClick(std::move(on_click))
@@ -637,7 +639,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
             Background(active ? theme.colors.primary_container : Color::Transparent())
         );
   };
-  const char* table_label = in_table ? "Table actions" : "Insert table";
+  const auto table_label = in_table ? l10n::table_actions : l10n::insert_table;
   const bool image_selected = editor.GetCommandState(DeleteImage{}).enabled;
   const bool can_insert_table = editor.GetCommandState(insert_table).enabled;
   const bool can_insert_image = can_pick_images &&
@@ -662,34 +664,34 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const auto ordered_state = editor.GetCommandState(ordered_list);
   const bool in_numbered_list = ordered_state.checked == CheckState::On;
   const auto list_start = editor.OrderedListStart();
-  const char* list_label = in_numbered_list ? "List numbering" : "Numbered list";
+  const auto list_label = in_numbered_list ? l10n::list_numbering : l10n::numbered_list;
   const auto table_entries = [command_item, continue_in_paragraph] {
     return std::vector<MenuEntry>{
-        command_item("Insert row above", InsertTableRow{TableInsertSide::Before}),
-        command_item("Insert row below", InsertTableRow{}),
-        command_item("Delete row", DeleteTableRow{}),
+        command_item(l10n::insert_row_above, InsertTableRow{TableInsertSide::Before}),
+        command_item(l10n::insert_row_below, InsertTableRow{}),
+        command_item(l10n::delete_row, DeleteTableRow{}),
         MenuSection{},
-        command_item("Insert column before", InsertTableColumn{TableInsertSide::Before}),
-        command_item("Insert column after", InsertTableColumn{}),
-        command_item("Delete column", DeleteTableColumn{}),
+        command_item(l10n::insert_column_before, InsertTableColumn{TableInsertSide::Before}),
+        command_item(l10n::insert_column_after, InsertTableColumn{}),
+        command_item(l10n::delete_column, DeleteTableColumn{}),
         MenuSection{},
-        command_item("Header row", ToggleTableHeader{}),
-        command_item("Continue below table", continue_in_paragraph),
-        command_item("Delete table", DeleteTable{}),
+        command_item(l10n::header_row, ToggleTableHeader{}),
+        command_item(l10n::continue_below_table, continue_in_paragraph),
+        command_item(l10n::delete_table, DeleteTable{}),
     };
   };
   const auto list_entries = [=] {
     return std::vector<MenuEntry>{
-        MenuItem("Set start number…", [=] {
+        MenuItem(l10n::set_start_number, [=] {
           if (const auto current = editor.OrderedListStart()) {
             dialog.Show(ListStartDialog, editor, focus, *current);
           }
         }),
-        command_item("Restart at 1", SetListStart{}).Enabled(list_start && *list_start != 1),
+        command_item(l10n::restart_at_one, SetListStart{}).Enabled(list_start && *list_start != 1),
         MenuSection{},
-        command_item("Increase list indent", IndentList{}),
-        command_item("Decrease list indent", OutdentList{}),
-        MenuItem("Remove numbering", [run, ordered_list] { run(ordered_list); }).Enabled(ordered_state.enabled),
+        command_item(l10n::increase_list_indent, IndentList{}),
+        command_item(l10n::decrease_list_indent, OutdentList{}),
+        MenuItem(l10n::remove_numbering, [run, ordered_list] { run(ordered_list); }).Enabled(ordered_state.enabled),
     };
   };
   const auto open_image_size = [editor, dialog] {
@@ -697,7 +699,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       dialog.Show(ImageSizeDialog, editor, *size);
     }
   };
-  const auto add_after = MenuItem("Add image after", [pick_image] { pick_image(false, false); }).Enabled(can_pick_images);
+  const auto add_after = MenuItem(l10n::add_image_after, [pick_image] { pick_image(false, false); }).Enabled(can_pick_images);
   const auto replace_image = [pick_image] { pick_image(true, false); };
   const auto table_tool = menu_tool(table_grid, table_label, table_anchor, header_state.enabled || can_insert_table,
                                     in_table, [=] {
@@ -718,50 +720,50 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   }).With(list_anchor);
   const auto padding = Padding(EdgeInsets::Symmetric(compact ? 5.0F : 12.0F, 5.0F));
   const auto background = Background(theme.colors.surface);
-  const auto more_tool = menu_tool(more, compact && image_selected ? "Image actions" : "More formatting",
+  const auto more_tool = menu_tool(more, compact && image_selected ? l10n::image_actions : l10n::more_formatting,
                                   more_anchor, true, false, [=] {
     if (compact && image_selected) {
-      menu.Show(more_anchor, {command_item("Redo", Redo{}), MenuSection{}, command_item("Delete image", DeleteImage{})});
+      menu.Show(more_anchor, {command_item(l10n::redo, Redo{}), MenuSection{}, command_item(l10n::delete_image, DeleteImage{})});
       return;
     }
     std::vector<MenuEntry> items;
     if (in_table) {
-      items.emplace_back(MenuItem("Table actions", table_entries()));
+      items.emplace_back(MenuItem(l10n::table_actions, table_entries()));
     }
     if (list_start) {
-      items.emplace_back(MenuItem("List numbering", list_entries()));
+      items.emplace_back(MenuItem(l10n::list_numbering, list_entries()));
     }
     if (compact) {
-      items.emplace_back(command_item("Redo", Redo{}));
+      items.emplace_back(command_item(l10n::redo, Redo{}));
     }
     if (!in_table && !in_code && editor.GetCommandState(continue_in_paragraph).enabled) {
-      items.emplace_back(command_item("Continue in plain paragraph", continue_in_paragraph));
+      items.emplace_back(command_item(l10n::continue_in_plain_paragraph, continue_in_paragraph));
     }
-    items.emplace_back(MenuItem("Text formatting", {
-        command_item("Strikethrough", ToggleMark{Mark::Strike}),
-        command_item("Inline code", ToggleMark{Mark::Code}),
-        command_item("Highlight", ToggleMark{Mark::Highlight}),
-        command_item("Clear formatting", ClearFormatting{}),
+    items.emplace_back(MenuItem(l10n::text_formatting, {
+        command_item(l10n::strikethrough, ToggleMark{Mark::Strike}),
+        command_item(l10n::inline_code, ToggleMark{Mark::Code}),
+        command_item(l10n::highlight, ToggleMark{Mark::Highlight}),
+        command_item(l10n::clear_formatting, ClearFormatting{}),
     }));
-    items.emplace_back(MenuItem("Insert", {
-        command_item("Insert table", insert_table),
-        MenuItem("Insert image", [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
-        MenuItem("Insert inline image", [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
-        MenuItem("Insert inline formula…", insert_inline_formula).Enabled(can_insert_inline_formula),
-        MenuItem("Insert display formula…", insert_formula).Enabled(can_insert_formula),
+    items.emplace_back(MenuItem(l10n::insert, {
+        command_item(l10n::insert_table, insert_table),
+        MenuItem(l10n::insert_image, [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
+        MenuItem(l10n::insert_inline_image, [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
+        MenuItem(l10n::insert_inline_formula_menu, insert_inline_formula).Enabled(can_insert_inline_formula),
+        MenuItem(l10n::insert_display_formula_menu, insert_formula).Enabled(can_insert_formula),
     }).Enabled(can_insert_table || can_insert_image || can_insert_inline_image ||
                can_insert_formula || can_insert_inline_formula));
-    items.emplace_back(MenuItem("Lists and quote", {
-        command_item("Bulleted list", ToggleList{ListKind::Unordered}),
-        command_item("Numbered list", ordered_list),
-        command_item("Block quote", ToggleQuote{}),
-        command_item("Increase list indent", IndentList{}),
-        command_item("Decrease list indent", OutdentList{}),
+    items.emplace_back(MenuItem(l10n::lists_and_quote, {
+        command_item(l10n::bulleted_list, ToggleList{ListKind::Unordered}),
+        command_item(l10n::numbered_list, ordered_list),
+        command_item(l10n::block_quote, ToggleQuote{}),
+        command_item(l10n::increase_list_indent, IndentList{}),
+        command_item(l10n::decrease_list_indent, OutdentList{}),
     }));
     menu.Show(more_anchor, std::move(items));
   });
 
-  const auto text_tool = [&](const char* title, const char* label, bool enabled, auto on_click) {
+  const auto text_tool = [&](StringVariant title, StringVariant label, bool enabled, auto on_click) {
     return Button(title).OnClick(std::move(on_click)).With(
         tool_frame,
         Padding(EdgeInsets::Symmetric(8.0F, 6.0F)),
@@ -771,12 +773,12 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         Semantics{.label = label}
     );
   };
-  const auto text_command = [&](const char* title, const char* label, EditorCommand command) {
+  const auto text_command = [&](StringVariant title, StringVariant label, EditorCommand command) {
     return text_tool(title, label, editor.GetCommandState(command).enabled,
                      [run, command] { run(command); });
   };
   const auto continue_below = in_table || in_code
-      ? text_command("Continue below", in_table ? "Continue below table" : "Continue below code block",
+      ? text_command(l10n::continue_below, in_table ? l10n::continue_below_table : l10n::continue_below_code,
                      continue_in_paragraph)
       : View{};
   if (compact) {
@@ -791,13 +793,13 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     Views actions;
     if (image_selected) {
       context = "image";
-      actions.Add(text_tool("Size", "Image size", selected_size.has_value(), open_image_size));
-      actions.Add(text_tool("Replace", "Replace image", can_pick_images, replace_image));
-      actions.Add(text_tool("+ Image", "Add image after", can_pick_images, [pick_image] { pick_image(false, false); }));
+      actions.Add(text_tool(l10n::size, l10n::image_size, selected_size.has_value(), open_image_size));
+      actions.Add(text_tool(l10n::replace, l10n::replace_image, can_pick_images, replace_image));
+      actions.Add(text_tool(l10n::add_image_short, l10n::add_image_after, can_pick_images, [pick_image] { pick_image(false, false); }));
     } else if (formula_selected) {
       context = "formula";
-      actions.Add(text_tool("Edit formula", "Edit formula", true, edit_formula));
-      actions.Add(text_tool("Copy LaTeX", "Copy LaTeX", clipboard && clipboard->IsAvailable(), copy_formula));
+      actions.Add(text_tool(l10n::edit_formula, l10n::edit_formula, true, edit_formula));
+      actions.Add(text_tool(l10n::copy_latex, l10n::copy_latex, clipboard && clipboard->IsAvailable(), copy_formula));
     } else {
       if (continue_below) {
         actions.Add(continue_below);
@@ -808,8 +810,8 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       if (in_table) {
         context = "table";
         actions.Add(table_tool);
-        actions.Add(text_command("+ Row", "Insert row below", InsertTableRow{}));
-        actions.Add(text_command("+ Column", "Insert column after", InsertTableColumn{}));
+        actions.Add(text_command(l10n::add_row_short, l10n::insert_row_below, InsertTableRow{}));
+        actions.Add(text_command(l10n::add_column_short, l10n::insert_column_after, InsertTableColumn{}));
       } else if (in_code) {
         context = "code";
       } else if (show_list) {
@@ -818,15 +820,15 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
           actions.Add(list_tool);
         }
         if (show_bulleted) {
-          actions.Add(format_tool(bulleted_list, "Bulleted list", unordered_state, [run, unordered_list] {
+          actions.Add(format_tool(bulleted_list, l10n::bulleted_list, unordered_state, [run, unordered_list] {
             run(unordered_list);
           }));
         }
-        actions.Add(tool(outdent, "Decrease list indent", OutdentList{}));
-        actions.Add(tool(indent, "Increase list indent", IndentList{}));
+        actions.Add(tool(outdent, l10n::decrease_list_indent, OutdentList{}));
+        actions.Add(tool(indent, l10n::increase_list_indent, IndentList{}));
       } else if (in_quote) {
         context = "quote";
-        actions.Add(tool(quote, "Block quote", ToggleQuote{}));
+        actions.Add(tool(quote, l10n::block_quote, ToggleQuote{}));
       } else if (can_link) {
         context = "link";
         actions.Add(LinkTool(editor, focus, available, compact));
@@ -837,9 +839,9 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         actions.Add(text_style);
       }
       if (!in_code) {
-        actions.Add(tool(bold, "Bold", ToggleMark{Mark::Bold}));
-        actions.Add(tool(italic, "Italic", ToggleMark{Mark::Italic}));
-        actions.Add(tool(underline, "Underline", ToggleMark{Mark::Underline}));
+        actions.Add(tool(bold, l10n::bold, ToggleMark{Mark::Bold}));
+        actions.Add(tool(italic, l10n::italic, ToggleMark{Mark::Italic}));
+        actions.Add(tool(underline, l10n::underline, ToggleMark{Mark::Underline}));
       }
       if (can_link && (in_table || show_list || in_quote)) {
         actions.Add(LinkTool(editor, focus, available, compact));
@@ -850,7 +852,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     }
 
     return Row {
-      tool(undo, "Undo", Undo{}),
+      tool(undo, l10n::undo, Undo{}),
       // Mount a fresh scroll position when the selection moves to another tool group.
       ScrollView {
         Row {std::move(actions)}.With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Center))
@@ -859,34 +861,34 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     }.With(padding, Spacing(2.0F), CrossAlign(CrossAxisAlignment::Center), background);
   }
 
-  const auto image_tool = menu_tool(image_block, image_selected ? "Image actions" : "Insert image", image_anchor,
+  const auto image_tool = menu_tool(image_block, image_selected ? l10n::image_actions : l10n::insert_image, image_anchor,
       image_selected || can_insert_image || can_insert_inline_image, image_selected, [=] {
     if (image_selected) {
       menu.Show(image_anchor, {
-          MenuItem("Image size…", open_image_size).Enabled(selected_size.has_value()),
+          MenuItem(l10n::image_size_menu, open_image_size).Enabled(selected_size.has_value()),
           add_after,
-          MenuItem("Replace image", replace_image).Enabled(can_pick_images),
+          MenuItem(l10n::replace_image, replace_image).Enabled(can_pick_images),
           MenuSection{},
-          command_item("Delete image", DeleteImage{}),
+          command_item(l10n::delete_image, DeleteImage{}),
       });
     } else {
       menu.Show(image_anchor, {
-          MenuItem("Insert image block", [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
-          MenuItem("Insert inline image", [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
+          MenuItem(l10n::insert_image_block, [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
+          MenuItem(l10n::insert_inline_image, [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
       });
     }
   });
-  const auto formula_tool = menu_tool(formula, formula_selected ? "Formula actions" : "Insert formula", formula_anchor,
+  const auto formula_tool = menu_tool(formula, formula_selected ? l10n::formula_actions : l10n::insert_formula, formula_anchor,
       formula_selected || can_insert_formula || can_insert_inline_formula, formula_selected, [=] {
     if (formula_selected) {
       menu.Show(formula_anchor, {
-          MenuItem("Edit formula…", edit_formula),
-          MenuItem("Copy LaTeX", copy_formula).Enabled(clipboard && clipboard->IsAvailable()),
+          MenuItem(l10n::edit_formula_menu, edit_formula),
+          MenuItem(l10n::copy_latex, copy_formula).Enabled(clipboard && clipboard->IsAvailable()),
       });
     } else {
       menu.Show(formula_anchor, {
-          MenuItem("Inline formula…", insert_inline_formula).Enabled(can_insert_inline_formula),
-          MenuItem("Display formula…", insert_formula).Enabled(can_insert_formula),
+          MenuItem(l10n::inline_formula_menu, insert_inline_formula).Enabled(can_insert_inline_formula),
+          MenuItem(l10n::display_formula_menu, insert_formula).Enabled(can_insert_formula),
       });
     }
   });
@@ -894,26 +896,26 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const auto separator = Divider(Axis::Vertical).With(Frame{.height = 21.0F});
   return ScrollView {
     Row {
-      tool(undo, "Undo", Undo{}),
+      tool(undo, l10n::undo, Undo{}),
       folio::IsMobilePlatform() ? continue_below : View{},
       open_link,
-      tool(redo, "Redo", Redo{}),
+      tool(redo, l10n::redo, Redo{}),
       separator,
       TextStylePicker(editor, focus, available, compact),
-      tool(bold, "Bold", ToggleMark{Mark::Bold}),
-      tool(italic, "Italic", ToggleMark{Mark::Italic}),
-      tool(underline, "Underline", ToggleMark{Mark::Underline}),
+      tool(bold, l10n::bold, ToggleMark{Mark::Bold}),
+      tool(italic, l10n::italic, ToggleMark{Mark::Italic}),
+      tool(underline, l10n::underline, ToggleMark{Mark::Underline}),
       LinkTool(editor, focus, available, compact),
-      tool(strikethrough, "Strikethrough", ToggleMark{Mark::Strike}),
-      tool(inline_code, "Inline code", ToggleMark{Mark::Code}),
-      tool(highlight, "Highlight", ToggleMark{Mark::Highlight}),
-      tool(clear_formatting, "Clear formatting", ClearFormatting{}),
+      tool(strikethrough, l10n::strikethrough, ToggleMark{Mark::Strike}),
+      tool(inline_code, l10n::inline_code, ToggleMark{Mark::Code}),
+      tool(highlight, l10n::highlight, ToggleMark{Mark::Highlight}),
+      tool(clear_formatting, l10n::clear_formatting, ClearFormatting{}),
       separator,
-      tool(bulleted_list, "Bulleted list", ToggleList{ListKind::Unordered}),
+      tool(bulleted_list, l10n::bulleted_list, ToggleList{ListKind::Unordered}),
       list_tool,
-      tool(quote, "Block quote", ToggleQuote{}),
-      tool(indent, "Increase list indent", IndentList{}),
-      tool(outdent, "Decrease list indent", OutdentList{}),
+      tool(quote, l10n::block_quote, ToggleQuote{}),
+      tool(indent, l10n::increase_list_indent, IndentList{}),
+      tool(outdent, l10n::decrease_list_indent, OutdentList{}),
       separator,
       table_tool,
       image_tool,
@@ -1062,7 +1064,7 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
       dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true, .object = object});
     }
   }).With(focus, Grow(), Enabled(options.available),
-          Semantics{.label = "Document editor", .identifier = "article-editor"}).Key("editor");
+          Semantics{.label = l10n::document_editor, .identifier = "article-editor"}).Key("editor");
   const auto paper_frame = compact ? Frame{} : Frame{.width = static_cast<float>(preferences.reading_width)};
   const auto paper_border = Border{theme.colors.outline, compact ? 0.0F : 1.0F};
   const auto paper_corners = CornerRadius(CornerRadii::Top(compact ? 0.0F : theme.shapes.medium));

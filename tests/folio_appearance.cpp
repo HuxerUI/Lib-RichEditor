@@ -13,6 +13,7 @@
 #include "../examples/preview/src/appearance.h"
 #include "../examples/preview/src/labels.h"
 #include "../examples/preview/src/settings.h"
+#include "folio_test_resources.h"
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
@@ -84,14 +85,16 @@ View SettingsFixture() {
   return Theme(FolioTheme(ResolveTheme(settings.theme, brightness)), SettingsLauncher());
 }
 
-void SettingsFlow(Size viewport, std::optional<File> directory, bool compact) {
+void SettingsFlow(Size viewport, std::optional<File> directory, bool compact,
+                  const std::shared_ptr<PlatformResources>& resources) {
   const Application app(SettingsFixture, {
       .show_debug_overlay = false,
       .application_hooks = {[directory](ApplicationContext& context) {
         context.Provide(std::make_shared<SettingsStore>(directory));
       }},
   });
-  UiTest ui(app, {.viewport = viewport, .safe_area = {.top = 22.0F, .bottom = 18.0F}});
+  UiTest ui(app, {.viewport = viewport, .safe_area = {.top = 22.0F, .bottom = 18.0F},
+                  .resource_provider = resources});
   ui.Find(UiSelector::Text("Open settings")).Tap();
   ui.Pump(300ms);
 
@@ -249,14 +252,14 @@ void ShortcutChanges() {
         "A corrupt file drops duplicate custom shortcuts and keeps unrelated overrides");
 }
 
-void ShortcutSettingsFlow(const File& directory, bool restore) {
+void ShortcutSettingsFlow(const File& directory, bool restore, const std::shared_ptr<PlatformResources>& resources) {
   const Application app(SettingsFixture, {
       .show_debug_overlay = false,
       .application_hooks = {[directory](ApplicationContext& context) {
         context.Provide(std::make_shared<SettingsStore>(directory));
       }},
   });
-  UiTest ui(app, {.viewport = {360.0F, 630.0F}});
+  UiTest ui(app, {.viewport = {360.0F, 630.0F}, .resource_provider = resources});
   const auto by_id = [&](const char* id) { return ui.FindSemantics(UiSemanticSelector::Identifier(id)); };
   const auto tap = [&](const char* id) { ui.TapAt(Center(by_id(id).One().bounds)); };
   ui.Find(UiSelector::Text("Open settings")).Tap();
@@ -405,10 +408,12 @@ void DialogActionLayout() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
   const auto directory = File(std::filesystem::temp_directory_path().u8string()).Child(
       "folio-appearance-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   try {
+    Check(argc == 2, "The Folio resource package path is required");
+    const auto resources = std::make_shared<folio::test::PackageResources>(argv[1]);
     PresetContrast();
     TitleAndStatus({1050.0F, 640.0F});
     TitleAndStatus({360.0F, 620.0F});
@@ -419,14 +424,14 @@ int main() {
               legacy.Child("appearance.cfg").WriteString("theme=lilac\ntext_size=14\nreading_width=560\n"),
           "Write legacy preferences");
     CheckLoaded(legacy, {.theme = "lilac", .editor = {.text_size = 14, .reading_width = 560}});
-    SettingsFlow({1060.0F, 500.0F}, std::nullopt, false);
-    SettingsFlow({360.0F, 600.0F}, directory, true);
+    SettingsFlow({1060.0F, 500.0F}, std::nullopt, false, resources);
+    SettingsFlow({360.0F, 600.0F}, directory, true, resources);
     CheckLoaded(directory, {.theme = "ember", .editor = {.text_size = 19, .reading_width = 920}});
-    ShortcutSettingsFlow(directory, false);
+    ShortcutSettingsFlow(directory, false, resources);
     const auto remapped = PlanShortcutChange({}, Shortcut("folio.find"), ShortcutKeys{{Key::Y, {.control = true}}});
     CheckLoaded(directory, {.theme = "ember", .editor = {.text_size = 19, .reading_width = 920},
                             .shortcuts = remapped.overrides});
-    ShortcutSettingsFlow(directory, true);
+    ShortcutSettingsFlow(directory, true, resources);
     CheckLoaded(directory, {.theme = "ember", .editor = {.text_size = 19, .reading_width = 920}});
 #if !defined(__EMSCRIPTEN__)
     SettingsSurviveQuit(directory);

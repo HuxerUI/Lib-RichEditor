@@ -3,9 +3,12 @@
 #include <huxerui/huxerui.h>
 
 #include "settings.h"
+#include "app_resources.h"
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
+
+namespace l10n = app::strings;
 
 namespace folio {
 namespace {
@@ -24,7 +27,7 @@ struct ShortcutDraft {
   bool operator==(const ShortcutDraft&) const = default;
 };
 
-View KeyLabel(std::string label, const ThemeSpec& theme) {
+View KeyLabel(StringVariant label, const ThemeSpec& theme) {
   return Text(std::move(label), TextRole::Label).Style(TextStyle{Font::Monospace(12.0F), theme.colors.on_surface})
       .With(Padding(EdgeInsets::Symmetric(7.0F, 4.0F)), Background(theme.colors.surface_container_high),
             CornerRadius(theme.shapes.extra_small));
@@ -52,12 +55,12 @@ View EditShortcutDialog(DialogContext context, const ShortcutCommand* command) {
   const auto focused = UseState(false);
   Lifecycle([focus] { focus.RequestFocus(true); });
   const auto& value = draft.Get();
-  const auto captured_label = value.keys ? ShortcutLabel(*value.keys) : "Press a shortcut";
+  const auto captured_label = value.keys ? StringVariant{ShortcutLabel(*value.keys)} : StringVariant{l10n::press_shortcut};
   const auto& overrides = store->Get().shortcuts;
   const auto keys = EffectiveShortcuts(overrides, *command);
   Views key_labels;
   if (keys.empty()) {
-    key_labels.Add(KeyLabel("Unassigned", theme));
+    key_labels.Add(KeyLabel(l10n::unassigned, theme));
   } else {
     for (const auto& combination : keys) {
       key_labels.Add(KeyLabel(ShortcutLabel(combination), theme));
@@ -82,7 +85,7 @@ View EditShortcutDialog(DialogContext context, const ShortcutCommand* command) {
             Padding(EdgeInsets::Symmetric(12.0F, 5.0F)), Background(theme.colors.surface_container),
             Border{focused.Get() ? theme.colors.primary : theme.colors.outline, 1.0F},
             CornerRadius(theme.shapes.small), PointerCursor(PointerCursorKind::Hand),
-            Semantics{.role = SemanticRole::Button, .label = "Record shortcut", .value = captured_label,
+            Semantics{.role = SemanticRole::Button, .label = l10n::record_shortcut, .value = captured_label,
                       .identifier = "shortcut-capture", .descendants = SemanticDescendantPolicy::Exclude})
       .Key("shortcut-capture");
   const bool can_apply = value.keys.has_value() || value.restoring;
@@ -98,25 +101,25 @@ View EditShortcutDialog(DialogContext context, const ShortcutCommand* command) {
         Foreground(theme.colors.error), Semantics{.live_region = SemanticLiveRegion::Polite}));
   }
   if (!conflicts.empty()) {
-    notices.Add(Text("Replace the shortcut for", TextRole::Label).With(
+    notices.Add(Text(l10n::replace_shortcut_for, TextRole::Label).With(
         Foreground(theme.colors.on_surface_variant), Semantics{.live_region = SemanticLiveRegion::Polite}));
     for (const auto& conflict : conflicts) {
-      notices.Add(Text(std::string(conflict.owner->label) + " · " + std::string(CommandGroup(*conflict.owner)) + " · " +
+      notices.Add(Text(UseString(CommandLabel(*conflict.owner)) + " · " + UseString(CommandGroup(*conflict.owner)) + " · " +
                        ShortcutLabel(conflict.keys), TextRole::Label)
                       .With(Semantics{.identifier = "shortcut-conflict-" + std::string(conflict.owner->id)}));
     }
   }
   const auto body = ScrollView(Column {
-    Text("Current shortcuts", TextRole::Label).With(Foreground(theme.colors.on_surface_variant)),
+    Text(l10n::current_shortcuts, TextRole::Label).With(Foreground(theme.colors.on_surface_variant)),
     Flow {std::move(key_labels)}.With(Spacing(5.0F)),
     capture,
-    Text("Use a physical keyboard with Ctrl or Command.", TextRole::Label)
+    Text(l10n::physical_keyboard, TextRole::Label)
         .With(Foreground(theme.colors.on_surface_variant)),
     Column {std::move(notices)}.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     Flow {
-      Button("Clear shortcut").OnClick([=] { ApplyShortcutChange(store, context, *command, ShortcutKeys{}); })
+      Button(l10n::clear_shortcut).OnClick([=] { ApplyShortcutChange(store, context, *command, ShortcutKeys{}); })
           .With(Enabled(!keys.empty()), Semantics{.identifier = "shortcut-clear"}),
-      Button("Restore default").OnClick([=] {
+      Button(l10n::restore_default).OnClick([=] {
         if (PlanShortcutChange(store->Get().shortcuts, *command, std::nullopt).conflicts.empty()) {
           ApplyShortcutChange(store, context, *command, std::nullopt);
         } else {
@@ -125,14 +128,14 @@ View EditShortcutDialog(DialogContext context, const ShortcutCommand* command) {
       }).With(Enabled(overrides.contains(command->id)), Semantics{.identifier = "shortcut-restore"}),
     }.With(Spacing(6.0F)),
   }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch))).With(ScrollBar());
-  const char* apply = value.restoring ? "Replace and restore" : conflicts.empty() ? "Set shortcut" : "Replace shortcut";
+  const auto apply = value.restoring ? l10n::replace_and_restore : conflicts.empty() ? l10n::set_shortcut : l10n::replace_shortcut;
   return ScrollableDialogPanel(
-      Text(std::string(command->label), TextRole::Title), body,
-      DialogActions(theme, Button("Cancel").OnClick([context] { context.Dismiss(); }),
+      Text(CommandLabel(*command), TextRole::Title), body,
+      DialogActions(theme, Button(l10n::cancel).OnClick([context] { context.Dismiss(); }),
           Button(apply).OnClick([store, context, command, replacement, conflicts = std::move(conflicts)] {
             ApplyShortcutChange(store, context, *command, replacement, conflicts);
           }).With(Enabled(can_apply), Semantics{.identifier = "shortcut-apply"})),
-      theme, 416.0F).With(Semantics{.label = "Change shortcut", .identifier = "shortcut-dialog"});
+      theme, 416.0F).With(Semantics{.label = l10n::change_shortcut, .identifier = "shortcut-dialog"});
 }
 
 [[huxerui::composable]]
@@ -140,10 +143,10 @@ View RestoreShortcutsDialog(DialogContext context) {
   const auto& theme = UseTheme();
   const auto store = UseService<SettingsStore>();
   return ScrollableDialogPanel(
-      Text("Restore default shortcuts?", TextRole::Title),
-      Text("This restores every shortcut and removes custom bindings.", TextRole::Body),
-      DialogActions(theme, Button("Cancel").OnClick([context] { context.Dismiss(); }),
-          Button("Restore defaults").OnClick([store, context] {
+      Text(l10n::restore_shortcuts_title, TextRole::Title),
+      Text(l10n::restore_shortcuts_hint, TextRole::Body),
+      DialogActions(theme, Button(l10n::cancel).OnClick([context] { context.Dismiss(); }),
+          Button(l10n::restore_defaults).OnClick([store, context] {
             auto settings = store->Get();
             settings.shortcuts.clear();
             store->Set(std::move(settings));
@@ -152,29 +155,32 @@ View RestoreShortcutsDialog(DialogContext context) {
       theme, 376.0F);
 }
 
-View ShortcutHeading(const char* name, const ThemeSpec& theme) {
+View ShortcutHeading(StringVariant name, const ThemeSpec& theme) {
   return Text(name, TextRole::Label).Style(TextStyle{
       Font::FromFamily(theme.typography.family, theme.typography.label_large).WithWeight(FontWeight::SemiBold),
       theme.colors.on_surface}).With(Semantics{.role = SemanticRole::Heading, .heading_level = 2});
 }
 
+[[huxerui::composable]]
 View ShortcutRows(const ThemeSpec& theme, const DialogHandle& dialog, const ShortcutOverrides& overrides,
-                  std::string_view group) {
+                  const StringResource& group) {
   Views rows;
   for (const auto& command : ShortcutCommands()) {
     if (CommandGroup(command) != group) {
       continue;
     }
-    const auto keys = PreferredShortcutLabel(EffectiveShortcuts(overrides, command));
+    const auto bindings = EffectiveShortcuts(overrides, command);
+    const auto keys = bindings.empty() ? UseString(l10n::unassigned) : PreferredShortcutLabel(bindings);
+    const auto label = UseString(CommandLabel(command));
     const auto id = "shortcut-" + std::string(command.id);
     rows.Add(Row {
-      Text(std::string(command.label), TextRole::Label).With(Grow()),
+      Text(label, TextRole::Label).With(Grow()),
       KeyLabel(keys, theme),
     }.OnClick([dialog, command = &command] { dialog.Show(EditShortcutDialog, command); })
       .With(Frame{.min_height = 44.0F}, Padding(EdgeInsets::Symmetric(8.0F, 3.0F)), Spacing(8.0F),
             CrossAlign(CrossAxisAlignment::Center), Focusable{}, CornerRadius(theme.shapes.small),
             PointerCursor(PointerCursorKind::Hand), theme.interactions.indication,
-            Semantics{.role = SemanticRole::Button, .label = std::string(command.label) + ", " + keys,
+            Semantics{.role = SemanticRole::Button, .label = label + ", " + keys,
                       .identifier = id, .descendants = SemanticDescendantPolicy::Exclude}).Key(id));
   }
   return Column {std::move(rows)}.With(CrossAlign(CrossAxisAlignment::Stretch));
@@ -187,32 +193,32 @@ View KeyboardSettings() {
   const auto& theme = UseTheme();
   const auto dialog = UseDialog();
   const auto& overrides = UseService<SettingsStore>()->Get().shortcuts;
-  const auto fixed_key = [&](const char* label, const char* keys) {
+  const auto fixed_key = [&](StringVariant label, const char* keys) {
     return Row {Text(label, TextRole::Label).With(Grow()), KeyLabel(keys, theme)}
         .With(Frame{.min_height = 35.0F}, Padding(EdgeInsets::Symmetric(8.0F, 3.0F)),
               Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
   };
   return Column {
     Row {
-      ShortcutHeading("Workbench", theme).With(Grow()),
-      Button("Restore all defaults").OnClick([dialog] { dialog.Show(RestoreShortcutsDialog); })
+      ShortcutHeading(l10n::workbench, theme).With(Grow()),
+      Button(l10n::restore_all_defaults).OnClick([dialog] { dialog.Show(RestoreShortcutsDialog); })
           .With(Enabled(!overrides.empty()), Semantics{.identifier = "shortcuts-restore-all"}).Key("shortcuts-restore-all"),
     }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
-    ShortcutRows(theme, dialog, overrides, "Workbench"),
+    ShortcutRows(theme, dialog, overrides, l10n::workbench),
     Divider(),
-    ShortcutHeading("Editor", theme),
-    ShortcutRows(theme, dialog, overrides, "Editor"),
-    fixed_key("Continue in plain paragraph", plain_paragraph_shortcut),
+    ShortcutHeading(l10n::editor, theme),
+    ShortcutRows(theme, dialog, overrides, l10n::editor),
+    fixed_key(l10n::continue_in_plain_paragraph, plain_paragraph_shortcut),
     Divider(),
-    ShortcutHeading("Table", theme),
-    ShortcutRows(theme, dialog, overrides, "Table"),
-    fixed_key("Next cell or new row", "Tab"),
-    fixed_key("Previous cell", "Shift + Tab"),
+    ShortcutHeading(l10n::table, theme),
+    ShortcutRows(theme, dialog, overrides, l10n::table),
+    fixed_key(l10n::next_cell_or_row, "Tab"),
+    fixed_key(l10n::previous_cell, "Shift + Tab"),
     Divider(),
-    ShortcutHeading("Find controls", theme),
-    fixed_key("Next match", "Enter"),
-    fixed_key("Previous match", "Shift + Enter"),
-    fixed_key("Close find", "Esc"),
+    ShortcutHeading(l10n::find_controls, theme),
+    fixed_key(l10n::next_match, "Enter"),
+    fixed_key(l10n::previous_match, "Shift + Enter"),
+    fixed_key(l10n::close_find, "Esc"),
   }.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 

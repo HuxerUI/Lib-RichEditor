@@ -15,8 +15,10 @@ if (TARGET HuxerUI::testing)
         ../examples/preview/src/shortcut_settings.cpp
         ../examples/preview/src/shortcuts.cpp)
     huxerui_enable_codegen(folio_appearance_tests)
+    huxerui_add_resources(folio_appearance_tests ROOT ../examples/preview/resources NAMESPACE app)
     target_link_libraries(folio_appearance_tests PRIVATE HuxerUI::RichEditor HuxerUI::testing)
-    add_test(NAME folio.appearance COMMAND folio_appearance_tests)
+    get_property(folio_appearance_resources TARGET folio_appearance_tests PROPERTY HUXERUI_RESOURCE_PACKAGE)
+    add_test(NAME folio.appearance COMMAND folio_appearance_tests "${folio_appearance_resources}")
 
     file(GLOB folio_preview_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../examples/preview/src/*.cpp")
     if (APPLE)

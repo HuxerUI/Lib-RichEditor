@@ -6,8 +6,11 @@
 #include <huxerui/huxerui.h>
 
 #include "shortcut_settings.h"
+#include "app_resources.h"
 
 using namespace huxerui;
+
+namespace l10n = app::strings;
 
 namespace folio {
 namespace {
@@ -113,7 +116,7 @@ bool SaveSettings(const File& directory, const FolioSettings& settings) {
 }
 #endif
 
-View Choice(View content, const ThemeSpec& theme, std::string label, std::string id,
+View Choice(View content, const ThemeSpec& theme, StringVariant label, std::string id,
             bool selected, std::function<void()> select) {
   const auto& colors = theme.colors;
   return std::move(content).OnClick(std::move(select)).Key(id).With(
@@ -169,13 +172,13 @@ View ThemePreview(const ThemePreset& preset) {
          Border{colors.outline, 1.0F}, CornerRadius(5.0F));
 }
 
-Text SettingsLabel(std::string label, const ThemeSpec& theme, FontWeight weight = FontWeight::Medium) {
+Text SettingsLabel(StringVariant label, const ThemeSpec& theme, FontWeight weight = FontWeight::Medium) {
   return Text(std::move(label), TextRole::Label).Style(TextStyle{
       Font::FromFamily(theme.typography.family, theme.typography.label_large).WithWeight(weight),
       theme.colors.on_surface});
 }
 
-View SectionLabel(const char* title, const ThemeSpec& theme) {
+View SectionLabel(StringVariant title, const ThemeSpec& theme) {
   return SettingsLabel(title, theme, FontWeight::SemiBold).With(
       Semantics{.role = SemanticRole::Heading, .heading_level = 2});
 }
@@ -208,14 +211,14 @@ View ThemeGroup(ThemeBrightness brightness, bool compact, const ThemeSpec& theme
     rows.Add(Row {std::move(cards)}.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   }
   return Column {
-    Text(brightness == ThemeBrightness::Dark ? "Dark" : "Light", TextRole::Label)
+    Text(brightness == ThemeBrightness::Dark ? l10n::dark : l10n::light, TextRole::Label)
         .With(Foreground(theme.colors.on_surface_variant)),
     Column {std::move(rows)}.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)),
   }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 View OptionRow(const ThemeSpec& theme, const std::array<int, 3>& values, const std::array<std::string, 3>& labels,
-               const char* id, const char* group, int active, const std::function<void(int)>& select) {
+               const char* id, std::string_view group, int active, const std::function<void(int)>& select) {
   Views options;
   for (std::size_t i = 0; i < labels.size(); ++i) {
     const int value = values[i];
@@ -240,17 +243,18 @@ View AppearancePage(const ThemeSpec& theme, bool compact, const std::string& act
   };
   return Column {
     Choice(Row {
-      SettingsLabel("Follow system", theme).With(Grow()),
+      SettingsLabel(l10n::follow_system, theme).With(Grow()),
       Text(std::string(system_preset.name), TextRole::Label).With(Foreground(theme.colors.on_surface_variant)),
       ChoiceMark(theme, follows_system),
     }.With(Frame{.min_height = 46.0F}, Padding(EdgeInsets::Symmetric(11.0F, 5.0F)), Spacing(8.0F),
            CrossAlign(CrossAxisAlignment::Center)),
-        theme, "Follow system", "theme-system", follows_system, [select_theme] { select_theme(system_theme); }),
+        theme, l10n::follow_system, "theme-system", follows_system, [select_theme] { select_theme(system_theme); }),
     ThemeGroup(ThemeBrightness::Light, compact, theme, active, select_theme),
     ThemeGroup(ThemeBrightness::Dark, compact, theme, active, select_theme),
   }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
+[[huxerui::composable]]
 View EditorPage(const ThemeSpec& theme, bool compact, const EditorSettings& editor,
                 const std::shared_ptr<SettingsStore>& store) {
   std::array<std::string, editor_text_sizes.size()> text_sizes;
@@ -258,28 +262,29 @@ View EditorPage(const ThemeSpec& theme, bool compact, const EditorSettings& edit
     text_sizes[i] = std::to_string(editor_text_sizes[i]) + " px";
   }
   const auto options = Column {
-    SectionLabel("Text size", theme),
-    OptionRow(theme, editor_text_sizes, text_sizes, "text-size-", "Text size", editor.text_size,
+    SectionLabel(l10n::text_size, theme),
+    OptionRow(theme, editor_text_sizes, text_sizes, "text-size-", UseString(l10n::text_size), editor.text_size,
               [store](int size) {
                 auto next = store->Get();
                 next.editor.text_size = size;
                 store->Set(std::move(next));
               }),
-    SectionLabel("Reading width", theme),
-    OptionRow(theme, editor_reading_widths, {"Narrow", "Standard", "Wide"}, "reading-width-", "Reading width",
+    SectionLabel(l10n::reading_width, theme),
+    OptionRow(theme, editor_reading_widths, {UseString(l10n::narrow), UseString(l10n::standard), UseString(l10n::wide)},
+              "reading-width-", UseString(l10n::reading_width),
               editor.reading_width, [store](int width) {
                 auto next = store->Get();
                 next.editor.reading_width = width;
                 store->Set(std::move(next));
               }),
-    compact ? Text("Used in wider windows", TextRole::Label)
+    compact ? Text(l10n::wider_windows, TextRole::Label)
                   .With(FontSize(12.0F), Foreground(theme.colors.on_surface_variant)) : View{},
   }.With(Spacing(9.0F), CrossAlign(CrossAxisAlignment::Stretch));
   return Column {
     options,
     Column {
-      SectionLabel("Text preview", theme),
-      Text("Collect ideas worth keeping. 中文输入也可以。").Style(TextStyle{
+      SectionLabel(l10n::text_preview, theme),
+      Text(l10n::preview_text).Style(TextStyle{
           Font::FromFamily(theme.typography.family, static_cast<float>(editor.text_size)), theme.colors.on_surface}),
     }.With(Padding(14.0F), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch),
            Background(theme.colors.surface_container), Border{theme.colors.outline, 1.0F},
@@ -334,9 +339,9 @@ View SettingsDialog(DialogContext context) {
   tabs_style.divider_height = 1.0F;
   tabs_style.minimum_height = 44.0F;
   tabs_style.expand_items = compact;
-  std::vector<StringVariant> pages{"Appearance", "Editor"};
+  std::vector<StringVariant> pages{l10n::appearance, l10n::editor};
   if (!IsMobilePlatform()) {
-    pages.emplace_back("Keyboard");
+    pages.emplace_back(l10n::keyboard);
   }
   const auto navigation = ProvideEnvironment(std::move(tabs_style), Tabs(std::move(pages), page)
       .OnChanged([page](std::size_t next) { page = next; }));
@@ -356,17 +361,17 @@ View SettingsDialog(DialogContext context) {
   View error;
   if (store->SaveFailed()) {
     error = Row {
-      Text("Couldn’t save settings", TextRole::Label).With(Grow(), Foreground(theme.colors.error),
+      Text(l10n::settings_save_failed, TextRole::Label).With(Grow(), Foreground(theme.colors.error),
           Semantics{.live_region = SemanticLiveRegion::Polite}),
-      Button("Retry").OnClick([store] { store->Set(store->Get()); }),
+      Button(l10n::retry).OnClick([store] { store->Set(store->Get()); }),
     }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
   }
   const auto header = Column {
     Row {
-      Text("Settings", TextRole::Title).Style(TextStyle{
+      Text(l10n::settings, TextRole::Title).Style(TextStyle{
           Font::FromFamily(theme.typography.family, 22.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
           .With(Grow(), Semantics{.role = SemanticRole::Heading, .heading_level = 1}),
-      Button("Done").OnClick([context] { context.Dismiss(); })
+      Button(l10n::done).OnClick([context] { context.Dismiss(); })
           .With(Frame{.min_height = 44.0F}, Semantics{.identifier = "settings-done"}),
     }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
     navigation,
@@ -379,7 +384,7 @@ View SettingsDialog(DialogContext context) {
       .With(Frame{.max_height = compact ? 550.0F : 430.0F}, ScrollBar(),
             Semantics{.identifier = page_ids[page.Get()]}).Key(page_ids[page.Get()]);
   return ScrollableDialogPanel(header, body, {}, theme, compact ? 366.0F : 662.0F)
-      .With(Semantics{.label = "Settings", .identifier = "settings-dialog"})
+      .With(Semantics{.label = l10n::settings, .identifier = "settings-dialog"})
       .Key("settings-dialog");
 }
 

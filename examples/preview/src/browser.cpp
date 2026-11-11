@@ -13,8 +13,11 @@
 #elif defined(__linux__)
 #include <gio/gio.h>
 #endif
+#include "app_resources.h"
 
 using namespace huxerui;
+
+namespace l10n = app::strings;
 
 namespace folio {
 namespace {
@@ -30,7 +33,7 @@ public:
     channel_.Invoke<bool>("open", url.ToString(), [toast](PlatformResult<bool> result) {
       const auto* opened = std::get_if<bool>(&result);
       if (!opened || !*opened) {
-        toast.Show("Could not open the link");
+        toast.Show(l10n::open_link_failed);
       }
     });
   }
@@ -84,7 +87,7 @@ void OpenBrowser(const Uri& url, const ToastHandle& toast) {
   const bool opened = false;
 #endif
   if (!opened) {
-    toast.Show("Could not open the link");
+    toast.Show(l10n::open_link_failed);
   }
 }
 #endif

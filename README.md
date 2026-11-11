@@ -195,6 +195,8 @@ The mounted tests use `HuxerUI::testing` when the SDK includes it. In Folio, ope
 
 On desktop, open **Command palette…** from **File actions**, or press **Command+Shift+P** on macOS or **Ctrl+Shift+P** on other platforms. Search by command name or a common Chinese alias. Results show the current shortcut and whether the action can run at the current caret or selection. Use the arrow keys and Enter to run a result, or select it directly. Android and iOS omit the menu entry and the **Keyboard** settings page. The shortcuts, including the palette binding, remain available with a physical keyboard.
 
+Folio follows the system language. Its interface supports English, Simplified Chinese, Japanese, Korean, German, French, and Spanish. English is the fallback.
+
 Folio starts with an empty workspace. **Open file…** accepts RichEditor JSON, `.md`, and `.markdown` and opens a tab. **Open folder…** adds a directory to the sidebar. Expand a directory to list its contents, then select a document to open it. The control at the sidebar’s upper right hides it, and **Show files** in the title bar restores it. On compact mobile hosts, **Show files** opens the drawer. Select the file name in the header to switch tabs. A standalone document with relative image references opens with placeholders. Use **Locate attachments…** to load the images.
 
 Desktop windows have independent tabs and sidebars. **Recent edits** is shared while Folio is running. **Save** checks the source file before writing back in its original format. **Save as…** creates and binds a file in a writable directory. **Export copy…** creates a separate JSON or Markdown copy. Closing a tab or window prompts for unsaved changes.

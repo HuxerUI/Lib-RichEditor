@@ -3,8 +3,12 @@
 #include <algorithm>
 #include <array>
 
+#include "app_resources.h"
+
 using namespace huxerui;
 using namespace huxerui::richeditor;
+
+namespace l10n = app::strings;
 
 namespace folio {
 namespace {
@@ -157,11 +161,61 @@ std::span<const ShortcutCommand> ShortcutCommands() {
   return commands;
 }
 
-std::string_view CommandGroup(const ShortcutCommand& command) {
+StringVariant CommandLabel(const ShortcutCommand& command) {
+  struct Label {
+    std::string_view id;
+    StringResource resource;
+  };
+  static const std::array labels{
+      Label{"folio.new", l10n::new_document},
+      Label{"folio.open", l10n::open_file},
+      Label{"folio.save", l10n::save},
+      Label{"folio.save-as", l10n::save_as},
+      Label{"folio.find", l10n::find_in_document},
+      Label{"folio.toggle-sidebar", l10n::toggle_file_sidebar},
+      Label{"folio.settings", l10n::open_settings},
+      Label{"folio.command-palette", l10n::command_palette},
+      Label{"editor.undo", l10n::undo},
+      Label{"editor.redo", l10n::redo},
+      Label{"editor.bold", l10n::bold},
+      Label{"editor.italic", l10n::italic},
+      Label{"editor.underline", l10n::underline},
+      Label{"editor.strikethrough", l10n::strikethrough},
+      Label{"editor.inline-code", l10n::inline_code},
+      Label{"editor.highlight", l10n::highlight},
+      Label{"editor.clear-formatting", l10n::clear_formatting},
+      Label{"editor.paragraph", l10n::paragraph},
+      Label{"editor.heading-1", l10n::heading_1},
+      Label{"editor.heading-2", l10n::heading_2},
+      Label{"editor.heading-3", l10n::heading_3},
+      Label{"editor.heading-4", l10n::heading_4},
+      Label{"editor.heading-5", l10n::heading_5},
+      Label{"editor.heading-6", l10n::heading_6},
+      Label{"editor.numbered-list", l10n::numbered_list},
+      Label{"editor.bulleted-list", l10n::bulleted_list},
+      Label{"editor.indent-list", l10n::increase_list_indent},
+      Label{"editor.outdent-list", l10n::decrease_list_indent},
+      Label{"editor.quote", l10n::block_quote},
+      Label{"editor.code-block", l10n::code_block},
+      Label{"editor.table.insert", l10n::insert_table},
+      Label{"editor.table.row-before", l10n::insert_row_above},
+      Label{"editor.table.row-after", l10n::insert_row_below},
+      Label{"editor.table.delete-row", l10n::delete_row},
+      Label{"editor.table.column-before", l10n::insert_column_before},
+      Label{"editor.table.column-after", l10n::insert_column_after},
+      Label{"editor.table.delete-column", l10n::delete_column},
+      Label{"editor.table.header", l10n::header_row},
+      Label{"editor.table.delete", l10n::delete_table},
+  };
+  const auto match = std::ranges::find(labels, command.id, &Label::id);
+  return match == labels.end() ? StringVariant{command.label} : StringVariant{match->resource};
+}
+
+StringResource CommandGroup(const ShortcutCommand& command) {
   if (std::holds_alternative<FolioCommand>(command.command)) {
-    return "Workbench";
+    return l10n::workbench;
   }
-  return command.id.starts_with("editor.table.") ? "Table" : "Editor";
+  return command.id.starts_with("editor.table.") ? l10n::table : l10n::editor;
 }
 
 std::span<const KeyCombination> EffectiveShortcuts(const ShortcutOverrides& overrides, const ShortcutCommand& command) {

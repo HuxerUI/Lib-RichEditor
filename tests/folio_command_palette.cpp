@@ -7,31 +7,16 @@
 #include "../examples/preview/src/attachments.h"
 #include "../examples/preview/src/web_url.h"
 #include "../examples/preview/src/workbench.h"
+#include "folio_test_resources.h"
 
 using namespace huxerui;
 using namespace huxerui::testing;
 using namespace std::chrono_literals;
+using folio::test::PackageResources;
 
 View App();
 
 namespace {
-
-class PackageResources final : public PlatformResources {
-public:
-  explicit PackageResources(std::string root) : root_(std::move(root)) {}
-
-  ResourceConfiguration Configuration() const override { return {}; }
-  std::optional<InputStream> OpenRead(std::string_view path) override {
-    auto result = File(root_ + "/" + std::string(path)).OpenRead();
-    if (!result.Succeeded()) {
-      return std::nullopt;
-    }
-    return std::move(result).Value();
-  }
-
-private:
-  std::string root_;
-};
 
 void Check(bool condition, const char* message) {
   if (!condition) {
