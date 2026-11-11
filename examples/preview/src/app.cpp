@@ -581,6 +581,8 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
             Foreground(theme.colors.on_primary_container))) : View{};
   const auto header_state = editor.GetCommandState(ToggleTableHeader{});
   const bool in_table = header_state.checked.has_value();
+  const bool in_code = editor.GetCommandState(SetBlockKind{BlockKind::CodeBlock}).checked == CheckState::On;
+  const ContinueInParagraph continue_in_paragraph;
   const EditorCommand insert_table = InsertTable{};
   const auto run = [editor, focus](const EditorCommand& command) {
     if (editor.Execute(command)) {
@@ -592,8 +594,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     auto item = MenuItem(label, [run, command = std::move(command)] { run(command); }).Enabled(state.enabled);
     return state.checked ? std::move(item).Checked(state.checked == CheckState::On) : std::move(item);
   };
-  const auto tool = [&](const ImageResource& icon, const char* label, EditorCommand command) {
-    const auto state = editor.GetCommandState(command);
+  const auto format_tool = [&](const ImageResource& icon, const char* label, CommandState state, auto on_click) {
     Color foreground = theme.colors.on_surface_variant;
     Color background = Color::Transparent();
     std::optional<SemanticCheckedState> checked;
@@ -609,7 +610,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       checked = SemanticCheckedState::Unchecked;
     }
     return IconButton(icon, label)
-        .OnClick([run, command = std::move(command)] { run(command); })
+        .OnClick(std::move(on_click))
         .With(
             tool_frame,
             Tooltip(label),
@@ -618,6 +619,10 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
             Background(background),
             Semantics{.checked = checked}
         );
+  };
+  const auto tool = [&](const ImageResource& icon, const char* label, EditorCommand command) {
+    const auto state = editor.GetCommandState(command);
+    return format_tool(icon, label, state, [run, command = std::move(command)] { run(command); });
   };
   const auto menu_tool = [&](const ImageResource& icon, const char* label, ViewHandle anchor,
                              bool enabled, bool active, auto on_click) {
@@ -658,7 +663,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const bool in_numbered_list = ordered_state.checked == CheckState::On;
   const auto list_start = editor.OrderedListStart();
   const char* list_label = in_numbered_list ? "List numbering" : "Numbered list";
-  const auto table_entries = [command_item] {
+  const auto table_entries = [command_item, continue_in_paragraph] {
     return std::vector<MenuEntry>{
         command_item("Insert row above", InsertTableRow{TableInsertSide::Before}),
         command_item("Insert row below", InsertTableRow{}),
@@ -669,7 +674,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         command_item("Delete column", DeleteTableColumn{}),
         MenuSection{},
         command_item("Header row", ToggleTableHeader{}),
-        command_item("Continue below table", ExitTable{}),
+        command_item("Continue below table", continue_in_paragraph),
         command_item("Delete table", DeleteTable{}),
     };
   };
@@ -684,7 +689,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         MenuSection{},
         command_item("Increase list indent", IndentList{}),
         command_item("Decrease list indent", OutdentList{}),
-        MenuItem("Remove numbering", [run, ordered_list] { run(ordered_list); }),
+        MenuItem("Remove numbering", [run, ordered_list] { run(ordered_list); }).Enabled(ordered_state.enabled),
     };
   };
   const auto open_image_size = [editor, dialog] {
@@ -702,15 +707,15 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       run(insert_table);
     }
   });
-  const auto list_tool = menu_tool(numbered_list, list_label, list_anchor,
-                                   ordered_state.enabled && (!in_numbered_list || list_start.has_value()),
-                                   in_numbered_list, [=] {
+  const CommandState numbering_state{
+      in_numbered_list ? list_start.has_value() : ordered_state.enabled, ordered_state.checked};
+  const auto list_tool = format_tool(numbered_list, list_label, numbering_state, [=] {
     if (in_numbered_list) {
       menu.Show(list_anchor, list_entries());
     } else {
       run(ordered_list);
     }
-  });
+  }).With(list_anchor);
   const auto padding = Padding(EdgeInsets::Symmetric(compact ? 5.0F : 12.0F, 5.0F));
   const auto background = Background(theme.colors.surface);
   const auto more_tool = menu_tool(more, compact && image_selected ? "Image actions" : "More formatting",
@@ -728,6 +733,9 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     }
     if (compact) {
       items.emplace_back(command_item("Redo", Redo{}));
+    }
+    if (!in_table && !in_code && editor.GetCommandState(continue_in_paragraph).enabled) {
+      items.emplace_back(command_item("Continue in plain paragraph", continue_in_paragraph));
     }
     items.emplace_back(MenuItem("Text formatting", {
         command_item("Strikethrough", ToggleMark{Mark::Strike}),
@@ -753,23 +761,30 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     menu.Show(more_anchor, std::move(items));
   });
 
+  const auto text_tool = [&](const char* title, const char* label, bool enabled, auto on_click) {
+    return Button(title).OnClick(std::move(on_click)).With(
+        tool_frame,
+        Padding(EdgeInsets::Symmetric(8.0F, 6.0F)),
+        Enabled(available && enabled),
+        Background(Color::Transparent()),
+        Foreground(theme.colors.on_surface),
+        Semantics{.label = label}
+    );
+  };
+  const auto text_command = [&](const char* title, const char* label, EditorCommand command) {
+    return text_tool(title, label, editor.GetCommandState(command).enabled,
+                     [run, command] { run(command); });
+  };
+  const auto continue_below = in_table || in_code
+      ? text_command("Continue below", in_table ? "Continue below table" : "Continue below code block",
+                     continue_in_paragraph)
+      : View{};
   if (compact) {
-    const auto text_tool = [&](const char* title, const char* label, bool enabled, auto on_click) {
-      return Button(title).OnClick(std::move(on_click)).With(
-          tool_frame,
-          Padding(EdgeInsets::Symmetric(8.0F, 6.0F)),
-          Enabled(available && enabled),
-          Background(Color::Transparent()),
-          Foreground(theme.colors.on_surface),
-          Semantics{.label = label}
-      );
-    };
-    const auto text_command = [&](const char* title, const char* label, EditorCommand command) {
-      return text_tool(title, label, editor.GetCommandState(command).enabled,
-                       [run, command] { run(command); });
-    };
     const ToggleList unordered_list{ListKind::Unordered};
-    const bool in_bulleted_list = editor.GetCommandState(unordered_list).checked == CheckState::On;
+    const auto unordered_state = editor.GetCommandState(unordered_list);
+    const bool show_numbered = ordered_state.checked.value_or(CheckState::Off) != CheckState::Off;
+    const bool show_bulleted = unordered_state.checked.value_or(CheckState::Off) != CheckState::Off;
+    const bool show_list = show_numbered || show_bulleted;
     const bool in_quote = editor.GetCommandState(ToggleQuote{}).checked == CheckState::On;
     const bool can_link = editor.GetCommandState(SetLink{}).enabled;
     const char* context = "text";
@@ -784,6 +799,9 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       actions.Add(text_tool("Edit formula", "Edit formula", true, edit_formula));
       actions.Add(text_tool("Copy LaTeX", "Copy LaTeX", clipboard && clipboard->IsAvailable(), copy_formula));
     } else {
+      if (continue_below) {
+        actions.Add(continue_below);
+      }
       if (open_link) {
         actions.Add(open_link);
       }
@@ -792,10 +810,18 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         actions.Add(table_tool);
         actions.Add(text_command("+ Row", "Insert row below", InsertTableRow{}));
         actions.Add(text_command("+ Column", "Insert column after", InsertTableColumn{}));
-        actions.Add(text_command("Below", "Continue below table", ExitTable{}));
-      } else if (in_numbered_list || in_bulleted_list) {
-        context = in_numbered_list ? "numbered-list" : "bulleted-list";
-        actions.Add(in_numbered_list ? list_tool : tool(bulleted_list, "Bulleted list", unordered_list));
+      } else if (in_code) {
+        context = "code";
+      } else if (show_list) {
+        context = show_numbered && show_bulleted ? "mixed-list" : show_numbered ? "numbered-list" : "bulleted-list";
+        if (show_numbered) {
+          actions.Add(list_tool);
+        }
+        if (show_bulleted) {
+          actions.Add(format_tool(bulleted_list, "Bulleted list", unordered_state, [run, unordered_list] {
+            run(unordered_list);
+          }));
+        }
         actions.Add(tool(outdent, "Decrease list indent", OutdentList{}));
         actions.Add(tool(indent, "Increase list indent", IndentList{}));
       } else if (in_quote) {
@@ -804,17 +830,22 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       } else if (can_link) {
         context = "link";
         actions.Add(LinkTool(editor, focus, available, compact));
-      } else {
-        actions.Add(TextStylePicker(editor, focus, available, compact));
       }
-      actions.Add(tool(bold, "Bold", ToggleMark{Mark::Bold}));
-      actions.Add(tool(italic, "Italic", ToggleMark{Mark::Italic}));
-      actions.Add(tool(underline, "Underline", ToggleMark{Mark::Underline}));
-      if (can_link && (in_table || in_numbered_list || in_bulleted_list || in_quote)) {
+      const View text_style = in_table ? View{} : TextStylePicker(editor, focus, available, compact);
+      const bool style_first = in_code || (!show_list && !in_quote && !can_link);
+      if (text_style && style_first) {
+        actions.Add(text_style);
+      }
+      if (!in_code) {
+        actions.Add(tool(bold, "Bold", ToggleMark{Mark::Bold}));
+        actions.Add(tool(italic, "Italic", ToggleMark{Mark::Italic}));
+        actions.Add(tool(underline, "Underline", ToggleMark{Mark::Underline}));
+      }
+      if (can_link && (in_table || show_list || in_quote)) {
         actions.Add(LinkTool(editor, focus, available, compact));
       }
-      if (!in_table && (in_numbered_list || in_bulleted_list || in_quote || can_link)) {
-        actions.Add(TextStylePicker(editor, focus, available, compact));
+      if (text_style && !style_first) {
+        actions.Add(text_style);
       }
     }
 
@@ -864,6 +895,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   return ScrollView {
     Row {
       tool(undo, "Undo", Undo{}),
+      folio::IsMobilePlatform() ? continue_below : View{},
       open_link,
       tool(redo, "Redo", Redo{}),
       separator,

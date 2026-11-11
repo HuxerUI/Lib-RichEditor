@@ -47,6 +47,8 @@ Applications can implement `DocumentCodec` for another UTF-8 format. A custom co
 
 `OrderedListStart()` reads the starting number of the list at the caret or shared by the selected items. Execute `SetListStart{number}` to renumber that list in one undo step. Nested lists keep their own starting numbers. Tab indents list items when they have a preceding sibling, and Shift+Tab outdents them.
 
+An unmarked continuation inside a list item keeps its nesting, and Enter splits the continuation inside that item. Applying a list to those blocks creates a sublist. Applying or changing a list style can join adjacent groups of the same kind and spacing at the edit site, provided their existing numbers stay the same. Across list levels, the toolbar reports the selected styles and disables structural list commands. Removing a marker is available for a single text block when the parent retains its own marker and the edit keeps existing child groups together.
+
 ## Tables
 
 A top-level `Table` contains a rectangular grid of `TableRow` and `TableCell` blocks, up to 4096 cells per table. Each cell contains one paragraph with its own text, line breaks, inline marks, and links. The table's `table_has_header` flag gives the first row the header role.
@@ -97,6 +99,8 @@ Call `editor.RevealTextRange(block, range, ScrollAlignment::Center)` to center a
 `DefaultEditorShortcuts()` lists the configurable editor commands and their default aliases. Pass a shared immutable `EditorKeymap` as `RichEditorOptions::keymap` to supply the complete editor binding table. A null pointer uses the defaults and an empty map clears them. Replace the shared map in composition to apply changes without restarting the text-input session. Use `RichEditorController::Execute()` for the same editing commands from toolbar controls.
 
 Use Ctrl or Command with 0–6 for the paragraph and heading styles. Add Shift with T, R, or Backslash to insert a table, a row below, or a column after the current cell. The other table actions can be assigned in Folio's desktop **Keyboard** settings.
+
+Ctrl+Enter or Command+Enter runs `ContinueInParagraph{}`. It splits a top-level paragraph or heading at the caret and starts typing without marks. Inside a list, quote, table, or code block, it goes to the paragraph below the enclosing top-level block and inserts one if needed. The existing content retains its formatting.
 
 ## Code highlighting
 
@@ -205,4 +209,4 @@ To exercise tables, select a cell in the sample. The compact toolbar shows **+ R
 
 To exercise images, place the caret in a top-level paragraph and choose **Insert image** to select a PNG or JPEG. On compact screens, find it under **More formatting** → **Insert**. Selecting an image dismisses the software keyboard and shows **Size**, **Replace**, and **+ Image** on the compact toolbar. Drag a corner or open the size dialog to set the width or height and watch the other dimension update. Size the pair to fit on the same line and undo a resize. Choose **Save as…**, move the resulting subfolder, and open its document from the folder sidebar. A Markdown copy includes the referenced local attachments.
 
-Enter starts a new paragraph without carrying over pending inline formats. At the start of a list item's text, Enter creates an empty sibling above it and puts the caret in the new item. At the end of a parent item, Enter adds the next sibling after its sublist. Enter or Backspace on a trailing empty list item or quote paragraph exits that structure at the caret. In code and table cells Enter inserts a literal newline. Shift+Enter keeps the format on a break within a paragraph. Ctrl+Enter or Command+Enter leaves a code block by inserting a paragraph after it.
+Enter starts a new paragraph without carrying over pending inline formats. At the start of a list item's text, Enter creates an empty sibling above it and puts the caret in the new item. At the end of a parent item's leading text, Enter adds the next sibling after its sublist. With content still following an empty subitem in the parent, Enter leaves an unmarked continuation when it can preserve the parent's marker. Otherwise it removes the empty item and moves the caret to the next block, as Backspace does. Enter or Backspace on a trailing empty list item or quote paragraph exits that structure at the caret. In code and table cells, the keyboard's Enter key inserts a newline inside the block. On mobile, **Continue below** in the toolbar moves the caret to the following paragraph. Shift+Enter keeps the format on a break within a paragraph.

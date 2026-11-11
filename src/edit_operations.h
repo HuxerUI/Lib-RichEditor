@@ -26,7 +26,6 @@ struct EditResult {
 };
 
 bool CanEditTextRange(const RichDocument& document, TextRange range);
-EditResult InsertParagraphAtAtomicBlock(const RichDocument& document, TextOffset caret, EditChanges& edit);
 EditResult ReplaceText(const RichDocument& document, TextRange range, std::string_view text,
                        std::optional<Mark> marks, bool hard_break, EditChanges& edit);
 /// Checks that both endpoints belong to one paragraph or heading. Offsets use the flattened UTF-16 text.
@@ -54,12 +53,19 @@ RichDocument Format(const RichDocument& document, TextRange range, const EditorC
 std::optional<unsigned> ListStartAt(const RichDocument& document, TextRange range);
 CommandState ContainerStatus(const RichDocument& document, TextRange range, const EditorCommand& command);
 RichDocument ChangeContainer(const RichDocument& document, TextRange range, const EditorCommand& command, EditChanges& edit);
-/// Inserts an empty sibling before an item whose leading text is at the caret.
-std::optional<RichDocument> InsertListItemBefore(const RichDocument& document, const Leaf& leaf, EditChanges& edit);
-/// Places the paragraph created by Return in a sibling list item and relocates its flattened caret when needed.
-EditResult SplitListItem(EditResult result, EditChanges& edit);
-RichDocument ExitContainer(const RichDocument& document, TextOffset caret, bool empty_only, EditChanges& edit);
-EditResult ExitCodeBlock(const RichDocument& document, TextOffset caret, EditChanges& edit);
+/// Replaces the selection with a break, creating a sibling item when splitting a list item's leading text.
+EditResult BreakTextLine(const RichDocument& document, TextRange range, std::optional<Mark> marks,
+                         bool hard_break, EditChanges& edit);
+/// Handles Return on an empty block or Backspace at a leading block boundary.
+/// The caret must be at the start of the leaf identified by ordinal. For Return, the leaf is empty.
+/// Returns the resulting snapshot, including the original snapshot when a guarded unwrap consumes the key.
+/// An empty result lets the caller proceed with ordinary text editing.
+std::optional<RichDocument> ExitContainer(const RichDocument& document, std::size_t ordinal, bool empty_only,
+                                         EditChanges& edit);
+/// Checks that the selection is confined to a single text leaf.
+bool CanContinueInParagraph(const RichDocument& document, TextRange range);
+/// Splits top-level text or places the caret in a paragraph after its enclosing top-level block.
+RichDocument ContinueParagraph(const RichDocument& document, TextRange range, Selection& selection, EditChanges& edit);
 bool IsTableCommand(const EditorCommand& command);
 CommandState TableStatus(const RichDocument& document, TextRange range, const EditorCommand& command);
 RichDocument ChangeTable(const RichDocument& document, Selection& selection, const EditorCommand& command,

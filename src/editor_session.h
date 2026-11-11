@@ -67,9 +67,9 @@ public:
   bool Apply(std::span<const TextInputCommand> commands);
   bool Select(TextSelection selection);
   bool BreakLine(bool hard_break);
+  /// Reports whether a structural Backspace action consumed the key at the start of the block.
   bool BackspaceAtStart();
   bool AppendTableRow();
-  bool ExitCode();
   bool SetCodeLanguage(BlockId block, std::string_view language);
   void FinishComposition();
 

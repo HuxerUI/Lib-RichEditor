@@ -4,6 +4,7 @@
 #include <huxerui/testing/ui_test.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
@@ -483,6 +484,201 @@ void ListEditing() {
   ui.PressKey(Key::Enter);
   Check(controller->Document().Blocks()[0].Data().children.size() == 4, "Enter splits the list item");
   Check(controller->Execute(Undo{}) && controller->Document() == original.document, "Undo restores list split");
+
+  const auto mixed = *MarkdownCodec().Import(
+      "7. Parent\n   - First\n   - **Second**\n   - Third\n8. Following\n").document;
+  const auto& mixed_index = huxerui::richeditor::detail::DocumentAccess::Get(mixed).index;
+  const auto middle = mixed_index.At(2).start;
+  const auto first_bullet = mixed_index.At(1).start;
+  const auto last_bullet = mixed_index.At(3).start + 5;
+  for (const auto selection : {TextSelection{middle + 4, middle + 1}, TextSelection{last_bullet, first_bullet}}) {
+    controller->ReplaceDocument(mixed);
+    ui.Pump();
+    Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
+    Check(controller->GetCommandState(unordered).checked == CheckState::On && controller->Execute(unordered),
+          "Remove nested bullets from the selected child items");
+    const auto unwrapped = controller->Document();
+    const auto& outer = unwrapped.Blocks().front().Data();
+    Check(outer.ordered && outer.list_start == 7 && outer.children.size() == 2 &&
+              outer.children.back() == mixed.Blocks().front().Data().children.back() &&
+              controller->GetCommandState(ordered).checked == CheckState::Off &&
+              controller->GetCommandState(unordered).checked == CheckState::Off && !controller->OrderedListStart() &&
+              !controller->GetCommandState(OutdentList{}).enabled,
+          "The unmarked continuation keeps its parent and does not select the parent's numbering");
+    CheckDocumentIndex(unwrapped);
+    Check(controller->Execute(unordered) && controller->Document() == mixed,
+          "Reapplying bullets reunites the sublist without renumbering the outer list");
+    ui.Pump();
+    Check(ui.ActiveTextInput()->selection == selection &&
+              controller->GetCommandState(unordered).checked == CheckState::On,
+          "Restoring nested bullets preserves the directed selection and toolbar state");
+    Check(controller->Execute(Undo{}) && controller->Document() == unwrapped &&
+              controller->Execute(Redo{}) && controller->Document() == mixed,
+          "Unwrapping and wrapping preserve the original list through undo and redo");
+  }
+}
+
+void ListSelectionScope() {
+  const Application app(App, {.show_debug_overlay = false});
+  UiTest ui(app);
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  using huxerui::richeditor::detail::DocumentAccess;
+  const ToggleList ordered{ListKind::Ordered};
+  const ToggleList unordered{ListKind::Unordered};
+  const auto verify = [&](std::string_view markdown, std::size_t last, CheckState numbered, CheckState bulleted) {
+    const auto original = *MarkdownCodec().Import(markdown).document;
+    controller->ReplaceDocument(original);
+    ui.Pump();
+    const auto end = DocumentAccess::Get(original).index.At(last).start + 1;
+    const TextSelection selection{end, 1};
+    Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
+    Check(controller->GetCommandState(ordered).checked == numbered &&
+              controller->GetCommandState(unordered).checked == bulleted && !controller->OrderedListStart(),
+          "A cross-level selection reports its styles independently of the available list target");
+    for (const auto& command : std::array<EditorCommand, 5>{ordered, unordered, SetListStart{20},
+                                                           IndentList{}, OutdentList{}}) {
+      Check(!controller->GetCommandState(command).enabled && !controller->Execute(command),
+            "A structural list command cannot retarget a cross-level selection to its ancestor");
+    }
+    Check(controller->Document() == original && ui.ActiveTextInput()->selection == selection &&
+              !controller->GetCommandState(Undo{}).enabled,
+          "Unavailable commands leave the tree, selection, and history in place");
+    Check(controller->Execute(ToggleMark{Mark::Bold}) && controller->Execute(Undo{}) &&
+              controller->Document() == original,
+          "Text formatting remains available across list levels");
+  };
+  verify("7. Parent\n   - Child\n8. Tail\n", 1, CheckState::Mixed, CheckState::Mixed);
+  verify("7. Parent\n   - Child\n8. Tail\n", 2, CheckState::Mixed, CheckState::Mixed);
+  verify("7. Parent\n   1. Child\n8. Tail\n", 1, CheckState::On, CheckState::Off);
+}
+
+void ListMarkerOwnership() {
+  const Application app(App, {.show_debug_overlay = false});
+  UiTest ui(app);
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  using huxerui::richeditor::detail::BlockAt;
+  using huxerui::richeditor::detail::DocumentAccess;
+  const ToggleList numbered{ListKind::Ordered};
+  const ToggleList bulleted{ListKind::Unordered};
+  const auto verify = [&](std::string_view markdown, std::size_t ordinal, bool first_in_list) {
+    const auto imported = MarkdownCodec().Import(markdown).document;
+    Check(imported.has_value(), "The list fixture imports as strict Markdown");
+    const auto saved = JsonCodec().Export(*imported);
+    Check(saved.text.has_value(), "The list fixture can be saved as JSON");
+    const auto reopened = JsonCodec().Import(*saved.text).document;
+    Check(reopened == imported, "JSON preserves the original list ownership");
+    const auto leaf = DocumentAccess::Get(*reopened).index.At(ordinal);
+    const auto item_path = std::span(leaf.path).first(leaf.path.size() - 1);
+    const auto& item = BlockAt(*reopened, item_path);
+    controller->ReplaceDocument(*reopened);
+    ui.Pump();
+    const TextSelection selection{leaf.start + 2, leaf.start + 1};
+    Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
+    const auto state = controller->GetCommandState(bulleted);
+    Check(state.checked == CheckState::On && !state.enabled && !controller->Execute(bulleted) &&
+              controller->GetCommandState(numbered).checked == CheckState::Off && !controller->OrderedListStart() &&
+              controller->Document() == reopened && ui.ActiveTextInput()->selection == selection,
+          "A marker that cannot be removed safely stays checked without claiming an ancestor list");
+
+    if (first_in_list) {
+      const TextSelection start{leaf.start, leaf.start};
+      Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = start}});
+      ui.PressKey(Key::Backspace);
+      Accept(ui, {{.kind = TextInputCommandKind::DeleteSurrounding, .delete_before = 1}});
+      Check(controller->Document() == reopened && ui.ActiveTextInput()->selection == start &&
+                !controller->GetCommandState(Undo{}).enabled,
+            "Hardware and IME Backspace cannot unwrap a protected first item or fall through to a text join");
+    }
+
+    const auto before_conversion = ui.ActiveTextInput()->selection;
+    Check(controller->Execute(numbered), "Changing kind remains available for a protected item");
+    const auto converted = controller->Document();
+    const auto changed_leaf = DocumentAccess::Get(converted).index.At(ordinal);
+    const auto changed_item_path = std::span(changed_leaf.path).first(changed_leaf.path.size() - 1);
+    Check(DocumentAccess::SameBlock(BlockAt(converted, changed_item_path), item) &&
+              controller->OrderedListStart() == 1 && controller->GetCommandState(SetListStart{7}).enabled &&
+              !controller->GetCommandState(numbered).enabled,
+          "Changing kind keeps the whole item together and enables numbering independently of removal");
+    CheckDocumentIndex(converted);
+    Check(controller->Execute(Undo{}) && controller->Document() == reopened &&
+              controller->Execute(Redo{}) && controller->Document() == converted,
+          "Undo and redo restore the tree around a protected item");
+    ui.Pump();
+    Check(ui.ActiveTextInput()->selection == before_conversion, "Changing kind preserves the directed selection");
+  };
+  verify("7. - Child\n8. Tail\n", 0, true);
+  verify("7. Parent\n   - Alpha\n   - Child\n     - Grandchild\n   - Omega\n8. Tail\n", 2, false);
+  verify("Intro\n\n- Child\n\n  Continuation\n", 1, true);
+}
+
+void ListNumbering() {
+  const Application app(App, {.show_debug_overlay = false});
+  UiTest ui(app);
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  using huxerui::richeditor::detail::DocumentAccess;
+  const ToggleList numbered{ListKind::Ordered};
+  const ToggleList bulleted{ListKind::Unordered};
+  const auto select = [&](const RichDocument& document, std::size_t ordinal) {
+    controller->ReplaceDocument(document);
+    ui.Pump();
+    const auto start = DocumentAccess::Get(document).index.At(ordinal).start;
+    const TextSelection selection{start + 2, start + 1};
+    Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
+    return selection;
+  };
+  const auto original = *MarkdownCodec().Import("7. Alpha\n8. Beta\n9. Gamma\n").document;
+  for (const auto ordinal : {0u, 1u, 2u}) {
+    const auto selection = select(original, ordinal);
+    Check(controller->Execute(numbered), "Remove numbering from one item");
+    const auto unwrapped = controller->Document();
+    Check((ordinal == 0 || unwrapped.Blocks().front().Data().list_start == 7) &&
+              (ordinal == 2 || unwrapped.Blocks().back().Data().list_start == 8 + ordinal),
+          "Removing one marker preserves the displayed ordinals of its neighbors");
+    Check(controller->Execute(numbered) && controller->Document() == original,
+          "Reapplying numbering joins the compatible fragments and restores the ordinal");
+    CheckDocumentIndex(controller->Document());
+    Check(controller->Execute(Undo{}) && DocumentAccess::Same(controller->Document(), unwrapped) &&
+              controller->Execute(Redo{}) && controller->Document() == original,
+          "Undo restores the split and redo rejoins it in one edit");
+    ui.Pump();
+    Check(ui.ActiveTextInput()->selection == selection, "Local rejoining preserves the directed selection");
+  }
+  select(original, 1);
+  Check(controller->Execute(bulleted) && controller->Execute(numbered) && controller->Document() == original,
+        "Converting the middle item back to numbered uses the same local continuation rule");
+
+  const auto nested = *MarkdownCodec().Import(
+      "- Parent\n\n  0. Alpha\n  1. Beta\n  2. Gamma\n\n- Next\n").document;
+  select(nested, 1);
+  Check(controller->OrderedListStart() == 0 && controller->Execute(numbered) &&
+            controller->Execute(numbered) && controller->Document() == nested,
+        "Prepending to the remaining sublist restores a valid start at zero");
+  CheckDocumentIndex(controller->Document());
+  const auto json = JsonCodec().Export(controller->Document());
+  const auto markdown = MarkdownCodec().Export(controller->Document());
+  Check(json.text && JsonCodec().Import(*json.text).document == nested &&
+            markdown.text && MarkdownCodec().Import(*markdown.text).document == nested,
+        "A restored numbered sublist round-trips through JSON and strict Markdown");
+
+  const auto groups = *MarkdownCodec().Import("7. Alpha\n\nGap\n\n1. Restart\n\n- Delta\n\n+ Epsilon\n").document;
+  select(groups, 1);
+  Check(controller->Execute(numbered), "Wrap text between independent list groups");
+  const auto joined = controller->Document();
+  Check(joined.Blocks().size() == 4 && joined.Blocks()[0].Data().list_start == 7 &&
+            joined.Blocks()[0].Data().children.size() == 2 &&
+            DocumentAccess::SameBlock(joined.Blocks()[1], groups.Blocks()[2]) &&
+            DocumentAccess::SameBlock(joined.Blocks()[2], groups.Blocks()[3]) &&
+            DocumentAccess::SameBlock(joined.Blocks()[3], groups.Blocks()[4]),
+        "The edit extends the preceding group and preserves the restarted and unrelated groups");
+
+  const auto spacing = *MarkdownCodec().Import("- Tight\n\nGap\n\n- Loose\n\n- Spacing\n").document;
+  Check(spacing.Blocks().size() == 3 && spacing.Blocks()[0].Data().tight && !spacing.Blocks()[2].Data().tight,
+        "The neighboring groups have different list spacing");
+  select(spacing, 1);
+  Check(controller->Execute(bulleted) && controller->Document().Blocks().size() == 2 &&
+            controller->Document().Blocks()[0].Data().children.size() == 2 &&
+            DocumentAccess::SameBlock(controller->Document().Blocks()[1], spacing.Blocks()[2]),
+        "Local wrapping preserves the separate group with different spacing");
 }
 
 void DeleteSurrounding() {
@@ -529,6 +725,46 @@ void LineEditing() {
   Check(soft_break.Blocks().size() == 1 && soft_break.Blocks()[0].Data().text == "Line\ncontinued" &&
             soft_break.Blocks()[0].Data().marks == std::vector<MarkRange>{{{0, 14}, Mark::Bold}},
         "Shift+Return keeps the inline format within the same paragraph");
+
+  replace("# **Title**", 2);
+  const auto before_plain_break = controller->Document();
+  ui.PressKey(Key::Enter, {.meta = true});
+  const auto plain_break = controller->Document();
+  Check(plain_break.Blocks().size() == 2 && plain_break.Blocks()[0].Data().kind == BlockKind::Heading &&
+            plain_break.Blocks()[0].Data().text == "Ti" && plain_break.Blocks()[1].Data().kind == BlockKind::Paragraph &&
+            plain_break.Blocks()[1].Data().text == "tle" &&
+            plain_break.Blocks()[1].Data().marks == std::vector<MarkRange>{{{0, 3}, Mark::Bold}} &&
+            ui.ActiveTextInput()->selection == TextSelection{3, 3} &&
+            controller->GetCommandState(bold).checked == CheckState::Off,
+        "Command+Enter splits a heading and preserves the existing suffix formatting");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "中文"}});
+  Check(controller->Document().Blocks()[1].Data().text == "中文tle" &&
+            controller->Document().Blocks()[1].Data().marks == std::vector<MarkRange>{{{2, 5}, Mark::Bold}},
+        "Typing after a plain break does not inherit the suffix's marks");
+  Check(controller->Execute(Undo{}) && controller->Document() == plain_break &&
+            controller->Execute(Undo{}) && controller->Document() == before_plain_break,
+        "The plain break and subsequent typing are separate undoable edits");
+
+  replace("7. Parent\n   - Child\n8. Next\n\n**After**", 8);
+  const auto before_continue = controller->Document();
+  const auto after_start = huxerui::richeditor::detail::DocumentAccess::Get(before_continue).index.At(3).start;
+  ui.PressKey(Key::Enter, {.control = true});
+  Check(controller->Document() == before_continue &&
+            ui.ActiveTextInput()->selection == TextSelection{after_start, after_start} &&
+            controller->GetCommandState(bold).checked == CheckState::Off,
+        "Ctrl+Enter exits the outer list to the following paragraph without moving any items");
+
+  replace("> Quote\n\n# Next", 2);
+  const auto before_quote_exit = controller->Document();
+  Check(controller->Execute(ContinueInParagraph{}), "Continue out of a quote through the editor command");
+  ui.Pump();
+  const auto quote_exit = controller->Document();
+  Check(quote_exit.Blocks().size() == 3 && quote_exit.Blocks()[0] == before_quote_exit.Blocks()[0] &&
+            quote_exit.Blocks()[1].Data().kind == BlockKind::Paragraph && quote_exit.Blocks()[1].Data().text.empty() &&
+            quote_exit.Blocks()[2] == before_quote_exit.Blocks()[1] &&
+            ui.ActiveTextInput()->selection == TextSelection{6, 6} &&
+            controller->Execute(Undo{}) && controller->Document() == before_quote_exit,
+        "A new paragraph below a quote preserves the quote and is undone in one step");
 
   replace("3. Item", 4);
   Accept(ui, {{.kind = TextInputCommandKind::CommitText, .selection_after = TextSelection{5, 5}, .text = "\n"}});
@@ -592,6 +828,17 @@ void LineEditing() {
   ui.PressKey(Key::Enter);
   check_inserted_bullet();
   const auto with_empty_bullet = controller->Document();
+  ui.PressKey(Key::Enter);
+  const auto with_continuation = controller->Document();
+  const auto& items = with_continuation.Blocks()[0].Data().children;
+  const auto& children = items[0].Data().children;
+  Check(items.size() == 2 && children.size() == 3 &&
+            children[1].Data().kind == BlockKind::Paragraph && children[1].Data().text.empty() &&
+            children[2] == original_list && ui.ActiveTextInput()->selection == TextSelection{5, 5},
+        "Enter removes the empty subitem's marker and leaves its siblings under their original parent");
+  Check(controller->Execute(Undo{}) && controller->Document() == with_empty_bullet,
+        "Undo restores the empty subitem with its marker");
+  ui.Pump();
   ui.PressKey(Key::Backspace);
   check_removed_bullet();
   Check(controller->Execute(Undo{}) && controller->Document() == with_empty_bullet &&
@@ -609,6 +856,26 @@ void LineEditing() {
   Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "First"}});
   Check(controller->Document().Blocks()[0].Data().children[0].Data().children[1].Data().children[0]
             .Data().children[0].Data().text == "First", "Typing fills the inserted bullet");
+
+  replace("3. Item\n   - First\n   - Second\n   - Third\n4. Tail\n", 17);
+  const ToggleList bulleted{ListKind::Unordered};
+  Check(controller->Execute(bulleted), "Unwrap a child item as a continuation");
+  const auto before_continuation_break = controller->Document();
+  ui.Pump();
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .selection_after = TextSelection{18, 18}, .text = "\n"}});
+  const auto continuation_break = controller->Document();
+  const auto& siblings = continuation_break.Blocks()[0].Data().children;
+  const auto& continuation = siblings[0].Data().children;
+  Check(siblings.size() == 2 && continuation.size() == 5 && continuation[2].Data().text == "Second" &&
+            continuation[3].Data().kind == BlockKind::Paragraph && continuation[3].Data().text.empty() &&
+            continuation[4] == before_continuation_break.Blocks()[0].Data().children[0].Data().children[3] &&
+            ui.ActiveTextInput()->selection == TextSelection{18, 18} &&
+            controller->GetCommandState(ToggleList{ListKind::Ordered}).checked == CheckState::Off,
+        "IME Return splits the continuation inside its existing list item");
+  CheckDocumentIndex(continuation_break);
+  Check(controller->Execute(Undo{}) && controller->Document() == before_continuation_break &&
+            controller->Execute(Redo{}) && controller->Document() == continuation_break,
+        "Undo and redo restore a continuation break without introducing another list item");
 
   replace("3. Alpha beta\n   - Bullet\n4. Tail\n", 6);
   const auto before_join = controller->Document();
@@ -670,6 +937,81 @@ void LineEditing() {
         "Backspace at the start of a heading removes the heading style in place");
 }
 
+void NestedEmptyListEditing() {
+  const Application app(App, {.show_debug_overlay = false});
+  UiTest ui(app);
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  using huxerui::richeditor::detail::DocumentAccess;
+  const auto select = [&](const RichDocument& document, std::size_t ordinal, bool at_end) {
+    controller->ReplaceDocument(document);
+    ui.Pump();
+    const auto leaf = DocumentAccess::Get(document).index.At(ordinal);
+    const auto offset = leaf.start + (at_end ? DocumentAccess::Body(leaf.block).Length() : 0);
+    Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{offset, offset}}});
+    return offset;
+  };
+
+  const auto original = *MarkdownCodec().Import("7. Parent\n\n   - 中文🙂\n\n   Continuation\n8. Tail\n").document;
+  const auto offset = select(original, 1, true) + 1;
+  const TextSelection empty_item_caret{offset, offset};
+  ui.PressKey(Key::Enter);
+  const auto with_empty_item = controller->Document();
+  Check(ui.ActiveTextInput()->selection == empty_item_caret, "Return creates an empty subitem before the continuation");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText,
+               .selection_after = TextSelection{offset + 1, offset + 1}, .text = "\n"}});
+  const auto with_empty_continuation = controller->Document();
+  const auto& outer = with_empty_continuation.Blocks().front().Data();
+  const auto& original_outer = original.Blocks().front().Data();
+  const auto& children = outer.children.front().Data().children;
+  const auto& original_children = original_outer.children.front().Data().children;
+  Check(outer.list_start == 7 && outer.children.size() == 2 &&
+            DocumentAccess::SameBlock(outer.children.back(), original_outer.children.back()) &&
+            children.size() == 4 && children[1] == original_children[1] &&
+            children[2].Data().kind == BlockKind::Paragraph && children[2].Data().text.empty() &&
+            DocumentAccess::SameBlock(children[3], original_children[2]) &&
+            ui.ActiveTextInput()->selection == empty_item_caret &&
+            controller->GetCommandState(ToggleList{ListKind::Ordered}).checked == CheckState::Off,
+        "IME Return removes the marker in place and keeps the parent's continuation and numbering");
+  CheckDocumentIndex(with_empty_continuation);
+  const auto saved = JsonCodec().Export(with_empty_continuation);
+  Check(saved.text && JsonCodec().Import(*saved.text).document == with_empty_continuation,
+        "JSON round-trips the empty continuation in its original parent");
+  Check(controller->Execute(Undo{}) && controller->Document() == with_empty_item &&
+            controller->Execute(Redo{}) && controller->Document() == with_empty_continuation &&
+            controller->Execute(Undo{}) && controller->Document() == with_empty_item,
+        "The change from an empty subitem to a continuation is one undoable edit");
+  ui.Pump();
+  ui.PressKey(Key::Backspace);
+  Check(controller->Document() == original && ui.ActiveTextInput()->selection == empty_item_caret &&
+            DocumentAccess::SameBlock(DocumentAccess::Get(controller->Document()).index.At(2).block, original_children[2]),
+        "Backspace deletes the empty subitem and places the caret in the following block of the parent");
+  CheckDocumentIndex(controller->Document());
+  const auto exported = MarkdownCodec().Export(controller->Document());
+  Check(exported.text && MarkdownCodec().Import(*exported.text).document == original,
+        "The list restored by Backspace round-trips through strict Markdown");
+
+  const auto without_lead = *MarkdownCodec().Import("7. - Child\n8. Tail\n").document;
+  select(without_lead, 0, false);
+  ui.PressKey(Key::Enter);
+  const auto with_first_empty = controller->Document();
+  ui.PressKey(Key::Enter);
+  Check(controller->Document() == without_lead && ui.ActiveTextInput()->selection == TextSelection{0, 0} &&
+            controller->GetCommandState(ToggleList{ListKind::Unordered}).checked == CheckState::On &&
+            controller->Execute(Undo{}) && controller->Document() == with_first_empty,
+        "An empty first child is removed instead of becoming the numbered parent's lead");
+
+  const auto at_tail = *MarkdownCodec().Import("7. Parent\n   - Child\n8. Tail\n").document;
+  select(at_tail, 1, true);
+  ui.PressKey(Key::Enter);
+  ui.PressKey(Key::Enter);
+  const auto outdented = controller->Document();
+  const auto& items = outdented.Blocks().front().Data().children;
+  Check(items.size() == 3 && items[0] == at_tail.Blocks().front().Data().children[0] &&
+            items[1].Data().children.front().Data().text.empty() &&
+            items[2] == at_tail.Blocks().front().Data().children[1],
+        "Return at the end of the parent still outdents an empty subitem by one level");
+}
+
 void CodeEditing() {
   const Application app(App, {.show_debug_overlay = false});
   UiTest ui(app);
@@ -680,6 +1022,9 @@ void CodeEditing() {
   ui.PressKey(Key::Enter);
   Check(controller->Document().Blocks().size() == 1 &&
             controller->Document().Blocks()[0].Data().text == "\ncode", "Enter inserts a literal code newline");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "\n"}});
+  Check(controller->Document().Blocks().size() == 1 &&
+            controller->Document().Blocks()[0].Data().text == "\n\ncode", "IME Return inserts a newline in code");
   const auto code = controller->Document();
   ui.PressKey(Key::Enter, {.control = true});
   Check(controller->Document().Blocks().size() == 2 &&
@@ -1027,9 +1372,12 @@ void TableEditing() {
   Check(controller->Execute(Undo{}) && controller->Document() == formatted, "Undo restores the header");
   ui.Pump();
   ui.PressKey(Key::Enter);
-  const auto broken = controller->Document();
-  Check(cell(broken, 0, 0).text == "\nA" && broken.Blocks().size() == 1,
+  Check(cell(controller->Document(), 0, 0).text == "\nA" && controller->Document().Blocks().size() == 1,
         "Enter keeps the line break inside the cell");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "\n"}});
+  const auto broken = controller->Document();
+  Check(cell(broken, 0, 0).text == "\n\nA" && broken.Blocks().size() == 1,
+        "IME Return inserts a newline in the current cell");
   ui.PressKey(Key::Enter, {.control = true});
   Check(controller->Document().Blocks().size() == 2 && controller->Execute(Undo{}) &&
             controller->Document() == broken,
@@ -1810,9 +2158,17 @@ int main() {
     controller.reset();
     ListEditing();
     controller.reset();
+    ListSelectionScope();
+    controller.reset();
+    ListMarkerOwnership();
+    controller.reset();
+    ListNumbering();
+    controller.reset();
     DeleteSurrounding();
     controller.reset();
     LineEditing();
+    controller.reset();
+    NestedEmptyListEditing();
     controller.reset();
     CodeEditing();
     controller.reset();

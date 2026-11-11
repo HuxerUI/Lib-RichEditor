@@ -27,6 +27,11 @@ inline bool IsLeaf(BlockKind kind) {
   return IsTextBlock(kind) || IsAtomicBlock(kind);
 }
 
+/// Tests whether a path follows first children toward a container's first leaf.
+inline bool IsLeadingPath(std::span<const std::size_t> path) {
+  return std::ranges::all_of(path, [](std::size_t index) { return index == 0; });
+}
+
 inline bool ValidTableSize(std::size_t rows, std::size_t columns) {
   return columns != 0 && rows != 0 && rows <= max_table_cells / columns;
 }

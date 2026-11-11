@@ -11,9 +11,9 @@ namespace folio {
 namespace {
 
 #if defined(__APPLE__)
-constexpr auto table_exit_shortcut = "⌘ + Enter";
+constexpr auto plain_paragraph_shortcut = "⌘ + Enter";
 #else
-constexpr auto table_exit_shortcut = "Ctrl + Enter";
+constexpr auto plain_paragraph_shortcut = "Ctrl + Enter";
 #endif
 
 struct ShortcutDraft {
@@ -202,12 +202,12 @@ View KeyboardSettings() {
     Divider(),
     ShortcutHeading("Editor", theme),
     ShortcutRows(theme, dialog, overrides, "Editor"),
+    fixed_key("Continue in plain paragraph", plain_paragraph_shortcut),
     Divider(),
     ShortcutHeading("Table", theme),
     ShortcutRows(theme, dialog, overrides, "Table"),
     fixed_key("Next cell or new row", "Tab"),
     fixed_key("Previous cell", "Shift + Tab"),
-    fixed_key("Continue below table", table_exit_shortcut),
     Divider(),
     ShortcutHeading("Find controls", theme),
     fixed_key("Next match", "Enter"),

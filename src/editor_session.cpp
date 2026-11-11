@@ -42,15 +42,18 @@ bool ExitBlockAtCaret(Draft& draft, bool empty_only) {
     return false;
   }
   auto document = data.kind == BlockKind::Heading
-      ? Format(edit.document, range, SetBlockKind{BlockKind::Paragraph}, false, draft.changes)
-      : ExitContainer(edit.document, range.start, empty_only, draft.changes);
-  if (DocumentAccess::Same(edit.document, document) &&
-      (empty_only || data.kind != BlockKind::Paragraph || !data.text.empty() ||
-       edit.pending.value_or(Mark::None) == Mark::None)) {
+      ? std::optional(Format(edit.document, range, SetBlockKind{BlockKind::Paragraph}, false, draft.changes))
+      : ExitContainer(edit.document, leaf.ordinal, empty_only, draft.changes);
+  if (document) {
+    if (DocumentAccess::Same(edit.document, *document)) {
+      return true;
+    }
+    edit.document = std::move(*document);
+    SetSelection(edit, selection, false);
+  } else if (empty_only || data.kind != BlockKind::Paragraph || !data.text.empty() ||
+             edit.pending.value_or(Mark::None) == Mark::None) {
     return false;
   }
-  edit.document = std::move(document);
-  SetSelection(edit, selection, false);
   edit.pending.reset();
   return true;
 }
@@ -61,25 +64,11 @@ void InsertLineBreak(Draft& draft, bool hard_break) {
   }
   auto& edit = draft.edit;
   const auto selected = Offsets(edit).Range();
-  const auto& index = DocumentAccess::Get(edit.document).index;
-  const auto leaf = index.AtOffset(selected.start);
-  const auto kind = leaf.block.Data().kind;
-  if (!hard_break && kind != BlockKind::CodeBlock && selected.IsCollapsed() && selected.start == leaf.start) {
-    if (auto inserted = InsertListItemBefore(edit.document, index.At(leaf.ordinal), draft.changes)) {
-      edit.document = std::move(*inserted);
-      SetSelection(edit, {selected.start, selected.start}, true);
-      return;
-    }
-  }
-  auto result = selected.IsCollapsed() && IsAtomicBlock(kind)
-      ? InsertParagraphAtAtomicBlock(edit.document, selected.start, draft.changes)
-      : ReplaceText(edit.document, selected, "\n", edit.pending, hard_break, draft.changes);
-  if (!hard_break && kind != BlockKind::CodeBlock) {
-    result = SplitListItem(std::move(result), draft.changes);
-  }
+  const auto block = DocumentAccess::Id(DocumentAccess::Get(edit.document).index.AtOffset(selected.start).block);
+  auto result = BreakTextLine(edit.document, selected, edit.pending, hard_break, draft.changes);
   edit.document = std::move(result.document);
   SetSelection(edit, {result.caret, result.caret}, false);
-  if (edit.selection.active.block != DocumentAccess::Id(leaf.block)) {
+  if (edit.selection.active.block != block) {
     edit.pending.reset();
   }
 }
@@ -439,7 +428,11 @@ bool EditorSession::BreakLine(bool hard_break) {
 bool EditorSession::BackspaceAtStart() {
   auto next = draft_;
   try {
-    return ExitBlockAtCaret(next, false) && Publish(std::move(next), true);
+    if (!ExitBlockAtCaret(next, false)) {
+      return false;
+    }
+    Publish(std::move(next), true);
+    return true;
   } catch (const std::invalid_argument&) {
     return false;
   }
@@ -453,21 +446,6 @@ bool EditorSession::AppendTableRow() {
   auto next = draft_;
   next.edit.document = ChangeTable(next.edit.document, next.edit.selection, insert, next.changes, true);
   next.edit.pending.reset();
-  return Publish(std::move(next), true);
-}
-
-bool EditorSession::ExitCode() {
-  const auto selection = SelectionOffsets();
-  if (!selection.IsCollapsed() || draft_.composition) {
-    return false;
-  }
-  auto next = draft_;
-  auto result = ExitCodeBlock(next.edit.document, selection.active, next.changes);
-  if (DocumentAccess::Same(result.document, next.edit.document)) {
-    return false;
-  }
-  next.edit.document = std::move(result.document);
-  SetSelection(next.edit, {result.caret, result.caret}, true);
   return Publish(std::move(next), true);
 }
 
@@ -592,6 +570,9 @@ CommandState EditorSession::CommandStatus(const EditorCommand& command) const {
   if (std::holds_alternative<Redo>(command)) {
     return {!draft_.composition && !redo_.empty()};
   }
+  if (std::holds_alternative<ContinueInParagraph>(command)) {
+    return {!draft_.composition && CanContinueInParagraph(document, range)};
+  }
   if (IsTableCommand(command)) {
     auto state = TableStatus(document, range, command);
     state.enabled = state.enabled && !draft_.composition;
@@ -666,6 +647,9 @@ bool EditorSession::Execute(const EditorCommand& command) {
       const auto value = next.edit.pending.value_or(MarksAt(next.edit.document, range.start));
       next.edit.pending = status.checked == CheckState::On ? Without(value, mark->mark) : value | mark->mark;
     } else if (std::holds_alternative<ClearFormatting>(command) && range.IsCollapsed()) {
+      next.edit.pending = Mark::None;
+    } else if (std::holds_alternative<ContinueInParagraph>(command)) {
+      next.edit.document = ContinueParagraph(next.edit.document, range, next.edit.selection, next.changes);
       next.edit.pending = Mark::None;
     } else if (std::holds_alternative<ToggleMark>(command) || std::holds_alternative<SetLink>(command) ||
                std::holds_alternative<ClearFormatting>(command) || std::holds_alternative<SetBlockKind>(command)) {

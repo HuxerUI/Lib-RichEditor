@@ -77,14 +77,19 @@ enum class ListKind {
 
 /// @brief Wraps the affected blocks in a list or changes the selected items of an existing list.
 ///
-/// If the selected items already belong to a list of the requested kind, the command unwraps those items.
+/// If the requested kind is already active, selected items can be unwrapped when each holds one text
+/// block and the unwrapped text does not become the lead of an enclosing item. Changing kind keeps
+/// each item's blocks together.
+/// A selection limited to unmarked continuation blocks within one item can form a nested list.
+/// GetCommandState() reports the applied style independently of whether the selected blocks or sibling
+/// items can be edited as one group. A selection crossing list levels can have a check state while disabled.
 struct ToggleList {
   /// Style to apply, or to toggle off when the selected items already use it.
   ListKind kind;
 };
 
-/// @brief Changes the first number of the ordered list containing the caret or selection.
-/// Targets the innermost list shared by the selection. The items and selection are preserved in one undoable edit.
+/// @brief Changes the first number of the ordered list targeted by the current list selection.
+/// Targets the same list as ToggleList. The items and selection are preserved in one undoable edit.
 struct SetListStart {
   /// Ordinal of the first item. Following items count up from this value. Zero is valid.
   unsigned start = 1;
@@ -94,7 +99,7 @@ struct SetListStart {
 struct ToggleQuote {};
 
 /// @brief Nests the selected list items under their preceding sibling.
-/// The selected items must share a list and have a preceding item.
+/// The selection must target consecutive items in one list level and have a preceding item.
 struct IndentList {};
 
 /// @brief Moves selected items from a nested list up one level or unwraps them at the outermost list level.
@@ -147,6 +152,15 @@ struct DeleteTable {};
 /// @brief Moves the caret to a paragraph after the current table.
 /// If the next block is not a paragraph, inserts an empty paragraph as one undoable edit.
 struct ExitTable {};
+
+/// @brief Continues typing with plain text at the current location or below the enclosing block.
+///
+/// In a top-level paragraph or heading, replaces the selection with a paragraph break and keeps the
+/// existing formatting of the text on either side. In a list, quote, table, or code block, moves to the
+/// paragraph after the enclosing top-level block, inserting one if needed. New typing starts without marks.
+/// Requires a caret or selection within one text block, outside IME preedit. Ctrl+Enter and Command+Enter
+/// invoke this command when the editor owns focus, except when activating a selected inline object.
+struct ContinueInParagraph {};
 
 /// @brief Inserts a top-level image at a paragraph caret or next to another image.
 /// A paragraph split preserves the text and formatting on both sides. The caret moves after the image.
@@ -240,7 +254,7 @@ using EditorCommand = std::variant<ToggleMark, ClearFormatting, SetLink, SetBloc
                                    InsertTableColumn, DeleteTableRow, DeleteTableColumn, ToggleTableHeader,
                                    DeleteTable, ExitTable, InsertImage, ReplaceImage, DeleteImage, ResizeImage,
                                    SetListStart, InsertCustomBlock, ReplaceCustomBlock, InsertInlineObject,
-                                   ReplaceInlineObject, InsertFragment>;
+                                   ReplaceInlineObject, InsertFragment, ContinueInParagraph>;
 
 /// @brief A portable key and its complete modifier state.
 ///
@@ -361,7 +375,7 @@ public:
 
   /// @brief Reads the first ordinal of the list targeted by SetListStart.
   /// Calls in composition observe selection and editing changes.
-  /// @return An empty value during IME preedit or when the selection has no shared ordered list.
+  /// @return An empty value during IME preedit or when the selection does not target items in one ordered list.
   std::optional<unsigned> OrderedListStart() const;
 
   /// @brief Reads the dimensions of the selected image for an application resize control.

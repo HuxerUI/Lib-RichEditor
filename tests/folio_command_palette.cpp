@@ -63,6 +63,33 @@ void WebUrls() {
         "Attachment discovery uses the same HTTP and HTTPS policy as browser links");
 }
 
+[[huxerui::composable]]
+View NestedCodeFixture() {
+  using namespace huxerui::richeditor;
+  const auto document = MarkdownCodec().Import(
+      "> ~~~cpp\n> quoted\n> ~~~\n\n- ~~~cpp\n  listed\n  ~~~\n").document;
+  Check(document && document->Blocks().size() == 2 && document->Blocks()[0].Data().kind == BlockKind::Quote &&
+            document->Blocks()[1].Data().kind == BlockKind::List,
+        "The fixture has a quote and a list enclosing the code blocks");
+  const auto editor = UseRichEditor(*document);
+  return folio::EditorPane(editor, {.find = UseState(folio::FindPanelState{}), .focus = UseViewHandle(),
+                                   .active = true, .available = true, .can_pick_images = false});
+}
+
+void CompactCodeTools(const char* package_path) {
+  const Application app(NestedCodeFixture, {
+      .show_debug_overlay = false,
+      .application_hooks = {folio::InstallFolio},
+      .window_hooks = {folio::InstallWorkbench},
+  });
+  UiTest ui(app, {.viewport = {360, 640}, .resource_provider = std::make_shared<PackageResources>(package_path)});
+  const auto style = ui.FindSemantics(UiSemanticSelector::Label("Text style, Code block"));
+  Check(style.Count() == 1, "A quoted code block has one compact text style picker");
+  ui.Find(UiSelector::Key("editor")).Tap();
+  Send(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{7, 7}}});
+  Check(style.Count() == 1, "A code block in a list has one compact text style picker");
+}
+
 void PaletteFlow(const char* package_path) {
   const Application app(App, {
       .show_debug_overlay = false,
@@ -189,6 +216,61 @@ void PaletteFlow(const char* package_path) {
   ui.PressKey(Key::Escape);
   wait_for_close();
 
+  const auto compact_continue = [&](const char* label, std::string_view text) {
+    const auto action = ui.FindSemantics(UiSemanticSelector::Label(label));
+    Check(action.Exists() && action.One().enabled, "The compact toolbar offers a way to continue below the block");
+    Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = std::string(text)},
+              {.kind = TextInputCommandKind::CommitText, .text = "\n"}});
+    const auto before = by_id("article-editor").One().value;
+    tap_semantic(action);
+    Check(!action.Exists() && by_id("article-editor").One().focused && ui.ActiveTextInput().has_value(),
+          "Continuing below a block returns focus to the text editor");
+    Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "Body"}});
+    Check(by_id("article-editor").One().value == before + "\nBody",
+          "The compact action places subsequent text below the original block");
+  };
+  ui.PressKey(Key::N, primary);
+  tap_semantic(by_id("article-editor"));
+  ui.PressKey(Key::T, shifted);
+  compact_continue("Continue below table", "Cell");
+
+  ui.PressKey(Key::N, primary);
+  tap_semantic(by_id("article-editor"));
+  open();
+  query.EnterText("code block");
+  ui.PressKey(Key::Enter);
+  wait_for_close();
+  compact_continue("Continue below code block", "code");
+
+  ui.Find(UiSelector::Key("file-menu")).Tap();
+  tap_semantic(ui.FindSemantics(UiSemanticSelector::Label("Load sample")));
+  tap_semantic(by_id("article-editor"));
+  const auto sample = by_id("article-editor").One().value;
+  const auto parent = sample.find("Capture an idea");
+  const auto child = sample.find("Save a useful detail");
+  Check(parent != sample.npos && child != sample.npos, "The sample contains an ordered item and a bulleted child");
+  const TextSelection mixed{AttributedText(sample.substr(0, child + 2)).Length(),
+                            AttributedText(sample.substr(0, parent + 1)).Length()};
+  Send(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = mixed}});
+  for (const auto* label : {"Numbered list", "Bulleted list"}) {
+    const auto item = ui.FindSemantics(UiSemanticSelector::Label(label)).One();
+    Check(!item.enabled && item.checked == SemanticCheckedState::Mixed,
+          "The compact list toolbar displays mixed styles with the structural actions disabled");
+  }
+
+  const auto parent_caret = mixed.active;
+  Send(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{parent_caret, parent_caret}}});
+  const auto numbering = ui.FindSemantics(UiSemanticSelector::Label("List numbering"));
+  Check(numbering.One().enabled && numbering.One().checked == SemanticCheckedState::Checked,
+        "A protected numbered item keeps its numbering menu available");
+  tap_semantic(numbering);
+  const auto set_number = ui.FindSemantics(UiSemanticSelector::Label("Set start number…"));
+  const auto remove_number = ui.FindSemantics(UiSemanticSelector::Label("Remove numbering"));
+  Check(set_number.One().enabled && !remove_number.One().enabled,
+        "The numbering menu can change the start while keeping protected markers in place");
+  ui.PressKey(Key::Escape);
+  ui.PumpUntil([&] { return !remove_number.Exists(); });
+
   ui.PressKey(Key::N, primary);
   tap_semantic(by_id("article-editor"));
   const TextSelection link_selection{7, 0};
@@ -213,6 +295,7 @@ int main(int argc, char** argv) {
   try {
     Check(argc == 2, "The Folio resource package path is required");
     WebUrls();
+    CompactCodeTools(argv[1]);
     PaletteFlow(argv[1]);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

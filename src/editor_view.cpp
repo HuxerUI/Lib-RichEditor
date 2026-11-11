@@ -545,7 +545,7 @@ TextInputKeyResult EditorClient::HandleTextKey(const KeyEvent& event) {
       if (editor_->SelectedInlineObject()) {
         return unhandled;
       }
-      if (editor_->Execute(ExitTable{}) || editor_->ExitCode()) {
+      if (!event.repeat && editor_->Execute(ContinueInParagraph{})) {
         return handled;
       }
     } else if (IsConfigurableKey(event.key)) {

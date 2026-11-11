@@ -689,7 +689,7 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
             ? std::max(24.0F, 9.0F * (std::to_string(start + data.children.size() - 1).size() + 1) + 5.0F)
             : 22.0F) * indent_scale;
         const auto inside_item = std::span(leaf.path).subspan(depth + 2);
-        if (std::ranges::all_of(inside_item, [](std::size_t index) { return index == 0; })) {
+        if (IsLeadingPath(inside_item)) {
           markers.push_back({marker, x, indent - 5.0F});
         }
         x += indent;
