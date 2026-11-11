@@ -88,6 +88,7 @@ struct Selection {
 };
 
 const Block& BlockAt(const RichDocument& document, std::span<const std::size_t> path);
+bool ValidTextRange(const Block& block, TextRange range);
 std::optional<TableCellLocation> TableCellAt(const RichDocument& document, const Leaf& leaf);
 std::size_t LeafIndex(const RichDocument& document, TextOffset absolute);
 Position PositionAt(const RichDocument& document, TextOffset absolute, TextAffinity affinity = TextAffinity::Downstream);

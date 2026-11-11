@@ -12,13 +12,16 @@
 #include <sstream>
 
 #include "app_resources.h"
-#include "attachments.h"
+#include "appearance.h"
 #include "formula.h"
+#include "workbench.h"
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
+using folio::DialogPanel;
 using folio::LatexBlock;
 using folio::LatexInline;
+using folio::PrimaryAction;
 using folio::latex_type;
 
 namespace {
@@ -69,55 +72,24 @@ for title in ready(notes):
 Built with [HuxerUI](https://github.com/HuxerUI).
 )markdown";
 
-RichEditorStyle StudioEditorStyle(const ThemeSpec& theme, bool compact) {
+RichEditorStyle FolioEditorStyle(const ThemeSpec& theme, bool compact) {
   RichEditorStyle style;
   style.background = theme.colors.surface;
-  style.body_font = Font::FromFamily(theme.typography.family, compact ? 16.0F : 17.0F);
+  style.body_font = Font::FromFamily(theme.typography.family, theme.typography.body_large);
   style.code_font = Font::Monospace(14.0F);
-  style.heading_font_sizes = std::array{compact ? 30.0F : 36.0F, 22.0F, 20.0F, 18.0F, 17.0F, 16.0F};
-  style.code_block_background = theme.colors.surface_container;
-  style.content_padding = compact ? EdgeInsets::Symmetric(4.0F, 10.0F) : EdgeInsets::Symmetric(16.0F, 16.0F);
+  style.heading_font_sizes = std::array{compact ? 27.0F : 33.0F, 22.0F, 20.0F, 18.0F, 17.0F, 16.0F};
+  style.quote_rule_color = theme.colors.primary;
+  style.highlight_background = theme.colors.primary_container;
+  style.code_block_background = theme.colors.surface_container_highest;
+  style.content_padding = compact ? EdgeInsets::Symmetric(22.0F, 20.0F) : EdgeInsets::Symmetric(44.0F, 32.0F);
   style.code_block_padding = EdgeInsets::Symmetric(14.0F, 11.0F);
-  style.block_spacing = 11.0F;
-  style.quote_rule_width = 3.5F;
+  style.block_spacing = 12.0F;
+  style.quote_rule_width = 2.0F;
   style.inline_code_corner_radius = 5.0F;
   style.inline_code_horizontal_padding = 3.0F;
   style.highlight_corner_radius = 4.0F;
-  style.code_block_corner_radius = 9.0F;
+  style.code_block_corner_radius = theme.shapes.medium;
   return style;
-}
-
-std::string IssueMessage(const std::vector<ConversionIssue>& issues) {
-  if (issues.empty()) {
-    return {};
-  }
-  std::string result = issues.front().code + " — " + issues.front().message;
-  if (issues.size() > 1) {
-    result += " (+" + std::to_string(issues.size() - 1) + ")";
-  }
-  return result;
-}
-
-Task<IoResult<std::string>> SaveFolderCopy(FileReference parent, File directory, File staged_file,
-                                         RichDocument document, std::string name) {
-  auto checked = co_await folio::CheckAttachments(directory, document);
-  if (!checked.Succeeded()) {
-    co_return IoResult<std::string>::Failure(checked.Error());
-  }
-  const auto folder_name = folio::UniqueName("Folio-");
-  auto destination = co_await parent.CreateDirectoryAsync(folder_name);
-  if (!destination.Succeeded()) {
-    co_return IoResult<std::string>::Failure(destination.Error());
-  }
-  auto attachments = co_await folio::CopyAttachments(directory, destination.Value(), std::move(document));
-  if (!attachments.Succeeded()) {
-    co_return IoResult<std::string>::Failure(attachments.Error());
-  }
-  auto copied = co_await destination.Value().CopyFileFromAsync(std::move(staged_file), std::move(name));
-  if (!copied.Succeeded()) {
-    co_return IoResult<std::string>::Failure(copied.Error());
-  }
-  co_return IoResult<std::string>::Success(folder_name);
 }
 
 TextEditingValue DimensionText(float value) {
@@ -188,8 +160,7 @@ View ImageSizeDialog(DialogContext context, RichEditorController editor, Size in
         .OnSubmitted(apply)
         .With(Grow());
   };
-  const auto action_padding = Padding(EdgeInsets::Symmetric(10.0F, 8.0F));
-  return Column {
+  return DialogPanel(Column {
     Column {
       Text("Image size", TextRole::Title),
       Text("Original proportions are locked.", TextRole::Label).With(Foreground(colors.on_surface_variant)),
@@ -204,40 +175,12 @@ View ImageSizeDialog(DialogContext context, RichEditorController editor, Size in
       Button("Auto size").OnClick([context, editor] {
         editor.Execute(ResizeImage{});
         context.Dismiss();
-      }).With(
-          Frame{.min_height = 44.0F},
-          action_padding,
-          Background(Color::Transparent()),
-          Foreground(colors.on_surface_variant),
-          CornerRadius(theme.shapes.small)
-      ),
+      }).With(Background(Color::Transparent()), Foreground(colors.on_surface_variant)),
       Spacer().With(Grow()),
-      Button("Cancel").OnClick([context] { context.Dismiss(); }).With(
-          Frame{.min_height = 44.0F},
-          action_padding,
-          Background(colors.surface_container_low),
-          Foreground(colors.on_surface),
-          Border{.color = colors.surface_container_high},
-          CornerRadius(theme.shapes.small)
-      ),
-      Button("Apply").OnClick(apply).With(
-          Frame{.min_height = 44.0F},
-          action_padding,
-          Enabled(draft->preferred_width.has_value()),
-          Background(colors.primary_container),
-          Foreground(colors.on_primary_container),
-          CornerRadius(theme.shapes.small)
-      ),
+      Button("Cancel").OnClick([context] { context.Dismiss(); }),
+      PrimaryAction(Button("Apply").OnClick(apply).With(Enabled(draft->preferred_width.has_value())), theme),
     }.With(Spacing(6.0F)),
-  }.With(
-      Frame{.width = 360.0F},
-      Padding(18.0F),
-      Spacing(14.0F),
-      CrossAlign(CrossAxisAlignment::Stretch),
-      Background(colors.surface),
-      Border{.color = colors.surface_container_high},
-      CornerRadius(theme.shapes.large)
-  );
+  }, theme, 380.0F);
 }
 
 std::optional<unsigned> ReadListStart(const TextEditingValue& value) {
@@ -263,7 +206,7 @@ View ListStartDialog(DialogContext context, RichEditorController editor, ViewHan
       focus.RequestFocus();
     }
   };
-  return Column {
+  return DialogPanel(Column {
     Column {
       Text("List numbering", TextRole::Title),
       Text("Items count up from the number you enter.", TextRole::Label)
@@ -282,22 +225,14 @@ View ListStartDialog(DialogContext context, RichEditorController editor, ViewHan
         .OnSubmitted(apply),
     Row {
       Spacer().With(Grow()),
-      Button("Cancel").OnClick([context] { context.Dismiss(); })
-          .With(Background(Color::Transparent()), Foreground(theme.colors.primary)),
-      Button("Apply").OnClick(apply).With(Enabled(proposed && *proposed != initial)),
+      Button("Cancel").OnClick([context] { context.Dismiss(); }),
+      PrimaryAction(Button("Apply").OnClick(apply).With(Enabled(proposed && *proposed != initial)), theme),
     }.With(Spacing(8.0F)),
-  }.With(
-      Frame{.width = 340.0F},
-      Padding(20.0F),
-      Spacing(16.0F),
-      CrossAlign(CrossAxisAlignment::Stretch),
-      Background(theme.colors.surface_container_high),
-      CornerRadius(theme.shapes.extra_large)
-  );
+  }, theme, 340.0F);
 }
 
 [[huxerui::composable]]
-View TextStylePicker(RichEditorController editor, ViewHandle focus, bool available) {
+View TextStylePicker(RichEditorController editor, ViewHandle focus, bool available, bool compact) {
   struct Choice {
     const char* label;
     const char* short_label;
@@ -321,7 +256,7 @@ View TextStylePicker(RichEditorController editor, ViewHandle focus, bool availab
   for (const auto& choice : choices) {
     const auto state = editor.GetCommandState(choice.command);
     if (state.checked == CheckState::On) {
-      label = choice.short_label;
+      label = compact ? choice.short_label : choice.label;
       description = choice.label;
       break;
     }
@@ -348,13 +283,12 @@ View TextStylePicker(RichEditorController editor, ViewHandle focus, bool availab
       })
       .With(
           anchor,
-          Frame{.width = 76.0F, .min_height = 44.0F},
-          Padding(EdgeInsets::Symmetric(8.0F, 6.0F)),
+          Frame{.width = compact ? 76.0F : 98.0F, .min_height = compact ? 44.0F : 30.0F},
+          Padding(EdgeInsets::Symmetric(6.0F, 4.0F)),
           Tooltip("Text style"),
           Enabled(available && editor.GetCommandState(choices.front().command).enabled),
-          Background(theme.colors.surface_container_high),
+          Background(Color::Transparent()),
           Foreground(theme.colors.on_surface),
-          CornerRadius(theme.shapes.full),
           Semantics{.label = std::string("Text style, ") + description}
       );
 }
@@ -377,7 +311,7 @@ View LinkDialog(DialogContext context, RichEditorController editor, ViewHandle f
       focus.RequestFocus();
     }
   };
-  return Column {
+  return DialogPanel(Column {
     Text(original ? "Edit link" : "Insert link", TextRole::Title),
     TextField(address)
         .Label("Link address")
@@ -388,29 +322,22 @@ View LinkDialog(DialogContext context, RichEditorController editor, ViewHandle f
         .OnSubmitted(apply),
     Row {
       Spacer().With(Grow()),
-      Button("Cancel").OnClick([context] { context.Dismiss(); })
-          .With(Background(Color::Transparent()), Foreground(theme.colors.primary)),
-      Button(original ? "Apply" : "Insert").OnClick(apply)
-          .With(Enabled(HasLinkAddress(current) && (!original || current.text != original->target))),
+      Button("Cancel").OnClick([context] { context.Dismiss(); }),
+      PrimaryAction(Button(original ? "Apply" : "Insert").OnClick(apply)
+          .With(Enabled(HasLinkAddress(current) && (!original || current.text != original->target))), theme),
     }.With(Spacing(8.0F)),
-  }.With(
-      Frame{.width = 360.0F},
-      Padding(20.0F),
-      Spacing(16.0F),
-      CrossAlign(CrossAxisAlignment::Stretch),
-      Background(theme.colors.surface_container_high),
-      CornerRadius(theme.shapes.extra_large)
-  );
+  }, theme, 360.0F);
 }
 
 [[huxerui::composable]]
-View LinkTool(RichEditorController editor, ViewHandle focus, bool available) {
+View LinkTool(RichEditorController editor, ViewHandle focus, bool available, bool compact) {
   const auto& theme = UseTheme();
   const auto menu = UseMenu();
   const auto anchor = UseViewHandle();
   const auto dialog = UseDialog();
   const auto toast = UseToast();
   const auto clipboard = UseApplication().Clipboard();
+  const float size = compact ? 44.0F : 30.0F;
   const bool linked = editor.CurrentLink().has_value();
   const char* label = linked ? "Link actions" : "Insert link";
 
@@ -436,12 +363,11 @@ View LinkTool(RichEditorController editor, ViewHandle focus, bool available) {
       })
       .With(
           anchor,
-          Frame{.min_width = 44.0F, .min_height = 44.0F},
+          Frame{.min_width = size, .min_height = size},
           Tooltip(label),
           Enabled(available && editor.GetCommandState(SetLink{}).enabled),
-          Foreground(linked ? theme.colors.on_primary_container : theme.colors.on_surface),
-          Background(linked ? theme.colors.primary_container : Color::Transparent()),
-          CornerRadius(theme.shapes.full)
+          Foreground(linked ? theme.colors.on_primary_container : theme.colors.on_surface_variant),
+          Background(linked ? theme.colors.primary_container : Color::Transparent())
       );
 }
 
@@ -468,7 +394,7 @@ View FormulaDialog(DialogContext context, RichEditorController editor, FormulaRe
   }
   const bool enabled = draft->text.find_first_not_of(" \t\r\n") != std::string::npos &&
       !draft->composition && editor.GetCommandState(command).enabled;
-  return Column {
+  return DialogPanel(Column {
     Text(editing ? "Edit formula" : request.inline_math ? "Insert inline formula" : "Insert display formula", TextRole::Title),
     TextField(draft)
         .Label("LaTeX source")
@@ -479,20 +405,29 @@ View FormulaDialog(DialogContext context, RichEditorController editor, FormulaRe
     Row {
       Spacer().With(Grow()),
       Button("Cancel").OnClick([context] { context.Dismiss(); }),
-      Button(editing ? "Apply" : "Insert").OnClick([=] {
+      PrimaryAction(Button(editing ? "Apply" : "Insert").OnClick([=] {
         if (editor.Execute(command)) {
           context.Dismiss();
         }
-      }).With(Enabled(enabled), Background(theme.colors.primary_container),
-              Foreground(theme.colors.on_primary_container), CornerRadius(theme.shapes.full)),
+      }).With(Enabled(enabled)), theme),
     }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
-  }.With(Frame{.width = 400.0F}, Padding(18.0F), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch),
-         Background(theme.colors.surface), CornerRadius(theme.shapes.large));
+  }, theme, 400.0F);
 }
 
-std::vector<TextDecorationRange> FindMatches(std::span<const DecorationBlock> blocks, std::string_view query,
-                                            Color color) {
-  std::vector<TextDecorationRange> matches;
+struct FindMatch {
+  std::size_t block_index;
+  Block block;
+  TextRange range;
+};
+
+struct FindResults {
+  RichDocument document;
+  std::string query;
+  std::vector<FindMatch> matches;
+};
+
+std::vector<FindMatch> FindMatches(std::span<const DecorationBlock> blocks, std::string_view query) {
+  std::vector<FindMatch> matches;
   const auto length = AttributedText(std::string(query)).Length();
   for (std::size_t index = 0; index < blocks.size(); ++index) {
     const std::string_view text = blocks[index].block.Data().text;
@@ -500,7 +435,7 @@ std::vector<TextDecorationRange> FindMatches(std::span<const DecorationBlock> bl
     TextOffset offset = 0;
     for (auto match = text.find(query); match != text.npos; match = text.find(query, previous)) {
       offset += AttributedText(std::string(text.substr(previous, match - previous))).Length();
-      matches.push_back({index, {offset, offset + length}, DecorationKind::Background, color});
+      matches.push_back({index, blocks[index].block, {offset, offset + length}});
       offset += length;
       previous = match + query.size();
     }
@@ -520,8 +455,11 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const auto list_anchor = UseViewHandle();
   const auto formula_anchor = UseViewHandle();
   const auto more_anchor = UseViewHandle();
-  const auto clipboard = UseApplication().Clipboard();
-  const bool compact = UseViewportClass() == ViewportClass::Compact;
+  const auto application = UseApplication();
+  const auto clipboard = application.Clipboard();
+  const bool compact = !application.SupportsMultipleWindows() && UseViewportClass() == ViewportClass::Compact;
+  const float tool_size = compact ? 44.0F : 30.0F;
+  const auto tool_frame = Frame{.min_width = tool_size, .min_height = tool_size};
   const auto header_state = editor.GetCommandState(ToggleTableHeader{});
   const bool in_table = header_state.checked.has_value();
   const EditorCommand insert_table = InsertTable{};
@@ -537,7 +475,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   };
   const auto tool = [&](const ImageResource& icon, const char* label, EditorCommand command) {
     const auto state = editor.GetCommandState(command);
-    Color foreground = theme.colors.on_surface;
+    Color foreground = theme.colors.on_surface_variant;
     Color background = Color::Transparent();
     std::optional<SemanticCheckedState> checked;
     if (state.checked == CheckState::On) {
@@ -554,12 +492,11 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     return IconButton(icon, label)
         .OnClick([run, command = std::move(command)] { run(command); })
         .With(
-            Frame{.min_width = 44.0F, .min_height = 44.0F},
+            tool_frame,
             Tooltip(label),
             Enabled(available && state.enabled),
             Foreground(foreground),
             Background(background),
-            CornerRadius(theme.shapes.full),
             Semantics{.checked = checked}
         );
   };
@@ -569,17 +506,15 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         .OnClick(std::move(on_click))
         .With(
             anchor,
-            Frame{.min_width = 44.0F, .min_height = 44.0F},
+            tool_frame,
             Tooltip(label),
             Enabled(available && enabled),
-            Foreground(active ? theme.colors.on_primary_container : theme.colors.on_surface),
-            Background(active ? theme.colors.primary_container : Color::Transparent()),
-            CornerRadius(theme.shapes.full)
+            Foreground(active ? theme.colors.on_primary_container : theme.colors.on_surface_variant),
+            Background(active ? theme.colors.primary_container : Color::Transparent())
         );
   };
   const char* table_label = in_table ? "Table actions" : "Insert table";
   const bool image_selected = editor.GetCommandState(DeleteImage{}).enabled;
-  const char* image_label = image_selected ? "Image actions" : "Insert image";
   const bool can_insert_table = editor.GetCommandState(insert_table).enabled;
   const bool can_insert_image = can_pick_images &&
       editor.GetCommandState(InsertImage{{.source = "attachments/image.jpg"}}).enabled;
@@ -657,14 +592,52 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       run(ordered_list);
     }
   });
-  const auto padding = Padding(EdgeInsets::Symmetric(6.0F, 4.0F));
-  const auto background = Background(theme.colors.surface_container);
-  const auto corners = CornerRadius(theme.shapes.large);
+  const auto padding = Padding(EdgeInsets::Symmetric(compact ? 5.0F : 12.0F, 5.0F));
+  const auto background = Background(theme.colors.surface);
+  const auto more_tool = menu_tool(more, compact && image_selected ? "Image actions" : "More formatting",
+                                  more_anchor, true, false, [=] {
+    if (compact && image_selected) {
+      menu.Show(more_anchor, {command_item("Redo", Redo{}), MenuSection{}, command_item("Delete image", DeleteImage{})});
+      return;
+    }
+    std::vector<MenuEntry> items;
+    if (in_table) {
+      items.emplace_back(MenuItem("Table actions", table_entries()));
+    }
+    if (list_start) {
+      items.emplace_back(MenuItem("List numbering", list_entries()));
+    }
+    if (compact) {
+      items.emplace_back(command_item("Redo", Redo{}));
+    }
+    items.emplace_back(MenuItem("Text formatting", {
+        command_item("Strikethrough", ToggleMark{Mark::Strike}),
+        command_item("Inline code", ToggleMark{Mark::Code}),
+        command_item("Highlight", ToggleMark{Mark::Highlight}),
+        command_item("Clear formatting", ClearFormatting{}),
+    }));
+    items.emplace_back(MenuItem("Insert", {
+        command_item("Insert table", insert_table),
+        MenuItem("Insert image", [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
+        MenuItem("Insert inline image", [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
+        MenuItem("Insert inline formula…", insert_inline_formula).Enabled(can_insert_inline_formula),
+        MenuItem("Insert display formula…", insert_formula).Enabled(can_insert_formula),
+    }).Enabled(can_insert_table || can_insert_image || can_insert_inline_image ||
+               can_insert_formula || can_insert_inline_formula));
+    items.emplace_back(MenuItem("Lists and quote", {
+        command_item("Bulleted list", ToggleList{ListKind::Unordered}),
+        command_item("Numbered list", ordered_list),
+        command_item("Block quote", ToggleQuote{}),
+        command_item("Increase list indent", IndentList{}),
+        command_item("Decrease list indent", OutdentList{}),
+    }));
+    menu.Show(more_anchor, std::move(items));
+  });
 
   if (compact) {
     const auto text_tool = [&](const char* title, const char* label, bool enabled, auto on_click) {
       return Button(title).OnClick(std::move(on_click)).With(
-          Frame{.min_width = 44.0F, .min_height = 44.0F},
+          tool_frame,
           Padding(EdgeInsets::Symmetric(8.0F, 6.0F)),
           Enabled(available && enabled),
           Background(Color::Transparent()),
@@ -708,18 +681,18 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         actions.Add(tool(quote, "Block quote", ToggleQuote{}));
       } else if (can_link) {
         context = "link";
-        actions.Add(LinkTool(editor, focus, available));
+        actions.Add(LinkTool(editor, focus, available, compact));
       } else {
-        actions.Add(TextStylePicker(editor, focus, available));
+        actions.Add(TextStylePicker(editor, focus, available, compact));
       }
       actions.Add(tool(bold, "Bold", ToggleMark{Mark::Bold}));
       actions.Add(tool(italic, "Italic", ToggleMark{Mark::Italic}));
       actions.Add(tool(underline, "Underline", ToggleMark{Mark::Underline}));
       if (can_link && (in_table || in_numbered_list || in_bulleted_list || in_quote)) {
-        actions.Add(LinkTool(editor, focus, available));
+        actions.Add(LinkTool(editor, focus, available, compact));
       }
       if (!in_table && (in_numbered_list || in_bulleted_list || in_quote || can_link)) {
-        actions.Add(TextStylePicker(editor, focus, available));
+        actions.Add(TextStylePicker(editor, focus, available, compact));
       }
     }
 
@@ -727,136 +700,94 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       tool(undo, "Undo", Undo{}),
       // Mount a fresh scroll position when the selection moves to another tool group.
       ScrollView {
-        Row {std::move(actions)}.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center))
+        Row {std::move(actions)}.With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Center))
       }.ScrollAxis(Axis::Horizontal).With(Grow(), ScrollBar()).Key(context),
-      menu_tool(more, image_selected ? "Image actions" : "More formatting", more_anchor, true, false, [=] {
-        if (image_selected) {
-          menu.Show(more_anchor, {command_item("Redo", Redo{}), MenuSection{}, command_item("Delete image", DeleteImage{})});
-          return;
-        }
-        std::vector<MenuEntry> items;
-        if (in_table) {
-          items.emplace_back(MenuItem("Table actions", table_entries()));
-        }
-        if (list_start) {
-          items.emplace_back(MenuItem("List numbering", list_entries()));
-        }
-        items.emplace_back(command_item("Redo", Redo{}));
-        items.emplace_back(MenuItem("Text formatting", {
-            command_item("Strikethrough", ToggleMark{Mark::Strike}),
-            command_item("Inline code", ToggleMark{Mark::Code}),
-            command_item("Highlight", ToggleMark{Mark::Highlight}),
-            command_item("Clear formatting", ClearFormatting{}),
-        }));
-        items.emplace_back(MenuItem("Insert", {
-            command_item("Insert table", insert_table),
-            MenuItem("Insert image", [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
-            MenuItem("Insert inline image", [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
-            MenuItem("Insert inline formula…", insert_inline_formula).Enabled(can_insert_inline_formula),
-            MenuItem("Insert display formula…", insert_formula).Enabled(can_insert_formula),
-        }).Enabled(can_insert_table || can_insert_image || can_insert_inline_image ||
-                   can_insert_formula || can_insert_inline_formula));
-        items.emplace_back(MenuItem("Lists and quote", {
-            command_item("Bulleted list", ToggleList{ListKind::Unordered}),
-            command_item("Numbered list", ordered_list),
-            command_item("Block quote", ToggleQuote{}),
-            command_item("Increase list indent", IndentList{}),
-            command_item("Decrease list indent", OutdentList{}),
-        }));
-        menu.Show(more_anchor, std::move(items));
-      }),
-    }.With(padding, Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center), background, corners);
+      more_tool,
+    }.With(padding, Spacing(2.0F), CrossAlign(CrossAxisAlignment::Center), background);
   }
 
-  const auto separator = Divider(Axis::Vertical).With(Frame{.height = 22.0F});
+  const auto image_tool = menu_tool(image_block, image_selected ? "Image actions" : "Insert image", image_anchor,
+      image_selected || can_insert_image || can_insert_inline_image, image_selected, [=] {
+    if (image_selected) {
+      menu.Show(image_anchor, {
+          MenuItem("Image size…", open_image_size).Enabled(selected_size.has_value()),
+          add_after,
+          MenuItem("Replace image", replace_image).Enabled(can_pick_images),
+          MenuSection{},
+          command_item("Delete image", DeleteImage{}),
+      });
+    } else {
+      menu.Show(image_anchor, {
+          MenuItem("Insert image block", [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
+          MenuItem("Insert inline image", [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
+      });
+    }
+  });
+  const auto formula_tool = menu_tool(formula, formula_selected ? "Formula actions" : "Insert formula", formula_anchor,
+      formula_selected || can_insert_formula || can_insert_inline_formula, formula_selected, [=] {
+    if (formula_selected) {
+      menu.Show(formula_anchor, {
+          MenuItem("Edit formula…", edit_formula),
+          MenuItem("Copy LaTeX", copy_formula).Enabled(clipboard && clipboard->IsAvailable()),
+      });
+    } else {
+      menu.Show(formula_anchor, {
+          MenuItem("Inline formula…", insert_inline_formula).Enabled(can_insert_inline_formula),
+          MenuItem("Display formula…", insert_formula).Enabled(can_insert_formula),
+      });
+    }
+  });
 
+  const auto separator = Divider(Axis::Vertical).With(Frame{.height = 21.0F});
   return ScrollView {
     Row {
       tool(undo, "Undo", Undo{}),
       tool(redo, "Redo", Redo{}),
-      table_tool,
-      menu_tool(image_block, image_label, image_anchor, image_selected || can_insert_image || can_insert_inline_image, image_selected, [=] {
-        if (image_selected) {
-          menu.Show(image_anchor, {
-              MenuItem("Image size…", open_image_size).Enabled(selected_size.has_value()),
-              add_after,
-              MenuItem("Replace image", replace_image).Enabled(can_pick_images),
-              MenuSection{},
-              command_item("Delete image", DeleteImage{}),
-          });
-        } else {
-          menu.Show(image_anchor, {
-              MenuItem("Insert image block", [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
-              MenuItem("Insert inline image", [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
-          });
-        }
-      }),
-      menu_tool(formula, formula_selected ? "Formula actions" : "Insert formula", formula_anchor,
-                formula_selected || can_insert_formula || can_insert_inline_formula, formula_selected, [=] {
-        if (formula_selected) {
-          menu.Show(formula_anchor, {
-              MenuItem("Edit formula…", edit_formula),
-              MenuItem("Copy LaTeX", copy_formula).Enabled(clipboard && clipboard->IsAvailable()),
-          });
-        } else {
-          menu.Show(formula_anchor, {
-              MenuItem("Inline formula…", insert_inline_formula).Enabled(can_insert_inline_formula),
-              MenuItem("Display formula…", insert_formula).Enabled(can_insert_formula),
-          });
-        }
-      }),
-      tool(bulleted_list, "Bulleted list", ToggleList{ListKind::Unordered}),
-      list_tool,
       separator,
-      TextStylePicker(editor, focus, available),
-      LinkTool(editor, focus, available),
+      TextStylePicker(editor, focus, available, compact),
       tool(bold, "Bold", ToggleMark{Mark::Bold}),
       tool(italic, "Italic", ToggleMark{Mark::Italic}),
       tool(underline, "Underline", ToggleMark{Mark::Underline}),
+      LinkTool(editor, focus, available, compact),
       tool(strikethrough, "Strikethrough", ToggleMark{Mark::Strike}),
       tool(inline_code, "Inline code", ToggleMark{Mark::Code}),
       tool(highlight, "Highlight", ToggleMark{Mark::Highlight}),
       tool(clear_formatting, "Clear formatting", ClearFormatting{}),
       separator,
+      tool(bulleted_list, "Bulleted list", ToggleList{ListKind::Unordered}),
+      list_tool,
       tool(quote, "Block quote", ToggleQuote{}),
       tool(indent, "Increase list indent", IndentList{}),
       tool(outdent, "Decrease list indent", OutdentList{}),
-    }.With(padding, Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center)),
-  }.ScrollAxis(Axis::Horizontal).With(ScrollBar(), background, corners);
+      separator,
+      table_tool,
+      image_tool,
+      formula_tool,
+    }.With(padding, Spacing(1.0F), CrossAlign(CrossAxisAlignment::Center)),
+  }.ScrollAxis(Axis::Horizontal).With(ScrollBar(), background);
 }
 
+} // namespace
+
+namespace folio {
+
+ImportResult LoadSample() { return DocumentMarkdown().Import(sample_markdown); }
+
 [[huxerui::composable]]
-View Preview() {
-  static const auto imported = folio::DocumentMarkdown().Import(sample_markdown);
-  const auto editor = UseRichEditor(imported.document.value_or(RichDocument{}));
+View EditorPane(RichEditorController editor, EditorPaneOptions options) {
   const auto focus = UseViewHandle();
   const auto find_focus = UseViewHandle();
   const auto dialog = UseDialog();
-  const auto file_menu = UseMenu();
-  const auto file_menu_anchor = UseViewHandle();
-  const auto tasks = UseTaskScope();
-  const auto picker = UseService<FilePicker>();
-  const auto status = UseState(imported.document ? std::string("Markdown imported") : IssueMessage(imported.issues));
-  const auto busy = UseState(false);
-  const auto find_open = UseState(false);
   const auto find_query = UseState(TextEditingValue{});
   const auto find_provider = UseState(std::shared_ptr<const DecorationProvider>{});
-  const auto find_count = UseState(std::optional<std::pair<RichDocument, std::size_t>>{});
-  const auto focus_after_picker = UseState(false);
-  const auto directories = UseApplication().Directories();
-  const auto folder = UseState(directories.data_directory);
-  const auto directory = folder.Get();
+  const auto active_provider = UseState(std::shared_ptr<const DecorationProvider>{});
+  const auto find_results = UseState(std::shared_ptr<const FindResults>{});
+  const auto active_match = UseState(std::optional<std::size_t>{});
   const auto& theme = UseTheme();
   const bool compact = UseViewportClass() == ViewportClass::Compact;
-  const bool working = busy.Get();
-  const bool finding = find_open.Get();
-  const bool can_save = picker->CanSaveFiles() || picker->CanOpenDirectories(true);
-  Lifecycle([=] {
-    if (!working && focus_after_picker.Get()) {
-      focus.RequestFocus();
-      focus_after_picker = false;
-    }
-  }, working);
+  const auto find_open = options.find_open;
+  const bool search_open = find_open.Get();
+  const bool finding = options.active && search_open;
   Lifecycle([=] {
     if (finding) {
       find_focus.RequestFocus();
@@ -866,294 +797,157 @@ View Preview() {
   const auto query = find_query->text;
   const auto match_color = theme.colors.tertiary_container;
   Lifecycle([=] {
-    find_count = std::nullopt;
-    if (!finding || query.empty()) {
+    if (!search_open || query.empty()) {
       find_provider = nullptr;
+      find_results = nullptr;
+      active_match = std::nullopt;
       return;
     }
     find_provider = std::make_shared<const DecorationProvider>(DecorationProvider{
         .scope = DecorationScope::Document,
         .analyze = [=](DecorationRequest request) -> Task<std::vector<TextDecorationRange>> {
-          auto matches = co_await RunWorker([query, match_color](std::vector<DecorationBlock> blocks) {
-            return FindMatches(blocks, query, match_color);
+          auto matches = co_await RunWorker([query](std::vector<DecorationBlock> blocks) {
+            return FindMatches(blocks, query);
           }, std::move(request.blocks));
-          if (find_open.Get() && find_query->text == query) {
-            find_count = std::pair(*request.document, matches.size());
+          if (!find_open.Get() || find_query->text != query || editor.Document() != *request.document) {
+            co_return std::vector<TextDecorationRange>{};
           }
-          co_return matches;
+          std::vector<TextDecorationRange> marks;
+          marks.reserve(matches.size());
+          for (const auto& match : matches) {
+            marks.push_back({match.block_index, match.range, DecorationKind::Background, match_color});
+          }
+          const auto& previous = find_results.Get();
+          if (!previous || previous->query != query || previous->document != *request.document) {
+            active_match = std::nullopt;
+          }
+          find_results = std::make_shared<const FindResults>(
+              FindResults{std::move(*request.document), query, std::move(matches)});
+          co_return marks;
         },
     });
-  }, finding, query, match_color);
-  std::vector<std::shared_ptr<const DecorationProvider>> decoration_providers;
-  if (const auto& provider = find_provider.Get()) {
-    decoration_providers.push_back(provider);
+  }, search_open, query, match_color);
+
+  const auto results = find_results.Get();
+  const bool ready = search_open && results && results->query == query && results->document == editor.Document();
+  const std::size_t count = ready ? results->matches.size() : 0;
+  const auto selected = active_match.Get();
+  const auto active_color = theme.colors.primary;
+  Lifecycle([=] {
+    if (!selected || *selected >= count) {
+      active_provider = nullptr;
+      return;
+    }
+    const auto& match = results->matches[*selected];
+    const auto mark = TextDecorationRange{match.block_index, match.range, DecorationKind::Outline, active_color};
+    active_provider = std::make_shared<const DecorationProvider>(DecorationProvider{
+        .scope = DecorationScope::Document,
+        .analyze = [document = results->document, mark](DecorationRequest request) -> Task<std::vector<TextDecorationRange>> {
+          co_return request.document == document ? std::vector{mark} : std::vector<TextDecorationRange>{};
+        },
+    });
+  }, results, count, selected, active_color);
+
+  std::vector<std::shared_ptr<const DecorationProvider>> decorations;
+  if (const auto& provider = find_provider.Get(); search_open && provider) {
+    decorations.push_back(provider);
+  }
+  if (const auto& provider = active_provider.Get(); search_open && provider) {
+    decorations.push_back(provider);
   }
 
-  const auto pick_image = [=](bool replace, bool inline_image) {
-    if (busy.Get()) {
-      return;
-    }
-    busy = true;
-    tasks.Launch([=]() -> Task<void> {
-      const auto selected = co_await picker->OpenFileAsync({
-          .name = "PNG and JPEG images", .extensions = {"png", "jpg", "jpeg"},
-          .content_types = {"image/png", "image/jpeg"}});
-      if (selected) {
-        auto saved = co_await folio::ImportImage(directory, *selected);
-        if (saved.Succeeded()) {
-          const ImageBlockData image{std::move(saved.Value()), selected->Name(), {}};
-          const auto command = replace ? EditorCommand{ReplaceImage{image.source}}
-              : inline_image ? EditorCommand{InsertInlineObject{InlineImage(image)}} : EditorCommand{InsertImage{image}};
-          status = editor.Execute(command) ? (replace ? "Image replaced" : "Image inserted")
-                                           : "Select an image or place the caret in a paragraph";
-        } else {
-          status = saved.Error().message;
-        }
-      }
-      focus_after_picker = true;
-      busy = false;
-    });
-  };
-
-  const auto import_sample = [=] {
-    if (imported.document) {
-      editor.ReplaceDocument(*imported.document);
-      status = "Markdown imported";
-    } else {
-      status = IssueMessage(imported.issues);
-    }
-  };
-
-  const auto save_document = [=](RichDocument snapshot, ExportResult result, SaveFileOptions options) {
-    if (busy.Get()) {
-      return;
-    }
-    const auto issues = IssueMessage(result.issues);
-    if (!result.text) {
-      status = issues;
-      return;
-    }
-    const bool save_folder = folio::HasLocalAttachments(snapshot) || !picker->CanSaveFiles();
-    if (save_folder && !picker->CanOpenDirectories(true)) {
-      status = "Saving this document requires a writable folder";
-      return;
-    }
-
-    const auto temporary = directories.temporary_directory;
-    const auto staged_file = temporary.Child(folio::UniqueName("folio-") + "-" + options.suggested_name);
-    // Prepare the temporary file without suspending so the picker keeps the initiating user activation on Web.
-    if (!temporary.CreateDirectories() || !staged_file.WriteString(*result.text)) {
-      (void)staged_file.Delete();
-      status = "Could not prepare the document";
-      return;
-    }
-    busy = true;
-    tasks.Launch([=, snapshot = std::move(snapshot), options = std::move(options)]() -> Task<void> {
-      std::string message;
-      bool succeeded = false;
-      if (save_folder) {
-        const auto parent = co_await picker->OpenDirectoryAsync(true);
-        if (parent) {
-          auto saved = co_await SaveFolderCopy(*parent, directory, staged_file, snapshot, options.suggested_name);
-          succeeded = saved.Succeeded();
-          message = succeeded ? "Saved " + saved.Value() : saved.Error().message;
-        }
-      } else {
-        succeeded = co_await picker->SaveFileAsync(staged_file, options);
-        message = succeeded ? "Document saved" : "Save canceled or unsuccessful";
-      }
-      (void)co_await staged_file.DeleteAsync();
-      if (succeeded && !issues.empty()) {
-        message += ". " + issues;
-      }
-      if (!message.empty()) {
-        status = std::move(message);
-      }
-      busy = false;
-    });
-  };
-
-  const auto save_json = [=] {
-    const auto snapshot = editor.Document();
-    save_document(snapshot, JsonCodec().Export(snapshot), {
-        .suggested_name = "article.json",
-        .filter = {.name = "RichEditor JSON", .extensions = {"json"}, .content_types = {"application/json"}}});
-  };
-
-  const auto export_markdown = [=] {
-    const auto snapshot = editor.Document();
-    auto strict = folio::DocumentMarkdown().Export(snapshot);
-    const SaveFileOptions options{
-        .suggested_name = "article.md",
-        .filter = {.name = "Markdown", .extensions = {"md"}, .content_types = {"text/markdown"}}};
-    if (strict.text) {
-      save_document(snapshot, std::move(strict), options);
-      return;
-    }
-    dialog.Show("Export Markdown with loss?", IssueMessage(strict.issues), "Export with loss", "Cancel", [=] {
-      save_document(snapshot, folio::DocumentMarkdown().Export(snapshot, LossPolicy::AllowLoss), options);
-    });
-  };
-
-  const auto new_working_directory = [data = directories.data_directory] {
-    return data.Child("documents").Child(folio::UniqueName("document-"));
-  };
-  const auto finish_open = [=](File working_directory, folio::OpenedDocument opened) {
-    folder = std::move(working_directory);
-    editor.ReplaceDocument(std::move(opened.document));
-    status = opened.missing_images == 0 ? "Document opened"
-        : "Opened with " + std::to_string(opened.missing_images) + " missing image(s)";
-  };
-
-  const auto open_folder = [=](std::optional<folio::DocumentSource> document) {
-    if (busy.Get()) {
-      return;
-    }
-    busy = true;
-    tasks.Launch([=, document = std::move(document)]() -> Task<void> {
-      const auto selected = co_await picker->OpenDirectoryAsync();
-      if (selected) {
-        const auto working_directory = new_working_directory();
-        auto opened = document ? co_await folio::ReadAttachments(*selected, working_directory, *document)
-                               : co_await folio::ReadFolder(*selected, working_directory);
-        if (opened.Succeeded()) {
-          finish_open(working_directory, std::move(opened.Value()));
-        } else {
-          status = opened.Error().message;
-        }
-      }
-      busy = false;
-    });
-  };
-
-  const auto open_file = [=] {
-    if (busy.Get()) {
-      return;
-    }
-    busy = true;
-    tasks.Launch([=]() -> Task<void> {
-      const auto selected = co_await picker->OpenFileAsync({
-          .name = "RichEditor documents",
-          .extensions = {"json", "md", "markdown"},
-          .content_types = {"application/json", "text/markdown", "text/plain"}});
-      if (selected) {
-        auto imported = co_await folio::ReadDocument(*selected);
-        if (!imported.Succeeded()) {
-          status = imported.Error().message;
-        } else if (!folio::HasLocalAttachments(imported.Value().document)) {
-          finish_open(new_working_directory(), {std::move(imported.Value().document)});
-        } else if (picker->CanOpenDirectories()) {
-          dialog.Show("Locate local images", "Choose the folder containing this document and its local images.",
-                      "Choose folder", "Cancel", [=, document = std::move(imported.Value())] {
-                        open_folder(document);
-                      });
-        } else {
-          status = "Opening this document's local images requires folder access";
-        }
-      }
-      busy = false;
-    });
-  };
-
-  const auto& colors = theme.colors;
   View find_bar;
   if (finding) {
-    const auto& result = find_count.Get();
-    const bool ready = result && result->first == editor.Document();
-    const auto count = ready ? result->second : 0;
-    const auto match_label = !query.empty() && !ready
-        ? std::string("Searching…") : std::to_string(count) + (count == 1 ? " match" : " matches");
+    const bool can_navigate = count != 0 && !find_query->composition;
+    const auto navigate = [editor, results, count, active_match, find_focus, find_query](bool forward) {
+      if (count == 0 || find_query->composition || find_query->text != results->query ||
+          editor.Document() != results->document) {
+        return;
+      }
+      const auto index = active_match.Get();
+      const auto next = index && *index < count
+          ? (forward ? (*index + 1) % count : (*index + count - 1) % count)
+          : (forward ? 0 : count - 1);
+      const auto& match = results->matches[next];
+      if (editor.RevealTextRange(match.block, match.range)) {
+        active_match = next;
+      }
+      find_focus.RequestFocus();
+    };
+    auto match_label = !query.empty() && !ready ? std::string("Searching…") : std::to_string(count) + " matches";
+    if (selected && *selected < count) {
+      match_label = std::to_string(*selected + 1) + " / " + std::to_string(count);
+    }
+    const auto button_frame = Frame{.min_width = compact ? 44.0F : 32.0F, .min_height = compact ? 44.0F : 32.0F};
     find_bar = Row {
-      TextField(find_query).Label("Find in document").Variant(TextFieldVariant::Outlined)
+      TextField(find_query).Label(compact ? "Find" : "Find in document").Variant(TextFieldVariant::Outlined)
           .OnChanged([find_query](const TextEditingValue& value) { find_query = value; })
+          .OnSubmitted([navigate] { navigate(true); })
+          .On<ViewEvents::KeyIntercept>([navigate, find_query](const KeyEvent& event) {
+            if (event.type != KeyEventType::Down || event.key != Key::Enter || !event.modifiers.shift ||
+                event.modifiers.control || event.modifiers.alt || event.modifiers.meta || find_query->composition) {
+              return false;
+            }
+            navigate(false);
+            return true;
+          })
           .With(find_focus, Grow()),
-      Text(match_label, TextRole::Label)
-          .With(Foreground(colors.on_surface_variant)),
-      Button("Done").OnClick([=] { find_open = false; }),
-    }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
+      Text(match_label, TextRole::Label).With(Foreground(theme.colors.on_surface_variant),
+          Semantics{.live_region = SemanticLiveRegion::Polite}),
+      IconButton(app::images::chevron_up, "Previous match").OnClick([navigate] { navigate(false); })
+          .With(button_frame, Enabled(can_navigate), Tooltip("Previous match")),
+      IconButton(app::images::chevron_down, "Next match").OnClick([navigate] { navigate(true); })
+          .With(button_frame, Enabled(can_navigate), Tooltip("Next match")),
+      IconButton(app::images::close, "Close find").OnClick([find_open] { find_open = false; })
+          .With(button_frame, Tooltip("Close find")),
+    }.With(Padding(EdgeInsets::Symmetric(compact ? 8.0F : 14.0F, 7.0F)), Spacing(compact ? 3.0F : 6.0F),
+           CrossAlign(CrossAxisAlignment::Center), Background(theme.colors.surface_container));
   }
+
+  const auto editor_view = RichEditor(editor, {
+      .style = FolioEditorStyle(theme, compact),
+      .document_directory = options.working_directory,
+      .extensions = {.image_resolver = std::move(options.image_resolver),
+                     .decorations = std::move(decorations),
+                     .custom_blocks = {{std::string(latex_type), FormulaRenderer()}},
+                     .inline_objects = {InlineFormulaExtension()}},
+  }).On<RichEditorEvents::InlineObjectActivated>([=](const InlineObjectSelection& object) {
+    if (object.data.type == latex_type && object.data.version == 1) {
+      dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true, .object = object});
+    }
+  }).With(focus, Grow(), Enabled(options.available),
+          Semantics{.label = "Document editor", .identifier = "article-editor"}).Key("editor");
+  const auto paper_frame = compact ? Frame{} : Frame{.width = 684.0F};
+  const auto paper_border = Border{theme.colors.outline, compact ? 0.0F : 1.0F};
+  const auto paper_corners = CornerRadius(CornerRadii::Top(compact ? 0.0F : theme.shapes.medium));
+  const View paper = Column {editor_view}.With(paper_frame, paper_border, paper_corners, ClipChildren(),
+      Background(theme.colors.surface), Grow(), CrossAlign(CrossAxisAlignment::Stretch));
   return Column {
-    Row {
-      Image(app::images::folio)
-          .Tint(colors.on_primary_container)
-          .With(
-              Frame{.width = 38.0F, .height = 38.0F},
-              Padding(9.0F),
-              Background(colors.primary_container),
-              CornerRadius(theme.shapes.small),
-              Semantics{.hidden = true}
-          ),
-      Column {
-        Text("Folio", TextRole::Title)
-            .Style({Font::System(22.0F).WithWeight(FontWeight::Bold), colors.on_surface})
-            .With(Semantics{.role = SemanticRole::Heading, .heading_level = 1}),
-        Text("RichEditor studio", TextRole::Label).With(FontSize(11.0F), Foreground(colors.on_surface_variant)),
-      }.With(Grow(), Spacing(2.0F)),
-      Row {
-        IconButton(app::images::search, "Find in document")
-            .OnClick([=] { find_open = !find_open.Get(); })
-            .With(Frame{.min_width = 44.0F, .min_height = 44.0F}, Tooltip("Find in document"), Enabled(!working)),
-        IconButton(app::images::save, "Save JSON")
-            .OnClick(save_json)
-            .With(Frame{.min_width = 44.0F, .min_height = 44.0F}, Tooltip("Save JSON"),
-                  Enabled(!working && can_save)),
-        IconButton(app::images::more, "File actions")
-            .OnClick([=] {
-              file_menu.Show(file_menu_anchor, {
-                  MenuItem("Open file…", open_file).Enabled(picker->CanOpenFiles()),
-                  MenuItem("Open folder…", [=] { open_folder(std::nullopt); }).Enabled(picker->CanOpenDirectories()),
-                  MenuItem("Export Markdown…", export_markdown).Enabled(can_save),
-                  MenuSection{},
-                  MenuItem("Load sample", import_sample),
-              });
-            })
-            .With(file_menu_anchor, Frame{.min_width = 44.0F, .min_height = 44.0F}, Tooltip("File actions"),
-                  Enabled(!working)),
-      }.With(
-          Padding(2.0F),
-          CrossAlign(CrossAxisAlignment::Center),
-          Background(colors.surface_container),
-          CornerRadius(theme.shapes.full)
-      ),
-    }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
-    std::move(find_bar),
-    FormattingBar(editor, focus, !working, picker->CanOpenFiles(), pick_image),
-    RichEditor(editor, {.style = StudioEditorStyle(theme, compact), .document_directory = directory,
-                        .extensions = {.decorations = std::move(decoration_providers),
-                                       .custom_blocks = {{std::string(latex_type), folio::FormulaRenderer()}},
-                                       .inline_objects = {folio::InlineFormulaExtension()}}})
-        .On<RichEditorEvents::InlineObjectActivated>([=](const InlineObjectSelection& object) {
-          if (object.data.type == latex_type && object.data.version == 1) {
-            dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true, .object = object});
-          }
-        })
-        .With(focus, Grow(), Enabled(!working), Semantics{.label = "Article", .identifier = "article-editor"}),
-    Text(working ? "Working…" : status.Get(), TextRole::Label)
-        .Align(TextAlign::Center)
-        .With(FontSize(12.0F), Foreground(colors.on_surface_variant),
-              Semantics{.identifier = "preview-status", .busy = working, .live_region = SemanticLiveRegion::Polite}),
-  }.With(
-      Padding(EdgeInsets::Symmetric(compact ? 12.0F : 24.0F, compact ? 8.0F : 12.0F)),
-      Spacing(8.0F),
-      CrossAlign(CrossAxisAlignment::Stretch),
-      SafeAreaPadding(),
-      Background(colors.surface)
-  );
+    Column {
+      FormattingBar(editor, focus, options.available, options.can_pick_images,
+                    [focus, pick = std::move(options.pick_image)](bool replace, bool inline_image) {
+                      pick(focus, replace, inline_image);
+                    }),
+      Divider(),
+    }.With(CrossAlign(CrossAxisAlignment::Stretch)).Key("formatting"),
+    find_bar ? std::move(find_bar).Key("find-bar") : View{},
+    Column {paper}.With(Grow(), Padding(compact ? EdgeInsets{} : EdgeInsets{.top = 20.0F, .right = 24.0F, .left = 24.0F}),
+                       CrossAlign(compact ? CrossAxisAlignment::Stretch : CrossAxisAlignment::Center)).Key("paper"),
+  }.With(CrossAlign(CrossAxisAlignment::Stretch), Background(theme.colors.background));
 }
 
-} // namespace
+} // namespace folio
 
 View App() {
-  const auto theme = UseSystemThemeBrightness() == ThemeBrightness::Dark
-      ? MaterialDarkThemeSpec() : MaterialLightThemeSpec();
-  return MaterialTheme(theme, Preview());
+  return Theme(folio::FolioTheme(UseSystemThemeBrightness()), folio::Workbench());
 }
 
 const Application application{
     App,
     {
-        .window = {.title = "Lib-RichEditor Preview", .initial_size = {920.0F, 720.0F},
-                   .minimum_size = Size{320.0F, 360.0F}},
+        .window = folio::FolioWindowOptions(),
         .show_debug_overlay = false,
+        .application_hooks = {folio::InstallFolio},
+        .window_hooks = {folio::InstallWorkbench},
     }
 };

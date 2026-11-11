@@ -6,6 +6,7 @@ endif()
 find_program(FOLIO_CARGO cargo)
 find_program(FOLIO_RUSTC rustc)
 
+set(folio_math_archive_name libfolio_math.a)
 if(ANDROID)
     if(ANDROID_ABI STREQUAL "arm64-v8a")
         set(folio_rust_target aarch64-linux-android)
@@ -26,9 +27,16 @@ elseif(APPLE AND NOT IOS)
     elseif(folio_arch STREQUAL "x86_64")
         set(folio_rust_target x86_64-apple-darwin)
     endif()
+elseif(WIN32 AND MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
+    set(folio_rust_target x86_64-pc-windows-msvc)
+    set(folio_math_archive_name folio_math.lib)
 endif()
 
-if(NOT FOLIO_CARGO OR NOT FOLIO_RUSTC OR NOT folio_rust_target)
+if(NOT folio_rust_target)
+    return()
+endif()
+if(NOT FOLIO_CARGO OR NOT FOLIO_RUSTC)
+    message(STATUS "Folio formulas use a text fallback. Install Cargo and Rust to typeset them.")
     return()
 endif()
 
@@ -42,7 +50,7 @@ endif()
 
 set(folio_math_dir "${CMAKE_CURRENT_LIST_DIR}")
 set(folio_math_build "${CMAKE_CURRENT_BINARY_DIR}/folio-math")
-set(folio_math_archive "${folio_math_build}/${folio_rust_target}/release/libfolio_math.a")
+set(folio_math_archive "${folio_math_build}/${folio_rust_target}/release/${folio_math_archive_name}")
 add_custom_command(OUTPUT "${folio_math_archive}"
         COMMAND "${FOLIO_CARGO}" build --locked --release --target "${folio_rust_target}"
                 --manifest-path "${folio_math_dir}/Cargo.toml" --target-dir "${folio_math_build}"
@@ -51,4 +59,7 @@ add_custom_command(OUTPUT "${folio_math_archive}"
 add_custom_target(folio_math_build DEPENDS "${folio_math_archive}")
 add_dependencies(example_lib_rich_editor folio_math_build)
 target_link_libraries(example_lib_rich_editor PRIVATE "${folio_math_archive}")
+if(WIN32)
+    target_link_libraries(example_lib_rich_editor PRIVATE ntdll userenv ws2_32 dbghelp)
+endif()
 target_compile_definitions(example_lib_rich_editor PRIVATE FOLIO_MATH_RENDERER=1)

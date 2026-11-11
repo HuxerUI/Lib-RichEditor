@@ -751,6 +751,7 @@ private:
 
   void ResetClient();
   bool UpdateScroll(bool focused, TextPosition position, bool edited, bool laid_out);
+  bool RevealText(const RichDocument& document, TextOffset offset);
   bool ScrollTable(std::size_t table, float delta);
   bool UpdateDecorations();
   void PaintDecorations(PaintContext& paint, const EditorLayout::Row& row, std::size_t index, bool behind) const;
@@ -763,6 +764,7 @@ private:
   std::shared_ptr<EditorSession> editor_;
   std::shared_ptr<EditorViewport> viewport_;
   std::shared_ptr<EditorViewport::ScrollInputHandler> scroll_input_;
+  std::shared_ptr<EditorViewport::RevealTextHandler> reveal_text_;
   std::uint64_t observed_revision_ = 0;
   std::shared_ptr<const DecorationAnalysis> decoration_analysis_;
   std::uint64_t observed_decoration_revision_ = 0;
@@ -806,6 +808,9 @@ void EditorExtension::Update(ViewNode& node, const Surface& surface) {
     return table && ScrollTable(*table, delta);
   });
   viewport_->scroll_input = scroll_input_;
+  reveal_text_ = std::make_shared<EditorViewport::RevealTextHandler>(
+      [this](const RichDocument& document, TextOffset offset) { return RevealText(document, offset); });
+  viewport_->reveal_text = reveal_text_;
 }
 
 void EditorExtension::ResetClient() {
@@ -826,6 +831,35 @@ void EditorExtension::ResetClient() {
   InvalidateSemantics();
 }
 
+float OffsetToReveal(const ScrollMetrics& metrics, Rect caret) {
+  const float margin = std::clamp((metrics.viewport_extent - caret.height) / 2.0F, 0.0F, 8.0F);
+  const float top = caret.y - margin;
+  const float bottom = caret.y + caret.height + margin - metrics.viewport_extent;
+  return std::clamp(metrics.offset < bottom ? bottom : std::min(metrics.offset, top), 0.0F, metrics.maximum_offset);
+}
+
+bool EditorExtension::RevealText(const RichDocument& document, TextOffset offset) {
+  const auto metrics = viewport_->scroll.Metrics();
+  if (!client_->HasGeometry() || !DocumentAccess::Same(document, editor_->VisibleDocument()) ||
+      metrics.viewport_extent <= 0.0F) {
+    return false;
+  }
+  auto& layout = client_->Layout();
+  const TextPosition position{offset, TextAffinity::Downstream};
+  const bool table_moved = layout.RevealCaret(document, position);
+  const auto next = OffsetToReveal(metrics, layout.Caret(document, position));
+  follow_caret_ = false;
+  if (next != metrics.offset) {
+    viewport_->scroll.ScrollTo(next);
+  }
+  if (table_moved) {
+    client_->GeometryChanged();
+    InvalidatePaint(PaintInvalidation::Foreground);
+    InvalidateSemantics();
+  }
+  return true;
+}
+
 bool EditorExtension::UpdateScroll(bool focused, TextPosition position, bool edited, bool laid_out) {
   auto metrics = viewport_->scroll.Metrics();
   const bool focus_gained = focused && !focused_;
@@ -841,11 +875,7 @@ bool EditorExtension::UpdateScroll(bool focused, TextPosition position, bool edi
   if (focused && follow_caret_ && (edited || focus_gained || laid_out || extent_changed) &&
       metrics.viewport_extent > 0.0F && !editor_->SelectedAtomicBlock()) {
     const auto caret = client_->Layout().Caret(editor_->VisibleDocument(), position);
-    const float margin = std::clamp((metrics.viewport_extent - caret.height) / 2.0F, 0.0F, 8.0F);
-    const float top = caret.y - margin;
-    const float bottom = caret.y + caret.height + margin - metrics.viewport_extent;
-    const float offset = std::clamp(metrics.offset < bottom ? bottom : std::min(metrics.offset, top),
-                                    0.0F, metrics.maximum_offset);
+    const float offset = OffsetToReveal(metrics, caret);
     if (offset != metrics.offset && viewport_->scroll.ScrollTo(offset)) {
       metrics = viewport_->scroll.Metrics();
     }

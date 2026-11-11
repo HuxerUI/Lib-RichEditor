@@ -15,6 +15,10 @@ if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
 endif ()
 
+if (MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif ()
+
 file(GLOB_RECURSE APP_SOURCE_FILES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"

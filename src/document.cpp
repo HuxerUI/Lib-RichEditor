@@ -275,6 +275,20 @@ const Block& BlockAt(const RichDocument& document, std::span<const std::size_t> 
   return children[path.back()];
 }
 
+bool ValidTextRange(const Block& block, TextRange range) {
+  const auto& body = DocumentAccess::Body(block);
+  if (!range.IsValid() || range.IsCollapsed() || range.end > body.Length()) {
+    return false;
+  }
+  try {
+    (void)body.TextInRange({range.start, range.start});
+    (void)body.TextInRange({range.end, range.end});
+    return true;
+  } catch (const std::invalid_argument&) {
+    return false;
+  }
+}
+
 std::optional<TableCellLocation> TableCellAt(const RichDocument& document, const Leaf& leaf) {
   const auto& path = leaf.path;
   if (path.size() == 4 && document.Blocks()[path.front()].Data().kind == BlockKind::Table) {

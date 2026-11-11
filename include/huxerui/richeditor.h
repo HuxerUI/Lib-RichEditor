@@ -340,6 +340,13 @@ public:
   /// @return A rich fragment, or an empty value for a collapsed selection or during IME preedit.
   std::optional<DocumentFragment> SelectedFragment() const;
 
+  /// @brief Scrolls the mounted editor to the start of a nonempty block-local UTF-16 range.
+  ///
+  /// Use a text block from Document() or a decoration request. The editing selection and focus are preserved.
+  /// @return True when the mounted editor accepted the range. Returns false for stale blocks, invalid ranges,
+  /// unavailable layout, or active IME composition.
+  bool RevealTextRange(const Block& block, TextRange range) const;
+
   /// @brief Applies a command to the retained selection or caret.
   /// A formatting command records changes across all affected blocks as one undo entry. An active IME composition
   /// may be committed separately before the command runs.

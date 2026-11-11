@@ -72,6 +72,19 @@ std::optional<DocumentFragment> RichEditorController::SelectedFragment() const {
   return session_->SelectedFragment();
 }
 
+bool RichEditorController::RevealTextRange(const Block& block, TextRange range) const {
+  const auto reveal = viewport_->reveal_text.lock();
+  if (!reveal || session_->CompositionRange()) {
+    return false;
+  }
+  const auto document = session_->Document();
+  const auto& index = detail::DocumentAccess::Get(document).index;
+  const auto id = detail::DocumentAccess::Id(block);
+  const auto* current = detail::FindTextBlock(index, id);
+  return current && detail::DocumentAccess::SameBlock(*current, block) && detail::ValidTextRange(*current, range) &&
+      (*reveal)(document, index.StartOf(id) + range.start);
+}
+
 bool RichEditorController::Execute(const EditorCommand& command) const { return session_->Execute(command); }
 
 RichEditorController UseRichEditor(RichDocument initial, const std::source_location& location) {

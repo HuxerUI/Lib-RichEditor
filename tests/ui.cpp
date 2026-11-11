@@ -1369,6 +1369,52 @@ void TallImageScrolling() {
   initial_image_resolver.reset();
 }
 
+void RevealTextRange() {
+  static const auto document = [] {
+    std::string markdown;
+    for (int i = 0; i < 40; ++i) {
+      markdown += "A paragraph of text\n\n";
+    }
+    markdown += "尾行🙂 target\n";
+    return *MarkdownCodec().Import(markdown).document;
+  }();
+  const Application app([]() -> View {
+    const auto editor = UseRichEditor(document);
+    const auto editor_focus = UseViewHandle();
+    const auto query_focus = UseViewHandle();
+    const auto query = UseState(TextEditingValue{});
+    controller = editor;
+    return Column {
+      Button("Focus editor").OnClick([editor_focus] { editor_focus.RequestFocus(); }),
+      Button("Focus query").OnClick([query_focus] { query_focus.RequestFocus(); }),
+      TextField(query).Label("Find").With(query_focus),
+      RichEditor(editor).With(editor_focus, Grow(), Semantics{.identifier = "reveal-editor"}),
+    }.With(CrossAlign(CrossAxisAlignment::Stretch));
+  }, {.show_debug_overlay = false});
+  UiTest ui(app, {.viewport = {420.0F, 360.0F}});
+  const auto target = controller->Document().Blocks().back();
+  const auto editor = ui.FindSemantics(UiSemanticSelector::Identifier("reveal-editor"));
+  const auto scroll = editor.Find(UiSemanticSelector::Role(SemanticRole::ScrollView));
+  ui.Find(UiSelector::Text("Focus editor")).Tap();
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{3, 0}}});
+  Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "ni"}});
+  Check(!controller->RevealTextRange(target, {5, 11}), "Reveal leaves an active IME composition alone");
+  Accept(ui, {{.kind = TextInputCommandKind::CancelComposition}});
+
+  ui.Find(UiSelector::Text("Focus query")).Tap();
+  const auto query_session = ui.ActiveTextInput();
+  Check(query_session && !editor.One().focused, "The query field owns the text input session");
+  Check(!controller->RevealTextRange(target, {3, 4}), "Reveal rejects a range that splits a surrogate pair");
+  Check(controller->RevealTextRange(target, {5, 11}), "Reveal accepts a range in an offscreen block");
+  ui.Pump();
+  Check(scroll.One().scroll->offset > 0.0F, "Reveal scrolls the target into the viewport");
+  Check(ui.ActiveTextInput()->session_id == query_session->session_id && editor.One().text_selection == TextRange{0, 3},
+        "Reveal preserves input focus and the editor selection");
+  controller->ReplaceDocument(RichDocument{});
+  ui.Pump();
+  Check(!controller->RevealTextRange(target, {5, 11}), "Reveal rejects a block from a replaced document");
+}
+
 } // namespace
 
 int main() {
@@ -1403,6 +1449,8 @@ int main() {
     ImageWorkflow();
     controller.reset();
     TallImageScrolling();
+    controller.reset();
+    RevealTextRange();
     controller.reset();
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -21,6 +21,7 @@ struct InlineRendering;
 
 struct EditorViewport {
   using ScrollInputHandler = std::function<bool(const ScrollInputEvent&)>;
+  using RevealTextHandler = std::function<bool(const RichDocument&, TextOffset)>;
 
   ScrollController scroll;
   /// The mounted surface owns the handler and its node-local coordinate mapping.
@@ -44,6 +45,7 @@ struct EditorViewport {
   std::shared_ptr<DecorationAnalysis> decoration_analysis;
   State<std::uint64_t> decoration_revision{0};
   State<float> content_width{0.0F};
+  std::weak_ptr<RevealTextHandler> reveal_text;
 };
 
 } // namespace huxerui::richeditor::detail

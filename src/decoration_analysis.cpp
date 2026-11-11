@@ -9,20 +9,6 @@
 namespace huxerui::richeditor::detail {
 namespace {
 
-bool IsValidDecorationRange(const Block& block, TextRange range) {
-  const auto& body = DocumentAccess::Body(block);
-  if (!range.IsValid() || range.IsCollapsed() || range.end > body.Length()) {
-    return false;
-  }
-  try {
-    (void)body.TextInRange({range.start, range.start});
-    (void)body.TextInRange({range.end, range.end});
-    return true;
-  } catch (const std::invalid_argument&) {
-    return false;
-  }
-}
-
 Task<void> AnalyzeDecorations(std::shared_ptr<DecorationAnalysis> analysis,
                               std::weak_ptr<EditorViewport> viewport,
                               std::shared_ptr<DecorationAnalysis::Layer> current_layer) {
@@ -93,7 +79,7 @@ Task<void> AnalyzeDecorations(std::shared_ptr<DecorationAnalysis> analysis,
         continue;
       }
       const auto& block = blocks[range.block_index];
-      if (!IsValidDecorationRange(block, range.range)) {
+      if (!ValidTextRange(block, range.range)) {
         continue;
       }
       const auto id = DocumentAccess::Id(block);
