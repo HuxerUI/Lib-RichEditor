@@ -195,10 +195,12 @@ void TaskListCodecs() {
   Check(legacy.document && !legacy.document->Blocks()[0].Data().children[0].Data().task_checked &&
             json.Export(*legacy.document).text->find("task_checked") == std::string::npos,
         "Ordinary JSON v1 items omit task metadata");
-  Check(!json.Import(R"({"version":1,"blocks":[{"type":"paragraph","text":"Wrong","task_checked":false}]})").document &&
-            !json.Import(R"({"version":1,"blocks":[{"type":"list","ordered":false,"start":1,"tight":true,
-      "children":[{"type":"list_item","task_checked":null,"children":[{"type":"paragraph","text":"Wrong"}]}]}]})").document,
-        "JSON accepts task_checked only as a boolean on a list item");
+  Check(!json.Import(R"({"version":1,"blocks":[{"type":"paragraph","text":"Wrong","task_checked":false}]})").document,
+        "JSON accepts task_checked only on a list item");
+  const auto invalid_task = json.Import(R"({"version":1,"blocks":[{"type":"list","ordered":false,"start":1,"tight":true,
+      "children":[{"type":"list_item","task_checked":null,"children":[{"type":"paragraph","text":"Wrong"}]}]}]})");
+  Check(!invalid_task.document && invalid_task.issues.size() == 1 && invalid_task.issues.front().code == "json.invalid",
+        "JSON reports an invalid task completion state when task_checked is null");
   bool rejected = false;
   try {
     RichDocument::Create({Block(BlockData{.task_checked = false})});

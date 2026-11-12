@@ -119,6 +119,9 @@ Block DecodeBlock(const Json& object) {
   case BlockKind::ListItem:
     CheckFields(object, {"type", "children", "task_checked"});
     if (const auto checked = object.find("task_checked"); checked != object.end()) {
+      if (!checked->is_boolean()) {
+        throw std::invalid_argument("Expected a JSON boolean for task_checked");
+      }
       data.task_checked = checked->get<bool>();
     }
     break;
