@@ -12,8 +12,10 @@
 #include "attachments.h"
 #include "browser.h"
 #include "command_palette.h"
+#include "document_library.h"
 #include "labels.h"
 #include "settings.h"
+#include "workspace_store.h"
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
@@ -28,9 +30,20 @@ namespace {
 using DocumentId = std::uint64_t;
 
 struct DocumentFile {
-  FileReference reference;
-  std::optional<FileReference> directory;
+  FileSource reference;
+  std::optional<FileSource> directory;
   std::optional<File> identity;
+  std::shared_ptr<DocumentLibrary> library;
+  std::string library_id;
+
+  std::string Name() const {
+    if (library) {
+      if (const auto entry = library->Find(library_id)) {
+        return entry->name;
+      }
+    }
+    return reference.Name();
+  }
 };
 
 using Target = std::shared_ptr<DocumentFile>;
@@ -40,6 +53,9 @@ bool SameFile(const Target& first, const Target& second) {
 }
 
 std::string LocationLabel(const DocumentFile& file) {
+  if (file.library) {
+    return file.Name();
+  }
   if (const auto local = file.reference.AsFile()) {
     return local->Path();
   }
@@ -54,10 +70,10 @@ struct SavedDocument {
 };
 
 struct AttachmentLocation {
-  std::vector<FileReference> directories;
+  std::vector<FileSource> directories;
   std::shared_ptr<const ImageResolver> resolver;
 
-  AttachmentLocation(const std::optional<File>& working_directory, std::vector<FileReference> directories)
+  AttachmentLocation(const std::optional<File>& working_directory, std::vector<FileSource> directories)
       : directories(std::move(directories)), resolver(AttachmentResolver(working_directory, this->directories)) {}
 };
 
@@ -79,19 +95,23 @@ struct DocumentTab {
   State<Operation> operation{Operation::Idle};
   State<FindPanelState> find{FindPanelState{}};
   State<std::string> status{std::string{}};
+  State<std::optional<WorkspaceTabRecord>> unresolved{std::nullopt};
+  std::vector<std::string> restored_relative;
+  std::optional<std::string> library_folder;
+  std::optional<WorkspaceLocation> unavailable_attachments;
   bool opened_with_attachments;
 
   DocumentTab(DocumentId id, std::string name, std::optional<File> working_directory, RichDocument initial,
-              std::shared_ptr<const SavedDocument> original, std::optional<FileReference> attachment_directory)
+              std::shared_ptr<const SavedDocument> original, std::optional<FileSource> attachment_directory)
       : id(id), draft_name(std::move(name)), working_directory(std::move(working_directory)),
         initial(std::move(initial)), saved(original),
         attachments(AttachmentLocation(this->working_directory,
-            attachment_directory ? std::vector{std::move(*attachment_directory)} : std::vector<FileReference>{})),
+            attachment_directory ? std::vector{std::move(*attachment_directory)} : std::vector<FileSource>{})),
         opened_with_attachments(HasLocalAttachments(this->initial)) {}
 
   std::string Name() const {
     const auto& original = saved.Get();
-    return original ? original->target->reference.Name() : draft_name;
+    return original ? original->target->Name() : draft_name;
   }
 
   RichDocument Snapshot() const {
@@ -107,17 +127,19 @@ struct DocumentTab {
 
   bool Busy() const { return operation.Get() != Operation::Idle; }
 
-  void SetAttachmentDirectory(FileReference directory) {
+  void SetAttachmentDirectory(FileSource directory) {
+    unavailable_attachments.reset();
     attachments = AttachmentLocation(working_directory, {std::move(directory)});
   }
 
-  void BindAttachmentDirectory(FileReference directory) {
+  void BindAttachmentDirectory(FileSource directory) {
+    unavailable_attachments.reset();
     auto sources = attachments->directories;
     if (const auto local = directory.AsFile()) {
       if (!sources.empty() && sources.front().AsFile() == local) {
         return;
       }
-      std::erase_if(sources, [&](const FileReference& source) { return source.AsFile() == local; });
+      std::erase_if(sources, [&](const FileSource& source) { return source.AsFile() == local; });
     }
     // Undo can restore a reference that was absent from the saved snapshot.
     sources.insert(sources.begin(), std::move(directory));
@@ -132,7 +154,7 @@ enum class FolderLoad { Unloaded, Loading, Loaded, Failed };
 struct FolderEntry {
   std::uint64_t id;
   std::string name;
-  std::optional<FileReference> directory;
+  std::optional<FileSource> directory;
   Target file;
   std::optional<File> identity;
   State<bool> expanded{false};
@@ -141,7 +163,27 @@ struct FolderEntry {
   State<std::string> error{std::string{}};
   std::uint64_t load_generation = 0;
   std::weak_ptr<FolderEntry> parent;
+  State<std::optional<WorkspaceFolderRecord>> unresolved{std::nullopt};
+  State<bool> mounted{true};
+  std::string recent_id;
 };
+
+struct RecentItem {
+  WorkspaceRecentRecord record;
+  Target target;
+  std::optional<FileSource> directory;
+
+  std::string Name(const DocumentLibrary* library) const {
+    if (library && !record.library_document.empty()) {
+      if (const auto entry = library->Find(record.library_document)) {
+        return entry->name;
+      }
+    }
+    return record.name;
+  }
+};
+
+using Recent = std::shared_ptr<RecentItem>;
 
 struct CloseRequest {
   Tab tab;
@@ -159,12 +201,15 @@ struct PaneSizes {
 };
 
 struct Workspace {
+  std::string id = UniqueName("window-");
   std::optional<WindowHandle> window;
   State<std::vector<Tab>> tabs{std::vector<Tab>{}};
   State<DocumentId> selected{0};
   State<std::vector<Entry>> folders{std::vector<Entry>{}};
   State<bool> files_open{true};
+  State<bool> external_open{true};
   State<bool> recents_open{true};
+  State<std::vector<std::string>> library_expanded{std::vector<std::string>{}};
   State<bool> sidebar_visible{true};
   State<bool> showing_outline{false};
   State<bool> drawer_open{false};
@@ -175,6 +220,7 @@ struct Workspace {
   State<std::string> status{std::string{}};
   bool allow_close = false;
   bool palette_open = false;
+  State<bool> restoring{false};
   std::uint64_t next_entry = 0;
 
   Tab Selected() const {
@@ -183,15 +229,149 @@ struct Workspace {
     const auto found = std::ranges::find_if(open, [id](const Tab& tab) { return tab->id == id; });
     return found == open.end() ? nullptr : *found;
   }
+
+  void PruneFolders() const {
+    folders.Update([&](auto& roots) {
+      std::erase_if(roots, [&](const Entry& root) {
+        return !root->mounted.Get() && std::ranges::none_of(tabs.Get(), [&](const Tab& tab) {
+          if (const auto& pending = tab->unresolved.Get()) {
+            return pending->folder == root->id;
+          }
+          auto folder = tab->source_folder.Get();
+          while (folder && folder != root) {
+            folder = folder->parent.lock();
+          }
+          return folder == root;
+        });
+      });
+    });
+  }
 };
 
 struct FolioState {
-  State<std::vector<Target>> recent{std::vector<Target>{}};
+  std::shared_ptr<WorkspaceStore> store;
+  std::shared_ptr<DocumentLibrary> library;
+  std::optional<File> temporary_directory;
+  std::vector<WorkspaceWindowRecord> restore_windows;
+  std::optional<WorkspaceWindowRecord> installing;
+  State<std::size_t> restoring{0};
+  State<std::vector<Recent>> recent{std::vector<Recent>{}};
   State<std::vector<Target>> pending_files{std::vector<Target>{}};
   std::vector<std::weak_ptr<Workspace>> windows;
   State<std::uint64_t> window_revision{0};
   DocumentId next_document = 0;
   unsigned next_draft = 0;
+
+  Target LibraryTarget(std::string_view id) const {
+    const auto entry = library ? library->Find(id) : std::nullopt;
+    if (!entry || entry->folder) {
+      return {};
+    }
+    const auto package = *library->Package(id);
+    const auto file = package.Child("article.json");
+    return std::make_shared<DocumentFile>(DocumentFile{FileSource(file, FileType::File, true),
+        FileSource(package, FileType::Directory, true), file, library, entry->id});
+  }
+
+  WorkspaceLocation Location(const FileSource& source) const {
+    const auto file = source.AsFile();
+    for (auto parent = file; parent; parent = parent->Parent()) {
+      if (parent == temporary_directory) {
+        return {};
+      }
+    }
+    return {file ? file->Path() : std::string{}, source.CanWrite()};
+  }
+
+  void Persist(const Workspace& workspace, bool activate = false) const {
+    WorkspaceWindowRecord window{
+        .id = workspace.id, .selected = workspace.selected.Get(),
+        .sidebar_width = workspace.pane_sizes->sidebar.width.value_or(default_sidebar_width),
+        .sidebar_visible = workspace.sidebar_visible.Get(), .showing_outline = workspace.showing_outline.Get(),
+        .files_open = workspace.files_open.Get(), .recents_open = workspace.recents_open.Get(),
+        .library_expanded = workspace.library_expanded.Get(),
+    };
+    for (const auto& folder : workspace.folders.Get()) {
+      if (const auto& unresolved = folder->unresolved.Get()) {
+        window.folders.push_back(*unresolved);
+      } else if (folder->directory) {
+        window.folders.push_back({folder->id, folder->name, Location(*folder->directory), folder->recent_id});
+      }
+    }
+    for (const auto& tab : workspace.tabs.Get()) {
+      if (const auto& unresolved = tab->unresolved.Get()) {
+        window.tabs.push_back(*unresolved);
+        continue;
+      }
+      const auto& original = tab->saved.Get();
+      if (!original) {
+        continue;
+      }
+      const auto& target = *original->target;
+      if (target.library) {
+        window.tabs.push_back({.id = tab->id, .name = tab->Name(), .library_document = target.library_id});
+        continue;
+      }
+      WorkspaceTabRecord record{.id = tab->id, .name = tab->Name(), .location = Location(target.reference)};
+      const auto& attachments = tab->attachments->directories;
+      if (!attachments.empty()) {
+        record.attachments = Location(attachments.front());
+      } else if (tab->unavailable_attachments) {
+        record.attachments = *tab->unavailable_attachments;
+      }
+      auto folder = tab->source_folder.Get();
+      if (folder) {
+        if (tab->restored_relative.empty()) {
+          record.relative.push_back(record.name);
+        }
+        while (auto parent = folder->parent.lock()) {
+          if (tab->restored_relative.empty()) {
+            record.relative.push_back(folder->name);
+          }
+          folder = std::move(parent);
+        }
+        if (std::ranges::find(window.folders, folder->id, &WorkspaceFolderRecord::id) != window.folders.end()) {
+          record.folder = folder->id;
+          if (tab->restored_relative.empty()) {
+            std::ranges::reverse(record.relative);
+          } else {
+            record.relative = tab->restored_relative;
+          }
+        } else {
+          record.relative.clear();
+        }
+      } else if (target.directory && !target.directory->AsFile()) {
+        record.package = target.directory->Name();
+      }
+      window.tabs.push_back(std::move(record));
+    }
+    std::erase_if(window.folders, [&](const WorkspaceFolderRecord& folder) {
+      return std::ranges::none_of(window.tabs, [&](const WorkspaceTabRecord& tab) { return tab.folder == folder.id; });
+    });
+    if (std::ranges::find(window.tabs, window.selected, &WorkspaceTabRecord::id) == window.tabs.end()) {
+      window.selected = window.tabs.empty() ? 0 : window.tabs.front().id;
+    }
+    auto record = store->Get();
+    const auto saved = std::ranges::find(record.windows, window.id, &WorkspaceWindowRecord::id);
+    if (saved == record.windows.end()) {
+      record.windows.push_back(std::move(window));
+    } else {
+      *saved = std::move(window);
+    }
+    if (activate || record.active_window.empty()) {
+      record.active_window = workspace.id;
+    }
+    store->Set(std::move(record));
+  }
+
+  void Forget(const Workspace& workspace) const {
+    auto record = store->Get();
+    std::erase_if(record.windows, [&](const WorkspaceWindowRecord& window) { return window.id == workspace.id; });
+    if (record.active_window == workspace.id) {
+      record.active_window = record.windows.empty() ? std::string{} : record.windows.back().id;
+    }
+    store->Set(std::move(record));
+  }
 
   void QueueActivation(const ApplicationActivation& activation) {
     if (const auto* files = std::get_if<FileActivation>(&activation)) {
@@ -222,20 +402,59 @@ struct FolioState {
     return first;
   }
 
-  void Remember(Target target) {
-    recent.Update([target = std::move(target)](auto& entries) {
-      std::erase_if(entries, [&](const Target& entry) { return SameFile(entry, target); });
-      entries.insert(entries.begin(), target);
+  void PersistRecent() const {
+    auto saved = store->Get();
+    saved.recent.clear();
+    for (const auto& item : recent.Get()) {
+      auto record = item->record;
+      record.name = item->Name(library.get());
+      saved.recent.push_back(std::move(record));
+    }
+    store->Set(std::move(saved));
+  }
+
+  std::string Remember(RecentItem item) const {
+    recent.Update([&](auto& entries) {
+      std::erase_if(entries, [&](const Recent& existing) {
+        const auto& prior = existing->record;
+        const auto& current = item.record;
+        const bool same = (!current.id.empty() && current.id == prior.id) ||
+            (!current.library_document.empty() && current.library_document == prior.library_document) ||
+            (current.kind == prior.kind && !current.location.path.empty() && current.location.path == prior.location.path) ||
+            (item.target && existing->target && SameFile(item.target, existing->target));
+        if (same && item.record.id.empty()) {
+          item.record.id = prior.id;
+        }
+        return same;
+      });
+      if (item.record.id.empty()) {
+        item.record.id = UniqueName("recent-");
+      }
+      entries.insert(entries.begin(), std::make_shared<RecentItem>(item));
       constexpr std::size_t recent_limit = 24;
       if (entries.size() > recent_limit) {
         entries.resize(recent_limit);
       }
     });
+    PersistRecent();
+    return item.record.id;
+  }
+
+  void RemoveRecent(std::string_view id) const {
+    recent.Update([&](auto& entries) {
+      std::erase_if(entries, [&](const Recent& entry) { return entry->record.id == id; });
+    });
+    PersistRecent();
   }
 };
 
-enum class OpenKind { File, Folder, Package };
-enum class WriteKind { Save, SaveAs, Export };
+enum class OpenKind { File, Folder, Package, Import };
+struct OpenRequest {
+  OpenKind kind;
+  std::string import_parent;
+  std::string recent_id;
+};
+enum class WriteKind { Save, SaveAs, Export, Library };
 enum class ChildKind { File, Folder };
 
 struct SaveRequest {
@@ -264,9 +483,11 @@ struct OpenFailure {
   std::string message;
   std::vector<ConversionIssue> issues;
   std::optional<RichDocument> lossy_copy;
+  std::optional<std::string> import_parent;
 };
 
 using OpenResult = std::variant<std::shared_ptr<Workspace>, OpenFailure>;
+using LoadedDocument = std::variant<std::shared_ptr<const SavedDocument>, OpenFailure>;
 
 std::string IssueMessage(const std::vector<ConversionIssue>& issues) {
   if (issues.empty()) {
@@ -299,12 +520,25 @@ public:
   }
   bool CanExecute(FolioCommand command) const;
   void Execute(FolioCommand command, bool keyboard = false) const;
-  void NewDocument(bool sample = false) const;
+  void NewDocument(bool sample = false, std::optional<std::string> library_folder = {}) const;
+  void OpenLibraryDocument(std::string id) const;
+  void SetLibraryExpanded(std::string id, bool expanded) const;
+  void RenameLibraryEntry(std::string id) const;
+  void NewLibraryFolder(std::string parent) const;
+  void ChooseLibraryDestination(std::string id) const;
+  void MoveLibraryEntry(std::string id, std::string parent) const;
   void JumpToHeading(const Tab& tab, const Block& block, TextOffset length) const;
   void NewWindow() const;
-  void PickOpen(OpenKind kind) const;
+  void PickOpen(OpenKind kind) const { PickOpen(OpenRequest{kind}); }
+  void PickOpen(OpenRequest request) const;
+  void OpenRecent(Recent item) const;
+  void RemoveExternalFolder(const Entry& folder) const;
   void OpenKnown(Target target, Entry source_folder = {}) const;
   void OpenActivated() const;
+  void RestoreWorkspace() const;
+  void RestoreWindows() const;
+  void RelocateTab(Tab tab) const;
+  void RelocateFolder(Entry folder) const;
   void SetExpanded(const Entry& entry, bool expanded) const;
   void RequestNewChild(Entry folder, ChildKind kind) const;
   void Select(const Tab& tab) const;
@@ -319,13 +553,23 @@ private:
   void ShowCommandPalette(bool keyboard) const;
   void Status(const Tab& tab, StringVariant message) const;
   void Launch(bool uses_picker, std::function<Task<void>()> action, std::function<void(std::string)> failed = {}) const;
-  void AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved = {},
-              Entry source_folder = {}, std::optional<FileReference> attachment_directory = {}) const;
+  Tab AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved = {},
+             Entry source_folder = {}, std::optional<FileSource> attachment_directory = {},
+             std::optional<std::string> library_folder = {}) const;
+  void EditLibraryName(LibraryEntry entry, bool creating) const;
+  void UpdateLibraryEntry(LibraryEntry entry) const;
   std::shared_ptr<Workspace> ActivateExisting(const Target& target, const Entry& source_folder) const;
   Task<OpenResult> OpenTarget(Target target, const Entry& source_folder) const;
-  Task<void> OpenTargets(std::vector<Target> targets, Entry source_folder = {}) const;
+  Task<void> OpenTargets(std::vector<Target> targets, Entry source_folder = {}, RecentKind kind = RecentKind::File,
+                         std::string recent_id = {}) const;
+  Task<void> OpenPicked(OpenRequest request) const;
+  Task<void> OpenDirectory(FileSource directory, OpenKind kind, std::string recent_id) const;
+  Task<void> RestoreTab(Tab tab, std::optional<FileSource> directory = {}) const;
+  Task<void> RestoreFolderTabs(Entry folder) const;
+  Task<void> FillRestoredTab(Tab tab, Target target, Entry folder) const;
+  void FinishRestore() const;
   void ShowOpenFailures(std::vector<OpenFailure> failures) const;
-  Task<Entry> AddFolder(FileReference directory) const;
+  Task<Entry> AddFolder(FileSource directory, std::string recent_id = {}) const;
   void LoadFolder(Entry entry) const;
   void PromptNewChild(Entry folder, ChildKind kind, std::string name = {}, std::string message = {}) const;
   void CreateChild(Entry folder, ChildKind kind, std::string name) const;
@@ -339,6 +583,7 @@ private:
                            std::string message) const;
   void WriteNew(Save request, WriteKind kind, std::string name, SavePayload payload) const;
   void SaveOriginal(Save request) const;
+  void SaveToLibrary(Save request) const;
   void ChooseOriginalFolder(Save request, std::shared_ptr<const SavedDocument> original, SavePayload payload) const;
   Task<void> WriteOriginalFile(Save request, std::shared_ptr<const SavedDocument> original, Target target,
                                SavePayload payload) const;
@@ -360,11 +605,17 @@ bool WorkbenchActions::CanExecute(FolioCommand command) const {
   case FolioCommand::OpenFile:
     return picker->CanOpenFiles();
   case FolioCommand::Save:
-    return tab && !tab->Busy();
-  case FolioCommand::SaveAs:
-    return tab && !tab->Busy() && picker->CanOpenDirectories(true);
+    return tab && !tab->unresolved.Get() && !tab->Busy();
+  case FolioCommand::SaveAs: {
+    if (!tab || tab->unresolved.Get() || tab->Busy()) {
+      return false;
+    }
+    const auto& saved = tab->saved.Get();
+    const bool exports = IsMobilePlatform() || (saved && saved->target->library);
+    return picker->CanOpenDirectories(true) || (exports && picker->CanSaveFiles());
+  }
   case FolioCommand::Find:
-    return static_cast<bool>(tab);
+    return tab && !tab->unresolved.Get();
   case FolioCommand::OpenCommandPalette:
     return !workspace->palette_open;
   case FolioCommand::NewDocument:
@@ -389,9 +640,12 @@ void WorkbenchActions::Execute(FolioCommand command, bool keyboard) const {
   case FolioCommand::Save:
     RequestSave(workspace->Selected(), WriteKind::Save);
     break;
-  case FolioCommand::SaveAs:
-    RequestSave(workspace->Selected(), WriteKind::SaveAs);
+  case FolioCommand::SaveAs: {
+    const auto tab = workspace->Selected();
+    const auto& saved = tab->saved.Get();
+    RequestSave(tab, IsMobilePlatform() || (saved && saved->target->library) ? WriteKind::Export : WriteKind::SaveAs);
     break;
+  }
   case FolioCommand::Find:
     workspace->Selected()->find.Update([](FindPanelState& find) {
       find.open = true;
@@ -400,6 +654,9 @@ void WorkbenchActions::Execute(FolioCommand command, bool keyboard) const {
     break;
   case FolioCommand::ToggleSidebar:
     sidebar_open = !sidebar_open.Get();
+    if (!modal_sidebar) {
+      folio->Persist(*workspace);
+    }
     break;
   case FolioCommand::Settings:
     if (modal_sidebar) {
@@ -518,25 +775,30 @@ void WorkbenchActions::Launch(bool uses_picker, std::function<Task<void>()> acti
   });
 }
 
-void WorkbenchActions::AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved,
-                              Entry source_folder, std::optional<FileReference> attachment_directory) const {
-  std::optional<File> directory;
+std::optional<File> NewWorkingDirectory(const ApplicationHandle& application) {
   try {
-    directory = application.Directories().temporary_directory.Child(UniqueName("folio-document-"));
+    return application.Directories().temporary_directory.Child(UniqueName("folio-document-"));
   } catch (const std::logic_error&) {
-    // A draft can still be edited on a host without application storage.
+    return std::nullopt;
   }
+}
+
+Tab WorkbenchActions::AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved,
+                             Entry source_folder, std::optional<FileSource> attachment_directory,
+                             std::optional<std::string> library_folder) const {
   if (saved) {
     attachment_directory = saved->target->directory;
   }
-  auto tab = std::make_shared<DocumentTab>(++folio->next_document, std::move(name), std::move(directory),
+  auto tab = std::make_shared<DocumentTab>(++folio->next_document, std::move(name), NewWorkingDirectory(application),
                                            std::move(snapshot), std::move(saved), std::move(attachment_directory));
   tab->source_folder = std::move(source_folder);
+  tab->library_folder = std::move(library_folder);
   workspace->tabs.Update([&](auto& open) { open.push_back(tab); });
   Select(tab);
+  return tab;
 }
 
-void WorkbenchActions::NewDocument(bool sample) const {
+void WorkbenchActions::NewDocument(bool sample, std::optional<std::string> library_folder) const {
   if (!Available()) {
     return;
   }
@@ -555,7 +817,27 @@ void WorkbenchActions::NewDocument(bool sample) const {
   if (number != 1) {
     name += " " + std::to_string(number);
   }
-  AddTab(std::move(name), RichDocument{});
+  AddTab(std::move(name), RichDocument{}, {}, {}, {}, std::move(library_folder));
+}
+
+void WorkbenchActions::OpenLibraryDocument(std::string id) const {
+  if (auto target = folio->LibraryTarget(id)) {
+    OpenKnown(std::move(target));
+  }
+}
+
+void WorkbenchActions::SetLibraryExpanded(std::string id, bool expanded) const {
+  if (id.empty()) {
+    workspace->files_open = expanded;
+  } else {
+    workspace->library_expanded.Update([&](auto& ids) {
+      std::erase(ids, id);
+      if (expanded) {
+        ids.push_back(std::move(id));
+      }
+    });
+  }
+  folio->Persist(*workspace);
 }
 
 void WorkbenchActions::NewWindow() const {
@@ -571,9 +853,7 @@ void WorkbenchActions::NewWindow() const {
 void WorkbenchActions::Select(const Tab& tab) const {
   workspace->selected = tab->id;
   workspace->drawer_open = false;
-  if (const auto& original = tab->saved.Get()) {
-    folio->Remember(original->target);
-  }
+  folio->Persist(*workspace, !workspace->restoring.Get() && folio->restoring.Get() == 0);
 }
 
 std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& target, const Entry& source_folder) const {
@@ -590,6 +870,9 @@ std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& targ
         }
         if (owner == workspace) {
           if (source_folder) {
+            if (source_folder != tab->source_folder.Get()) {
+              tab->restored_relative.clear();
+            }
             tab->source_folder = source_folder;
           }
           Select(tab);
@@ -598,7 +881,7 @@ std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& targ
           owner->drawer_open = false;
           owner->window->Activate();
           workspace->drawer_open = false;
-          folio->Remember(original->target);
+          folio->Persist(*owner, true);
         } else {
           continue;
         }
@@ -609,26 +892,20 @@ std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& targ
   return {};
 }
 
-Task<OpenResult> WorkbenchActions::OpenTarget(Target target, const Entry& source_folder) const {
+Task<LoadedDocument> LoadDocument(Target target, bool offer_lossy_copy = false) {
   if (!target->identity) {
     target->identity = co_await LocalIdentity(target->reference);
-  }
-  if (auto owner = ActivateExisting(target, source_folder)) {
-    co_return owner;
   }
   auto read = co_await ReadDocument(target->reference);
   if (!read.Succeeded()) {
     co_return OpenFailure{target, read.Error().message};
-  }
-  if (auto owner = ActivateExisting(target, source_folder)) {
-    co_return owner;
   }
   auto source = std::move(read.Value());
   const auto& codec = Codec(source.format);
   auto imported = codec.Import(source.Text());
   if (!imported.document) {
     OpenFailure failure{target, {}, std::move(imported.issues)};
-    if (source.format == DocumentFormat::Markdown) {
+    if (offer_lossy_copy && source.format == DocumentFormat::Markdown) {
       // The offered copy must come from the same bytes that produced the diagnostics.
       auto lossy = codec.Import(source.Text(), LossPolicy::AllowLoss);
       if (lossy.document) {
@@ -638,13 +915,68 @@ Task<OpenResult> WorkbenchActions::OpenTarget(Target target, const Entry& source
     }
     co_return failure;
   }
-  auto original = std::make_shared<const SavedDocument>(
+  co_return std::make_shared<const SavedDocument>(
       SavedDocument{target, source.format, *imported.document, std::move(source.bytes)});
-  AddTab(target->reference.Name(), std::move(*imported.document), std::move(original), source_folder);
+}
+
+void SetRestoredDocument(const Tab& tab, std::shared_ptr<const SavedDocument> original, const Entry& folder) {
+  tab->initial = original->snapshot;
+  tab->opened_with_attachments = HasLocalAttachments(tab->initial);
+  tab->saved = original;
+  if (original->target->directory) {
+    tab->SetAttachmentDirectory(*original->target->directory);
+  }
+  tab->source_folder = folder;
+  if (folder) {
+    tab->restored_relative = tab->unresolved.Get()->relative;
+  }
+  tab->status = std::string{};
+  tab->unresolved = std::nullopt;
+}
+
+Task<OpenResult> WorkbenchActions::OpenTarget(Target target, const Entry& source_folder) const {
+  if (!target->identity) {
+    target->identity = co_await LocalIdentity(target->reference);
+  }
+  if (auto owner = ActivateExisting(target, source_folder)) {
+    co_return owner;
+  }
+  auto loaded = co_await LoadDocument(target, true);
+  if (auto* failure = std::get_if<OpenFailure>(&loaded)) {
+    co_return std::move(*failure);
+  }
+  if (auto owner = ActivateExisting(target, source_folder)) {
+    co_return owner;
+  }
+  const auto original = std::get<std::shared_ptr<const SavedDocument>>(std::move(loaded));
+  if (const auto path = target->reference.AsFile()) {
+    for (const auto& weak : folio->windows) {
+      const auto owner = weak.lock();
+      if (!owner || !owner->window || !owner->window->IsOpen()) {
+        continue;
+      }
+      const auto& tabs = owner->tabs.Get();
+      const auto match = std::ranges::find_if(tabs, [&](const Tab& tab) {
+        const auto& pending = tab->unresolved.Get();
+        return pending && (pending->location.path == path->Path() ||
+            (target->identity && pending->location.path == target->identity->Path()));
+      });
+      if (match != tabs.end()) {
+        SetRestoredDocument(*match, original, source_folder);
+        owner->selected = (*match)->id;
+        owner->drawer_open = false;
+        owner->window->Activate();
+        folio->Persist(*owner, true);
+        co_return owner;
+      }
+    }
+  }
+  AddTab(target->Name(), original->snapshot, original, source_folder);
   co_return workspace;
 }
 
-Task<void> WorkbenchActions::OpenTargets(std::vector<Target> targets, Entry source_folder) const {
+Task<void> WorkbenchActions::OpenTargets(std::vector<Target> targets, Entry source_folder, RecentKind kind,
+                                          std::string recent_id) const {
   std::shared_ptr<Workspace> last_owner;
   std::vector<OpenFailure> failures;
   for (const auto& target : targets) {
@@ -652,6 +984,11 @@ Task<void> WorkbenchActions::OpenTargets(std::vector<Target> targets, Entry sour
       auto result = co_await OpenTarget(target, source_folder);
       if (auto* owner = std::get_if<std::shared_ptr<Workspace>>(&result)) {
         last_owner = std::move(*owner);
+        const bool package = kind == RecentKind::Package && target->directory;
+        const auto& source = package ? *target->directory : target->reference;
+        folio->Remember({{recent_id, package ? source.Name() : target->Name(),
+                          target->library ? WorkspaceLocation{} : folio->Location(source), kind, target->library_id},
+                         target, {}});
       } else {
         failures.push_back(std::get<OpenFailure>(std::move(result)));
       }
@@ -677,7 +1014,7 @@ void WorkbenchActions::OpenKnown(Target target, Entry source_folder) const {
 }
 
 void WorkbenchActions::OpenActivated() const {
-  if (folio->pending_files->empty() || !Available() || folio->ActivationWindow() != workspace) {
+  if (folio->restoring.Get() || folio->pending_files->empty() || !Available() || folio->ActivationWindow() != workspace) {
     return;
   }
   auto files = folio->pending_files.Get();
@@ -688,57 +1025,341 @@ void WorkbenchActions::OpenActivated() const {
   });
 }
 
-void WorkbenchActions::PickOpen(OpenKind kind) const {
-  if (!Available()) {
+Task<std::optional<FileSource>> OpenWorkspacePath(WorkspaceLocation location, FileType type) {
+  if (location.path.empty()) {
+    co_return std::nullopt;
+  }
+  const File file(location.path);
+  const auto info = co_await file.StatAsync();
+  if (!info.Succeeded() || info.Value().type != type) {
+    co_return std::nullopt;
+  }
+  co_return FileSource(file, type, location.writable);
+}
+
+Task<void> WorkbenchActions::FillRestoredTab(Tab tab, Target target, Entry folder) const {
+  auto loaded = co_await LoadDocument(std::move(target));
+  if (!tab->unresolved.Get() || std::ranges::find(workspace->tabs.Get(), tab) == workspace->tabs->end()) {
+    co_return;
+  }
+  if (auto* original = std::get_if<std::shared_ptr<const SavedDocument>>(&loaded)) {
+    SetRestoredDocument(tab, *original, folder);
+    folio->Persist(*workspace);
+  } else {
+    const auto& failure = std::get<OpenFailure>(loaded);
+    Status(tab, failure.message.empty() ? IssueMessage(failure.issues) : failure.message);
+  }
+}
+
+Task<void> WorkbenchActions::RestoreTab(Tab tab, std::optional<FileSource> directory) const {
+  const auto pending = tab->unresolved.Get();
+  if (!pending) {
+    co_return;
+  }
+  if (!pending->library_document.empty()) {
+    if (auto target = folio->LibraryTarget(pending->library_document)) {
+      co_await FillRestoredTab(tab, std::move(target), {});
+    }
+    co_return;
+  }
+  const auto& roots = workspace->folders.Get();
+  const auto root = std::ranges::find_if(roots, [&](const Entry& folder) { return folder->id == pending->folder; });
+  const auto folder = root == roots.end() ? Entry{} : *root;
+  if (!directory) {
+    auto local = co_await OpenWorkspacePath(pending->location, FileType::File);
+    if (local) {
+      auto attachments = co_await OpenWorkspacePath(pending->attachments, FileType::Directory);
+      if (!attachments && pending->attachments.path.empty()) {
+        if (const auto parent = local->AsFile()->Parent()) {
+          const bool writable = folder && folder->directory && folder->directory->CanWrite();
+          attachments = FileSource(*parent, FileType::Directory, writable);
+        }
+      } else if (!attachments) {
+        tab->unavailable_attachments = pending->attachments;
+      }
+      co_await FillRestoredTab(tab, std::make_shared<DocumentFile>(DocumentFile{*local, attachments, {}}), folder);
+      co_return;
+    }
+    directory = folder ? folder->directory : std::nullopt;
+  }
+  if (!directory || pending->relative.empty()) {
+    co_return;
+  }
+  for (std::size_t index = 0; index < pending->relative.size(); ++index) {
+    const bool last = index + 1 == pending->relative.size();
+    auto entry = co_await FindChild(*directory, pending->relative[index], last ? FileType::File : FileType::Directory);
+    if (!entry.Succeeded()) {
+      Status(tab, entry.Error().message);
+      co_return;
+    }
+    if (last) {
+      co_await FillRestoredTab(tab, std::make_shared<DocumentFile>(
+          DocumentFile{std::move(entry.Value()), directory, {}}), folder);
+    } else {
+      directory = std::move(entry.Value());
+    }
+  }
+}
+
+void WorkbenchActions::FinishRestore() const {
+  if (!workspace->restoring.Get()) {
     return;
   }
-  Status({}, {});
-  Launch(true, [self = *this, kind]() -> Task<void> {
-    if (kind == OpenKind::File) {
-      const auto file = co_await self.picker->OpenFileAsync({
-          .name = self.resources->GetString(l10n::rich_editor_documents), .extensions = {"json", "md", "markdown"},
-          .content_types = {"application/json", "text/markdown", "text/plain"},
-      });
-      if (file) {
-        co_await self.OpenTargets(std::vector{std::make_shared<DocumentFile>(DocumentFile{*file, {}, {}})});
+  workspace->restoring = false;
+  folio->Persist(*workspace);
+  folio->restoring = folio->restoring.Get() - 1;
+  if (folio->restoring.Get() == 0) {
+    const auto& active = folio->store->Get().active_window;
+    for (const auto& weak : folio->windows) {
+      if (const auto owner = weak.lock(); owner && owner->id == active && owner->window && owner->window->IsOpen()) {
+        owner->window->Activate();
+        break;
       }
+    }
+  }
+}
+
+void WorkbenchActions::RestoreWorkspace() const {
+  if (!workspace->restoring.Get()) {
+    return;
+  }
+  Launch(false, [self = *this]() -> Task<void> {
+    const auto folders = self.workspace->folders.Get();
+    for (const auto& folder : folders) {
+      const auto pending = folder->unresolved.Get();
+      if (pending) {
+        auto directory = co_await OpenWorkspacePath(pending->location, FileType::Directory);
+        if (directory && (co_await directory->AsFile()->ListChildrenAsync()).Succeeded()) {
+          folder->directory = std::move(directory);
+          folder->identity = co_await LocalIdentity(*folder->directory);
+          folder->unresolved = std::nullopt;
+        }
+      }
+    }
+    const auto tabs = self.workspace->tabs.Get();
+    for (const auto& tab : tabs) {
+      co_await self.RestoreTab(tab);
+    }
+    self.FinishRestore();
+  }, [self = *this](std::string error) {
+    self.Status({}, std::move(error));
+    self.FinishRestore();
+  });
+}
+
+void WorkbenchActions::RestoreWindows() const {
+  auto pending = std::exchange(folio->restore_windows, {});
+  for (auto& record : pending) {
+    folio->installing = std::move(record);
+    try {
+      application.OpenWindow(App, FolioWindowOptions());
+    } catch (const std::exception& error) {
+      folio->installing.reset();
+      folio->restoring = folio->restoring.Get() - 1;
+      Status({}, error.what());
+    }
+  }
+}
+
+void WorkbenchActions::RelocateTab(Tab tab) const {
+  const auto pending = tab->unresolved.Get();
+  if (!Available() || !pending || !pending->library_document.empty() || workspace->restoring.Get()) {
+    return;
+  }
+  const auto& roots = workspace->folders.Get();
+  const auto root = std::ranges::find_if(roots, [&](const Entry& folder) { return folder->id == pending->folder; });
+  if (root != roots.end() && (*root)->unresolved.Get()) {
+    RelocateFolder(*root);
+    return;
+  }
+  Launch(true, [self = *this, tab, pending]() -> Task<void> {
+    if (!pending->package.empty()) {
+      const auto folder = co_await self.picker->OpenDirectoryAsync();
+      if (!folder) {
+        co_return;
+      }
+      auto file = co_await FindPackageDocument(*folder);
+      if (!file.Succeeded()) {
+        self.Status(tab, file.Error().message);
+        co_return;
+      }
+      co_await self.FillRestoredTab(tab, std::make_shared<DocumentFile>(
+          DocumentFile{std::move(file.Value()), folder, {}}), {});
       co_return;
     }
-    const auto folder = co_await self.picker->OpenDirectoryAsync();
-    if (!folder) {
-      co_return;
-    }
-    if (kind == OpenKind::Folder) {
-      co_await self.AddFolder(*folder);
-      co_return;
-    }
-    auto file = co_await FindPackageDocument(*folder);
-    if (file.Succeeded()) {
-      co_await self.OpenTargets(std::vector{std::make_shared<DocumentFile>(
-          DocumentFile{std::move(file.Value()), folder, {}})});
-    } else {
-      self.Status({}, file.Error().message);
+    const auto file = co_await self.picker->OpenFileAsync({
+        .name = self.resources->GetString(l10n::rich_editor_documents), .extensions = {"json", "md", "markdown"},
+        .content_types = {"application/json", "text/markdown", "text/plain"},
+    });
+    if (file) {
+      co_await self.FillRestoredTab(tab, std::make_shared<DocumentFile>(DocumentFile{*file, {}, {}}), {});
     }
   });
 }
 
-Task<Entry> WorkbenchActions::AddFolder(FileReference directory) const {
-  const auto identity = co_await LocalIdentity(directory);
-  if (identity) {
-    for (const auto& folder : workspace->folders.Get()) {
-      if (identity == folder->identity) {
-        if (directory.CanWrite() && !folder->directory->CanWrite()) {
-          folder->directory = std::move(directory);
-          folder->expanded = true;
-          LoadFolder(folder);
-        } else {
-          SetExpanded(folder, true);
-        }
-        workspace->files_open = true;
-        workspace->drawer_open = true;
-        workspace->sidebar_visible = true;
-        co_return folder;
+void WorkbenchActions::RelocateFolder(Entry folder) const {
+  const auto pending = folder->unresolved.Get();
+  if (!Available() || !pending || workspace->restoring.Get() || !picker->CanOpenDirectories()) {
+    return;
+  }
+  Launch(true, [self = *this, folder, writable = pending->location.writable]() -> Task<void> {
+    const auto reference = co_await self.picker->OpenDirectoryAsync(writable && self.picker->CanOpenDirectories(true));
+    if (!reference) {
+      co_return;
+    }
+    folder->directory = *reference;
+    folder->name = reference->Name().empty() ? folder->name : reference->Name();
+    folder->identity = co_await LocalIdentity(*folder->directory);
+    folder->unresolved = std::nullopt;
+    if (folder->mounted.Get()) {
+      self.SetExpanded(folder, true);
+    }
+    co_await self.RestoreFolderTabs(folder);
+  });
+}
+
+Task<void> WorkbenchActions::RestoreFolderTabs(Entry folder) const {
+  const auto tabs = workspace->tabs.Get();
+  for (const auto& tab : tabs) {
+    const auto& record = tab->unresolved.Get();
+    if (record && record->folder == folder->id) {
+      co_await RestoreTab(tab, *folder->directory);
+    }
+  }
+}
+
+void WorkbenchActions::PickOpen(OpenRequest request) const {
+  if (!Available()) {
+    return;
+  }
+  Status({}, {});
+  Launch(true, [self = *this, request = std::move(request)] { return self.OpenPicked(request); });
+}
+
+Task<void> WorkbenchActions::OpenPicked(OpenRequest request) const {
+  if (request.kind == OpenKind::File || request.kind == OpenKind::Import) {
+    const auto file = co_await picker->OpenFileAsync({
+        .name = resources->GetString(l10n::rich_editor_documents), .extensions = {"json", "md", "markdown"},
+        .content_types = {"application/json", "text/markdown", "text/plain"},
+    });
+    if (!file) {
+      co_return;
+    }
+    auto target = std::make_shared<DocumentFile>(DocumentFile{*file, {}, {}});
+    if (request.kind == OpenKind::File) {
+      co_await OpenTargets(std::vector{std::move(target)}, {}, RecentKind::File, std::move(request.recent_id));
+      co_return;
+    }
+    if (const auto local = file->AsFile(); local && local->Parent()) {
+      target->directory = FileSource(*local->Parent(), FileType::Directory, false);
+    }
+    auto loaded = co_await LoadDocument(target, true);
+    if (auto* failure = std::get_if<OpenFailure>(&loaded)) {
+      failure->import_parent = std::move(request.import_parent);
+      ShowOpenFailures({std::move(*failure)});
+    } else {
+      const auto& original = std::get<std::shared_ptr<const SavedDocument>>(loaded);
+      auto tab = AddTab(target->Name(), original->snapshot, {}, {}, target->directory, std::move(request.import_parent));
+      StartSave(std::move(tab), WriteKind::Library);
+    }
+    co_return;
+  }
+  if (const auto directory = co_await picker->OpenDirectoryAsync()) {
+    co_await OpenDirectory(*directory, request.kind, std::move(request.recent_id));
+  }
+}
+
+Task<void> WorkbenchActions::OpenDirectory(FileSource directory, OpenKind kind, std::string recent_id) const {
+  if (kind == OpenKind::Folder) {
+    const auto folder = co_await AddFolder(std::move(directory), std::move(recent_id));
+    const auto& source = *folder->directory;
+    folder->recent_id = folio->Remember({{folder->recent_id, folder->name, folio->Location(source), RecentKind::Folder},
+                                        {}, source});
+    co_return;
+  }
+  auto file = co_await FindPackageDocument(directory);
+  if (file.Succeeded()) {
+    co_await OpenTargets(std::vector{std::make_shared<DocumentFile>(
+        DocumentFile{std::move(file.Value()), directory, {}})}, {}, RecentKind::Package, std::move(recent_id));
+  } else {
+    Status({}, file.Error().message);
+  }
+}
+
+OpenKind RecentOpenKind(RecentKind kind) {
+  switch (kind) {
+  case RecentKind::File: return OpenKind::File;
+  case RecentKind::Folder: return OpenKind::Folder;
+  case RecentKind::Package: return OpenKind::Package;
+  }
+  return OpenKind::File;
+}
+
+void WorkbenchActions::OpenRecent(Recent item) const {
+  if (!Available()) {
+    return;
+  }
+  Status({}, {});
+  Launch(true, [self = *this, item = std::move(item)]() -> Task<void> {
+    const auto& record = item->record;
+    const auto kind = RecentOpenKind(record.kind);
+    if (!record.library_document.empty()) {
+      if (auto target = self.folio->LibraryTarget(record.library_document)) {
+        co_await self.OpenTargets(std::vector{std::move(target)}, {}, record.kind, record.id);
+      } else {
+        self.Status({}, l10n::library_document_unavailable);
       }
+      co_return;
+    }
+    if (item->target) {
+      co_await self.OpenTargets(std::vector{item->target}, {}, record.kind, record.id);
+      co_return;
+    }
+    auto source = item->directory ? item->directory
+        : co_await OpenWorkspacePath(record.location, kind == OpenKind::File ? FileType::File : FileType::Directory);
+    if (source) {
+      if (kind == OpenKind::File) {
+        co_await self.OpenTargets(std::vector{std::make_shared<DocumentFile>(DocumentFile{*source, {}, {}})},
+                                  {}, record.kind, record.id);
+      } else {
+        co_await self.OpenDirectory(*source, kind, record.id);
+      }
+      co_return;
+    }
+    co_await self.OpenPicked({.kind = kind, .recent_id = record.id});
+  });
+}
+
+void WorkbenchActions::RemoveExternalFolder(const Entry& folder) const {
+  if (Available()) {
+    folder->mounted = false;
+    workspace->PruneFolders();
+  }
+}
+
+Task<Entry> WorkbenchActions::AddFolder(FileSource directory, std::string recent_id) const {
+  const auto identity = co_await LocalIdentity(directory);
+  workspace->external_open = true;
+  workspace->drawer_open = true;
+  workspace->sidebar_visible = true;
+  for (const auto folder : workspace->folders.Get()) {
+    if ((identity && identity == folder->identity) || (!recent_id.empty() && recent_id == folder->recent_id)) {
+      folder->mounted = true;
+      if (!recent_id.empty()) {
+        folder->recent_id = std::move(recent_id);
+      }
+      if (!folder->directory || !identity || (directory.CanWrite() && !folder->directory->CanWrite())) {
+        if (auto name = directory.Name(); !name.empty()) {
+          folder->name = std::move(name);
+        }
+        folder->directory = std::move(directory);
+        folder->identity = identity;
+        folder->unresolved = std::nullopt;
+        folder->load = FolderLoad::Unloaded;
+      }
+      SetExpanded(folder, true);
+      co_await RestoreFolderTabs(folder);
+      co_return folder;
     }
   }
   auto name = directory.Name();
@@ -748,10 +1369,8 @@ Task<Entry> WorkbenchActions::AddFolder(FileReference directory) const {
   auto folder = std::make_shared<FolderEntry>(FolderEntry{
       ++workspace->next_entry, std::move(name), std::move(directory), {}, identity,
   });
+  folder->recent_id = std::move(recent_id);
   workspace->folders.Update([&](auto& roots) { roots.push_back(folder); });
-  workspace->files_open = true;
-  workspace->sidebar_visible = true;
-  workspace->drawer_open = true;
   SetExpanded(folder, true);
   co_return folder;
 }
@@ -865,6 +1484,7 @@ void WorkbenchActions::LocateAttachments(Tab tab) const {
   Launch(true, [self = *this, tab]() -> Task<void> {
     if (auto folder = co_await self.picker->OpenDirectoryAsync()) {
       tab->SetAttachmentDirectory(std::move(*folder));
+      self.folio->Persist(*self.workspace);
       self.Status(tab, l10n::attachment_folder_linked);
     }
     tab->operation = Operation::Idle;
@@ -890,11 +1510,28 @@ std::string CopyName(std::string name, DocumentFormat format) {
   return copy;
 }
 
+using DialogSubmission = std::function<void()>;
+
+template <class Prepare>
+auto SubmitDialog(Prepare prepare, std::optional<TaskScope> text_input_tasks = {}) {
+  return [prepare, text_input_tasks] {
+    if (auto submit = prepare()) {
+      // Finish the text-input event before dismissing the dialog or opening another layer.
+      if (text_input_tasks) {
+        text_input_tasks->Post(std::move(submit));
+      } else {
+        submit();
+      }
+    }
+  };
+}
+
 [[huxerui::composable]]
 View OutputDialog(DialogContext context, StringVariant title, std::string name, DocumentFormat preferred,
                   std::string message, StringVariant action_label,
                   std::function<void(DocumentFormat, std::string)> action, std::function<void()> cancel) {
   const auto& theme = UseTheme();
+  const auto tasks = UseTaskScope();
   const auto format = UseState(preferred);
   const auto filename = UseState(TextEditingValue::FromText(NameForFormat(std::move(name), preferred)));
   const auto choose = [format, filename](DocumentFormat next) {
@@ -910,13 +1547,18 @@ View OutputDialog(DialogContext context, StringVariant title, std::string name, 
         Foreground(selected ? theme.colors.on_primary_container : theme.colors.on_surface),
         Semantics{.selected = selected});
   };
-  const auto field = filename.Get();
-  const bool valid = !field.composition && ValidDocumentName(field.text, format.Get());
-  const auto submit = [=] {
-    if (valid) {
-      context.Dismiss();
-      action(format.Get(), field.text);
+  const bool valid = !filename->composition && ValidDocumentName(filename->text, format.Get());
+  const auto prepare = [context, format, filename, action]() -> DialogSubmission {
+    const auto selected = format.Get();
+    const auto& field = filename.Get();
+    if (field.composition || !ValidDocumentName(field.text, selected)) {
+      return {};
     }
+    return [context, action, selected, name = field.text] {
+      if (context.Dismiss()) {
+        action(selected, name);
+      }
+    };
   };
   return DialogPanel(Column {
     Text(std::move(title), TextRole::Title),
@@ -927,13 +1569,13 @@ View OutputDialog(DialogContext context, StringVariant title, std::string name, 
     }.With(Spacing(6.0F)),
     TextField(filename).Label(l10n::file_name).Variant(TextFieldVariant::Outlined)
         .OnChanged([filename](const TextEditingValue& next) { filename = next; })
-        .OnSubmitted(submit),
+        .OnSubmitted(SubmitDialog(prepare, tasks)).Key("output-name"),
     DialogActions(theme,
       Button(l10n::cancel).OnClick([context, cancel] {
         context.Dismiss();
         cancel();
       }),
-      Button(std::move(action_label)).OnClick(submit).With(Enabled(valid))),
+      Button(std::move(action_label)).OnClick(SubmitDialog(prepare)).With(Enabled(valid))),
   }, theme, 420.0F);
 }
 
@@ -1022,7 +1664,7 @@ void WorkbenchActions::ShowOpenFailures(std::vector<OpenFailure> failures) const
     choices.push_back({std::move(label), [self = *this, finish, copies = std::move(failures)] {
       for (const auto& copy : copies) {
         self.AddTab(CopyName(copy.target->reference.Name(), DocumentFormat::Markdown),
-                    *copy.lossy_copy, {}, {}, copy.target->directory);
+                    *copy.lossy_copy, {}, {}, copy.target->directory, copy.import_parent);
       }
       finish();
     }, ChoiceTone::Primary});
@@ -1037,23 +1679,217 @@ bool ValidChildName(std::string_view name) {
       std::ranges::none_of(name, [](unsigned char ch) { return ch < 32; });
 }
 
+StringVariant LibraryWriteMessage(LibraryWriteResult result) {
+  switch (result) {
+  case LibraryWriteResult::Saved: return {};
+  case LibraryWriteResult::NameInUse: return l10n::name_already_used;
+  case LibraryWriteResult::Busy: return l10n::library_write_busy;
+  case LibraryWriteResult::Unavailable: return l10n::library_entry_unavailable;
+  case LibraryWriteResult::WriteFailed: return l10n::library_change_failed;
+  }
+  return {};
+}
+
+[[huxerui::composable]]
+View LibraryNameDialog(DialogContext context, StringVariant title, StringVariant label, StringVariant action,
+                       std::string name, State<bool> saving,
+                       std::function<Task<LibraryWriteResult>(std::string)> apply, std::function<void()> on_saved) {
+  const auto& theme = UseTheme();
+  const auto tasks = UseTaskScope();
+  const auto application_tasks = UseApplicationTaskScope();
+  const auto focus = UseViewHandle();
+  auto initial = TextEditingValue::FromText(std::move(name));
+  initial.selection.anchor = 0;
+  const auto value = UseState(std::move(initial));
+  const auto result = UseState(LibraryWriteResult::Saved);
+  const bool valid = !value->composition && ValidChildName(value->text);
+  auto validation = ValidationResult::None();
+  if (saving.Get()) {
+    validation = ValidationResult::Pending(l10n::saving);
+  } else if (!value->composition && !valid) {
+    validation = ValidationResult::Invalid(l10n::invalid_entry_name);
+  } else if (result.Get() != LibraryWriteResult::Saved) {
+    validation = ValidationResult::Invalid(LibraryWriteMessage(result.Get()));
+  }
+  const auto prepare = [context, tasks, application_tasks, value, saving, result, focus, apply,
+                        on_saved]() -> DialogSubmission {
+    const auto& current = value.Get();
+    if (saving.Get() || current.composition || !ValidChildName(current.text)) {
+      return {};
+    }
+    return [context, tasks, application_tasks, saving, result, focus, apply, on_saved, name = current.text] {
+      if (saving.Get()) {
+        return;
+      }
+      saving = true;
+      // Complete the catalog write even if the window closes while the write is in flight.
+      application_tasks.Launch([context, tasks, saving, result, focus, apply, on_saved, name]() -> Task<void> {
+        auto written = LibraryWriteResult::WriteFailed;
+        try {
+          written = co_await apply(name);
+        } catch (const std::exception&) {
+        }
+        tasks.Post([context, saving, result, focus, on_saved, written] {
+          saving = false;
+          if (written == LibraryWriteResult::Saved) {
+            if (context.Dismiss()) {
+              on_saved();
+            }
+          } else {
+            result = written;
+            focus.RequestFocus();
+          }
+        });
+      });
+    };
+  };
+  return DialogPanel(Column {
+    Text(title, TextRole::Title),
+    TextField(value).Label(label).Variant(TextFieldVariant::Outlined)
+        .Validation(validation).InputConfiguration({.read_only = saving.Get()})
+        .OnChanged([value, result](const TextEditingValue& next) {
+          if (next.text != value->text) {
+            result = LibraryWriteResult::Saved;
+          }
+          value = next;
+        }).OnSubmitted(SubmitDialog(prepare, tasks))
+        .With(focus, Semantics{.identifier = "library-entry-name"}).Key("library-entry-name"),
+    DialogActions(theme, Button(l10n::cancel).OnClick([context] { context.Dismiss(); }).With(Enabled(!saving.Get())),
+                  Button(action).OnClick(SubmitDialog(prepare)).With(Enabled(valid && !saving.Get()))).Key("actions"),
+  }, theme, 400.0F);
+}
+
+void WorkbenchActions::EditLibraryName(LibraryEntry entry, bool creating) const {
+  const State<bool> saving{false};
+  const auto id = std::make_shared<LayerId>();
+  const auto apply = [library = folio->library, entry, creating](std::string name) -> Task<LibraryWriteResult> {
+    auto current = creating ? std::optional(entry) : library->Find(entry.id);
+    if (!current) {
+      co_return LibraryWriteResult::Unavailable;
+    }
+    current->name = std::move(name);
+    co_return co_await library->Put(std::move(*current));
+  };
+  const auto on_saved = [self = *this, parent = entry.parent, creating] {
+    if (creating) {
+      self.SetLibraryExpanded(parent, true);
+    }
+  };
+  *id = dialog.Show(DialogFactory{[entry = std::move(entry), creating, saving, apply, on_saved](DialogContext context) {
+    return LibraryNameDialog(context, creating ? l10n::new_folder : l10n::library_rename,
+                             entry.folder ? l10n::folder_name : l10n::file_name, creating ? l10n::create : l10n::save,
+                             entry.name, saving, apply, on_saved);
+  }}, {.on_dismiss_request = [dialog = dialog, id, saving] {
+    if (!saving.Get()) {
+      dialog.Dismiss(*id);
+    }
+  }});
+}
+
+void WorkbenchActions::NewLibraryFolder(std::string parent) const {
+  if (Available() && folio->library) {
+    EditLibraryName({UniqueName("folder-"), resources->GetString(l10n::new_folder), std::move(parent), true}, true);
+  }
+}
+
+void WorkbenchActions::RenameLibraryEntry(std::string id) const {
+  if (Available()) {
+    if (const auto entry = folio->library->Find(id)) {
+      EditLibraryName(*entry, false);
+    }
+  }
+}
+
+void WorkbenchActions::UpdateLibraryEntry(LibraryEntry entry) const {
+  Launch(false, [self = *this, entry = std::move(entry)]() -> Task<void> {
+    const auto result = co_await self.folio->library->Put(entry);
+    if (result != LibraryWriteResult::Saved) {
+      self.Status({}, LibraryWriteMessage(result));
+      co_return;
+    }
+    self.SetLibraryExpanded(entry.parent, true);
+  });
+}
+
+void WorkbenchActions::MoveLibraryEntry(std::string id, std::string parent) const {
+  if (Available()) {
+    if (auto entry = folio->library->Find(id); entry && entry->parent != parent && folio->library->CanPlace(id, parent)) {
+      entry->parent = std::move(parent);
+      UpdateLibraryEntry(std::move(*entry));
+    }
+  }
+}
+
+[[huxerui::composable]]
+View MoveLibraryDialog(DialogContext context, WorkbenchActions actions, std::string id,
+                       std::vector<std::pair<std::string, std::string>> destinations) {
+  const auto& theme = UseTheme();
+  Views rows;
+  for (const auto& [folder, label] : destinations) {
+    rows.Add(Button(label).OnClick([context, actions, id, folder] {
+      context.Dismiss();
+      actions.MoveLibraryEntry(id, folder);
+    }).With(Frame{.min_height = 38.0F}).Key(folder));
+  }
+  return ScrollableDialogPanel(
+      Text(l10n::library_move_to, TextRole::Title),
+      ScrollView(Column {std::move(rows)}.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+          .With(Frame{.max_height = 300.0F}, ScrollBar()),
+      DialogActions(theme, Button(l10n::cancel).OnClick([context] { context.Dismiss(); }), {}), theme, 420.0F);
+}
+
+void WorkbenchActions::ChooseLibraryDestination(std::string id) const {
+  const auto library = folio->library;
+  const auto entry = library->Find(id);
+  if (!Available() || !entry) {
+    return;
+  }
+  std::vector<std::pair<std::string, std::string>> destinations;
+  for (const auto& folder : library->Entries()) {
+    if (folder.folder && folder.id != entry->parent && library->CanPlace(id, folder.id)) {
+      auto path = folder.name;
+      for (auto parent = library->Find(folder.parent); parent; parent = library->Find(parent->parent)) {
+        path = parent->name + " / " + path;
+      }
+      destinations.emplace_back(folder.id, std::move(path));
+    }
+  }
+  std::ranges::sort(destinations, {}, &std::pair<std::string, std::string>::second);
+  if (!entry->parent.empty()) {
+    destinations.insert(destinations.begin(), {"", resources->GetString(l10n::workspace)});
+  }
+  if (!destinations.empty()) {
+    dialog.Show(MoveLibraryDialog, *this, std::move(id), std::move(destinations));
+  }
+}
+
 [[huxerui::composable]]
 View NewChildDialog(DialogContext context, ChildKind kind, std::string folder, std::string name, std::string message,
                     std::function<void(std::string)> create) {
   const auto& theme = UseTheme();
+  const auto tasks = UseTaskScope();
   const bool file = kind == ChildKind::File;
   auto initial = TextEditingValue::FromText(name.empty()
       ? (file ? UseString(l10n::untitled) + ".md" : UseString(l10n::new_folder)) : name);
   initial.selection.anchor = 0;
   const auto value = UseState(std::move(initial));
-  const auto candidate = file && !FormatOf(value->text) ? value->text + ".md" : value->text;
-  const bool valid = !value->composition && ValidChildName(value->text) &&
-      (!file || ValidDocumentName(candidate, *FormatOf(candidate)));
-  const auto submit = [context, create, candidate, valid] {
-    if (valid) {
-      context.Dismiss();
-      create(candidate);
+  const auto child_name = [file](const TextEditingValue& field) -> std::optional<std::string> {
+    if (field.composition || !ValidChildName(field.text)) {
+      return {};
     }
+    auto candidate = file && !FormatOf(field.text) ? field.text + ".md" : field.text;
+    return !file || ValidDocumentName(candidate, *FormatOf(candidate)) ? std::optional(std::move(candidate)) : std::nullopt;
+  };
+  const auto prepare = [context, create, value, child_name]() -> DialogSubmission {
+    auto candidate = child_name(value.Get());
+    if (!candidate) {
+      return {};
+    }
+    return [context, create, name = std::move(*candidate)] {
+      if (context.Dismiss()) {
+        create(name);
+      }
+    };
   };
   return DialogPanel(Column {
     Text(file ? l10n::new_file : l10n::new_folder, TextRole::Title),
@@ -1061,10 +1897,10 @@ View NewChildDialog(DialogContext context, ChildKind kind, std::string folder, s
     message.empty() ? View{} : Text(std::move(message), TextRole::Label).With(Foreground(theme.colors.error)),
     TextField(value).Label(file ? l10n::file_name : l10n::folder_name).Variant(TextFieldVariant::Outlined)
         .OnChanged([value](const TextEditingValue& next) { value = next; })
-        .OnSubmitted(submit).Key("name"),
+        .OnSubmitted(SubmitDialog(prepare, tasks)).Key("name"),
     DialogActions(theme,
       Button(l10n::cancel).OnClick([context] { context.Dismiss(); }),
-      Button(l10n::create).OnClick(submit).With(Enabled(valid))).Key("actions"),
+      Button(l10n::create).OnClick(SubmitDialog(prepare)).With(Enabled(child_name(value.Get()).has_value()))).Key("actions"),
   }, theme, 400.0F);
 }
 
@@ -1113,37 +1949,37 @@ void WorkbenchActions::PromptNewChild(Entry folder, ChildKind kind, std::string 
   }});
 }
 
-Task<IoResult<FileReference>> CreateNamedFolder(FileReference parent, const std::string& name) {
+Task<IoResult<FileSource>> CreateNamedFolder(FileSource parent, const std::string& name) {
   const IoError exists{IoErrorCode::AlreadyExists, "A file or folder already uses that name"};
   if (const auto local = parent.AsFile()) {
     const auto info = co_await local->Child(name).StatAsync();
     if (info.Succeeded()) {
-      co_return IoResult<FileReference>::Failure(exists);
+      co_return IoResult<FileSource>::Failure(exists);
     }
     if (info.Error().code != IoErrorCode::NotFound) {
-      co_return IoResult<FileReference>::Failure(info.Error());
+      co_return IoResult<FileSource>::Failure(info.Error());
     }
   } else {
     auto children = co_await parent.ListChildrenAsync();
     if (!children.Succeeded()) {
-      co_return IoResult<FileReference>::Failure(children.Error());
+      co_return IoResult<FileSource>::Failure(children.Error());
     }
-    if (std::ranges::any_of(children.Value(), [&](const FileReference& child) { return child.Name() == name; })) {
-      co_return IoResult<FileReference>::Failure(exists);
+    if (std::ranges::any_of(children.Value(), [&](const FileSource& child) { return child.Name() == name; })) {
+      co_return IoResult<FileSource>::Failure(exists);
     }
   }
   co_return co_await parent.CreateDirectoryAsync(name);
 }
 
-Task<IoResult<FileReference>> CreateEmptyFile(FileReference parent, const std::string& name, File temporary) {
+Task<IoResult<FileSource>> CreateEmptyFile(FileSource parent, const std::string& name, File temporary) {
   auto encoded = Codec(*FormatOf(name)).Export(RichDocument{});
   const auto staged = temporary.Child(UniqueName("folio-new-"));
   if (!encoded.text || !(co_await temporary.CreateDirectoriesAsync()) ||
       !(co_await staged.WriteStringAsync(*encoded.text))) {
     (void)co_await staged.DeleteAsync();
-    co_return IoResult<FileReference>::Failure({IoErrorCode::Io, "Could not prepare the new document"});
+    co_return IoResult<FileSource>::Failure({IoErrorCode::Io, "Could not prepare the new document"});
   }
-  auto created = co_await parent.CopyFileFromAsync(staged, name, false);
+  auto created = co_await parent.CopyFileFromAsync(staged, name);
   (void)co_await staged.DeleteAsync();
   co_return created;
 }
@@ -1176,7 +2012,7 @@ void WorkbenchActions::CreateChild(Entry folder, ChildKind kind, std::string nam
 }
 
 void WorkbenchActions::RequestSave(Tab tab, WriteKind kind) const {
-  if (!tab || !Available() || tab->Busy()) {
+  if (!tab || tab->unresolved.Get() || !Available() || tab->Busy()) {
     return;
   }
   file_menu_focus.RequestFocus();
@@ -1198,7 +2034,9 @@ void WorkbenchActions::StartSave(Tab tab, WriteKind kind, std::function<void(boo
   request->tab->operation = kind == WriteKind::Export ? Operation::Export : Operation::Save;
   Status({}, {});
   Status(request->tab, {});
-  if (kind == WriteKind::Save) {
+  if (kind == WriteKind::Library) {
+    SaveToLibrary(request);
+  } else if (kind == WriteKind::Save) {
     SaveOriginal(request);
   } else {
     const auto& original = request->tab->saved.Get();
@@ -1218,13 +2056,18 @@ void WorkbenchActions::FinishSave(const Save& request, bool saved) const {
 
 void WorkbenchActions::MarkSaved(const Save& request, Target target, SavePayload payload) const {
   const auto bytes = std::as_bytes(std::span(payload.text));
+  const auto& original = request->tab->saved.Get();
+  if (original && !SameFile(original->target, target)) {
+    request->tab->source_folder = nullptr;
+    request->tab->restored_relative.clear();
+  }
   request->tab->saved = std::make_shared<const SavedDocument>(SavedDocument{
       target, payload.format, std::move(payload.snapshot), Bytes(bytes.begin(), bytes.end()),
   });
   if (target->directory) {
     request->tab->BindAttachmentDirectory(*target->directory);
   }
-  folio->Remember(std::move(target));
+  folio->Persist(*workspace);
   Status(request->tab, StringVariant::Format(l10n::saved_document, request->tab->Name()));
   FinishSave(request, true);
 }
@@ -1279,7 +2122,9 @@ void WorkbenchActions::ExplainMarkdownLoss(Save request, WriteKind kind, RichDoc
     name = CopyName(std::move(name), DocumentFormat::Markdown);
   }
   std::vector<Choice> choices{{l10n::cancel, [self = *this, request] { self.FinishSave(request, false); }}};
-  if (kind != WriteKind::Export && picker->CanOpenDirectories(true)) {
+  if (kind != WriteKind::Export && folio->library && IsMobilePlatform()) {
+    choices.push_back({l10n::library_save_copy, [self = *this, request] { self.SaveToLibrary(request); }, ChoiceTone::Primary});
+  } else if (kind != WriteKind::Export && picker->CanOpenDirectories(true)) {
     choices.push_back({l10n::save_as_json, [self = *this, request] {
       self.ChooseOutput(request, WriteKind::SaveAs, DocumentFormat::Json);
     }, ChoiceTone::Primary});
@@ -1380,7 +2225,11 @@ void WorkbenchActions::WriteNew(Save request, WriteKind kind, std::string name, 
 void WorkbenchActions::SaveOriginal(Save request) const {
   const auto original = request->tab->saved.Get();
   if (!original) {
-    ChooseOutput(request, WriteKind::SaveAs, DocumentFormat::Markdown);
+    if (folio->library) {
+      SaveToLibrary(request);
+    } else {
+      ChooseOutput(request, WriteKind::SaveAs, DocumentFormat::Markdown);
+    }
     return;
   }
   auto snapshot = request->tab->Snapshot();
@@ -1416,6 +2265,58 @@ void WorkbenchActions::SaveOriginal(Save request) const {
   Launch(false, [self = *this, request, original, payload = std::move(payload)]() mutable -> Task<void> {
     co_await self.WriteOriginalFile(request, original, original->target, std::move(payload));
   }, [self = *this, request](std::string error) { self.OfferSaveAs(request, std::move(error)); });
+}
+
+void WorkbenchActions::SaveToLibrary(Save request) const {
+  const auto library = folio->library;
+  if (!library) {
+    Status(request->tab, l10n::library_save_failed);
+    FinishSave(request, false);
+    return;
+  }
+  auto snapshot = request->tab->Snapshot();
+  auto encoded = Codec(DocumentFormat::Json).Export(snapshot);
+  if (!encoded.text) {
+    Status(request->tab, IssueMessage(encoded.issues));
+    FinishSave(request, false);
+    return;
+  }
+  const auto original = request->tab->saved.Get();
+  auto sources = request->tab->attachments->directories;
+  if (sources.empty() && original) {
+    if (const auto local = original->target->reference.AsFile(); local && local->Parent()) {
+      sources.emplace_back(*local->Parent(), FileType::Directory, false);
+    }
+  }
+  auto title = request->tab->Name();
+  if (FormatOf(title)) {
+    title.resize(title.rfind('.'));
+  }
+  auto entry = LibraryEntry{UniqueName("document-"), std::move(title), request->tab->library_folder.value_or("")};
+  const auto package = *library->Package(entry.id);
+  const auto failed = [self = *this, request](std::string message) {
+    self.Status(request->tab, std::move(message));
+    self.FinishSave(request, false);
+  };
+  Launch(false, [self = *this, request, library, entry = std::move(entry), package, sources = std::move(sources),
+                 payload = SavePayload{std::move(snapshot), DocumentFormat::Json, std::move(*encoded.text)},
+                 failed]() mutable -> Task<void> {
+    const auto saved = co_await WriteLibraryPackage(package, payload.text, request->tab->working_directory,
+                                                     std::move(sources), payload.snapshot);
+    if (!saved.Succeeded()) {
+      (void)co_await package.DeleteRecursivelyAsync();
+      failed(saved.Error().message);
+      co_return;
+    }
+    entry.name = library->UniqueTitle(std::move(entry.name), entry.parent);
+    const auto written = co_await library->Put(entry);
+    if (written != LibraryWriteResult::Saved) {
+      (void)co_await package.DeleteRecursivelyAsync();
+      failed(self.resources->GetString(LibraryWriteMessage(written)));
+      co_return;
+    }
+    self.MarkSaved(request, self.folio->LibraryTarget(entry.id), std::move(payload));
+  }, failed);
 }
 
 void WorkbenchActions::ChooseOriginalFolder(Save request, std::shared_ptr<const SavedDocument> original,
@@ -1455,9 +2356,11 @@ void WorkbenchActions::ChooseOriginalFolder(Save request, std::shared_ptr<const 
 
 Task<void> WorkbenchActions::WriteOriginalFile(Save request, std::shared_ptr<const SavedDocument> original,
                                              Target target, SavePayload payload) const {
-  const auto written = co_await WriteOriginal(target->reference, original->bytes, payload.text,
-                                              request->tab->working_directory, request->tab->attachments->directories,
-                                              target->directory, payload.snapshot, original->snapshot);
+  const auto written = target->library
+      ? co_await WriteLibraryPackage(*target->directory->AsFile(), payload.text, request->tab->working_directory,
+                                     request->tab->attachments->directories, payload.snapshot, original->snapshot)
+      : co_await WriteOriginal(target->reference, original->bytes, payload.text, request->tab->working_directory,
+                               request->tab->attachments->directories, target->directory, payload.snapshot, original->snapshot);
   if (!written.Succeeded()) {
     OfferSaveAs(request, written.Error().message);
     co_return;
@@ -1467,6 +2370,21 @@ Task<void> WorkbenchActions::WriteOriginalFile(Save request, std::shared_ptr<con
 
 void WorkbenchActions::OfferSaveAs(Save request, std::string message) const {
   const auto& original = request->tab->saved.Get();
+  if (original && original->target->library) {
+    Status(request->tab, std::move(message));
+    FinishSave(request, false);
+    return;
+  }
+  if (folio->library && IsMobilePlatform()) {
+    const auto format = original ? original->format : DocumentFormat::Json;
+    ShowChoices(l10n::library_save_copy, std::move(message), {
+        {l10n::cancel, [self = *this, request] { self.FinishSave(request, false); }},
+        {l10n::export_copy_menu, [self = *this, request, format] { self.ChooseOutput(request, WriteKind::Export, format); },
+         ChoiceTone::Secondary},
+        {l10n::library_save_copy, [self = *this, request] { self.SaveToLibrary(request); }, ChoiceTone::Primary},
+    });
+    return;
+  }
   ChooseOutput(request, WriteKind::SaveAs, original ? original->format : DocumentFormat::Markdown, std::move(message));
 }
 
@@ -1482,7 +2400,7 @@ void WorkbenchActions::RequestClose(Tab tab) const {
 }
 
 bool WorkbenchActions::OnCloseRequest() const {
-  if (std::exchange(workspace->allow_close, false) || (workspace->tabs->empty() && !workspace->picking.Get())) {
+  if (std::exchange(workspace->allow_close, false)) {
     return false;
   }
   RequestClose();
@@ -1569,7 +2487,10 @@ void WorkbenchActions::FinishClose() const {
       }
     }
     workspace->closing = nullptr;
+    workspace->PruneFolders();
+    folio->Persist(*workspace);
   } else {
+    folio->Forget(*workspace);
     workspace->allow_close = true;
     window.Close();
   }
@@ -1707,7 +2628,25 @@ View DocumentArea(WorkbenchActions actions) {
         index = pages.size();
         active = tab;
       }
-      pages.push_back(DocumentPage(actions, tab, is_active).Key(tab->id));
+      if (const auto& pending = tab->unresolved.Get()) {
+        const bool restoring = actions.workspace->restoring.Get();
+        const bool needs_folder = !pending->package.empty() || std::ranges::any_of(
+            actions.workspace->folders.Get(), [&](const Entry& folder) {
+              return folder->id == pending->folder && folder->unresolved.Get();
+            });
+        pages.push_back(Column {
+          Text(restoring ? l10n::workspace_loading : pending->library_document.empty()
+              ? l10n::workspace_reconnect_file : l10n::library_document_unavailable),
+          restoring || !pending->library_document.empty() ? View{} : Button(l10n::workspace_relocate)
+              .OnClick([actions, tab] { actions.RelocateTab(tab); })
+              .With(Enabled(actions.Available() && (needs_folder ? actions.picker->CanOpenDirectories()
+                                                                : actions.picker->CanOpenFiles())),
+                    Semantics{.identifier = "restore-document"}),
+        }.With(Grow(), Padding(18.0F), Spacing(12.0F), MainAlign(MainAxisAlignment::Center),
+               CrossAlign(CrossAxisAlignment::Center)).Key(tab->id));
+      } else {
+        pages.push_back(DocumentPage(actions, tab, is_active).Key(tab->id));
+      }
     }
     content = IndexedPages(std::move(pages), index).With(Grow());
   }
@@ -1725,6 +2664,9 @@ View DocumentArea(WorkbenchActions actions) {
       break;
     }
   }
+  if (status.empty() && actions.folio->store->WriteFailed()) {
+    status = UseString(l10n::workspace_write_failed);
+  }
   return Column {
     std::move(content).Key("document-content"),
     StatusBar(std::move(status)),
@@ -1738,13 +2680,14 @@ View SidebarLabel(const ImageResource& icon, std::string label, Color color) {
   }.With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center));
 }
 
-enum class SidebarSection { Workspace, Recent, EmptyWorkspace, NoRecent };
-using SidebarItem = std::variant<SidebarSection, Entry, Tab, Target>;
+enum class SidebarSection { Workspace, External, Recent, EmptyWorkspace, NoRecent };
+using SidebarItem = std::variant<SidebarSection, Entry, Recent, LibraryEntry>;
 
 StringResource SidebarSectionLabel(SidebarSection section) {
   switch (section) {
   case SidebarSection::Workspace: return l10n::workspace;
-  case SidebarSection::Recent: return l10n::recent_edits;
+  case SidebarSection::External: return l10n::external_locations;
+  case SidebarSection::Recent: return l10n::recent_opened;
   case SidebarSection::EmptyWorkspace: return l10n::no_files_or_folders;
   case SidebarSection::NoRecent: return l10n::no_recent_documents;
   }
@@ -1754,7 +2697,7 @@ StringResource SidebarSectionLabel(SidebarSection section) {
 bool IsListed(const Entry& entry, const Workspace& workspace) {
   const auto parent = entry->parent.lock();
   const auto& siblings = parent ? parent->children.Get() : workspace.folders.Get();
-  return std::ranges::find(siblings, entry) != siblings.end() && (!parent || IsListed(parent, workspace));
+  return std::ranges::find(siblings, entry) != siblings.end() && (parent ? IsListed(parent, workspace) : entry->mounted.Get());
 }
 
 Entry FolderFileRow(const Tab& tab, const Workspace& workspace) {
@@ -1774,20 +2717,49 @@ Entry FolderFileRow(const Tab& tab, const Workspace& workspace) {
 std::vector<MenuEntry> FolderMenu(WorkbenchActions actions, const Entry& folder) {
   const bool available = actions.Available();
   const bool can_create = available && (folder->directory->CanWrite() || actions.picker->CanOpenDirectories(true));
-  return {
+  std::vector<MenuEntry> menu{
       MenuItem(l10n::new_file_menu, [actions, folder] { actions.RequestNewChild(folder, ChildKind::File); }).Enabled(can_create),
       MenuItem(l10n::new_folder_menu, [actions, folder] { actions.RequestNewChild(folder, ChildKind::Folder); })
           .Enabled(can_create),
       MenuItem(l10n::refresh, [actions, folder] { actions.SetExpanded(folder, true); })
           .Enabled(available && folder->load.Get() != FolderLoad::Loading),
   };
+  if (folder->parent.expired()) {
+    menu.emplace_back(MenuSection{});
+    menu.emplace_back(MenuItem(l10n::remove_external_folder, [actions, folder] { actions.RemoveExternalFolder(folder); }));
+  }
+  return menu;
+}
+
+[[huxerui::composable]]
+View SidebarActionRow(View label, std::string name, bool desktop, float row_height, bool enabled,
+                      std::function<std::vector<MenuEntry>()> entries, bool root = false) {
+  const auto menu = UseMenu();
+  const auto anchor = UseViewHandle();
+  const auto open_menu = [enabled, entries, menu](Point point) {
+    if (enabled) {
+      menu.ShowAt(point, entries());
+    }
+  };
+  auto row = Row {
+    View(label).With(Grow()),
+    desktop && !root ? View{} : IconButton(root ? app::images::plus : app::images::more,
+                                             StringVariant::Format(l10n::actions_for, name))
+        .OnClick([menu, anchor, entries] { menu.Show(anchor, entries()); })
+        .With(anchor, Frame{.width = row_height, .height = row_height}, Enabled(enabled)),
+  }.With(Frame{.height = row_height}, CrossAlign(CrossAxisAlignment::Center))
+      .On<ViewEvents::ContextMenuRequested>(open_menu);
+  if (!desktop) {
+    return std::move(row).With(LongPressGesture{}).On<LongPressEvents::Ended>([open_menu](const LongPressEvent& event) {
+      open_menu(event.window_position);
+    });
+  }
+  return row;
 }
 
 [[huxerui::composable]]
 View FolderTreeRow(WorkbenchActions actions, Entry entry, bool desktop, float row_height) {
   const auto& colors = UseTheme().colors;
-  const auto menu = UseMenu();
-  const auto anchor = UseViewHandle();
   const bool expanded = entry->expanded.Get();
   std::string label = entry->name;
   if (expanded && entry->load.Get() == FolderLoad::Loading) {
@@ -1795,44 +2767,150 @@ View FolderTreeRow(WorkbenchActions actions, Entry entry, bool desktop, float ro
   } else if (expanded && entry->load.Get() == FolderLoad::Failed) {
     label += " — couldn’t load";
   }
-  const auto tooltip = entry->error->empty() ? entry->name : entry->error.Get();
-  auto row = Row {
-    SidebarLabel(expanded ? app::images::folder_open : app::images::folder, std::move(label), colors.on_surface)
-        .With(Grow(), Tooltip(tooltip)),
-    desktop ? View{} : IconButton(app::images::more, StringVariant::Format(l10n::actions_for, entry->name))
-        .OnClick([actions, entry, menu, anchor] { menu.Show(anchor, FolderMenu(actions, entry)); })
-        .With(anchor, Frame{.width = row_height, .height = row_height}, Enabled(actions.Available())),
-  }.With(Frame{.height = row_height}, CrossAlign(CrossAxisAlignment::Center));
+  auto content = SidebarLabel(expanded ? app::images::folder_open : app::images::folder, std::move(label), colors.on_surface);
   if (desktop) {
-    return std::move(row).On<ViewEvents::ContextMenuRequested>([actions, entry, menu](Point point) {
-      if (actions.Available()) {
-        menu.ShowAt(point, FolderMenu(actions, entry));
-      }
+    content = std::move(content).With(Tooltip(entry->error->empty() ? entry->name : entry->error.Get()));
+  }
+  return SidebarActionRow(std::move(content), entry->name, desktop, row_height, actions.Available(),
+                          [actions, entry] { return FolderMenu(actions, entry); });
+}
+
+std::vector<MenuEntry> LibraryMenu(WorkbenchActions actions, const LibraryEntry& entry) {
+  std::vector<MenuEntry> menu;
+  if (entry.folder) {
+    menu.emplace_back(MenuItem(l10n::new_document, [actions, id = entry.id] { actions.NewDocument(false, id); }));
+    menu.emplace_back(MenuItem(l10n::new_folder_menu, [actions, id = entry.id] { actions.NewLibraryFolder(id); }));
+    menu.emplace_back(MenuItem(l10n::library_import_here, [actions, id = entry.id] {
+      actions.PickOpen({.kind = OpenKind::Import, .import_parent = id});
+    }).Enabled(actions.picker->CanOpenFiles()));
+  }
+  if (!entry.id.empty()) {
+    if (entry.folder) {
+      menu.emplace_back(MenuSection{});
+    }
+    menu.emplace_back(MenuItem(l10n::library_rename_menu, [actions, id = entry.id] { actions.RenameLibraryEntry(id); }));
+    const auto& library = actions.folio->library;
+    const bool can_move = !entry.parent.empty() || std::ranges::any_of(library->Entries(), [&](const LibraryEntry& folder) {
+      return folder.folder && library->CanPlace(entry.id, folder.id);
+    });
+    menu.emplace_back(MenuItem(l10n::library_move_menu, [actions, id = entry.id] {
+      actions.ChooseLibraryDestination(id);
+    }).Enabled(can_move));
+  }
+  return menu;
+}
+
+struct LibraryTransfer {
+  std::string id;
+};
+
+[[huxerui::composable]]
+View LibraryTreeRow(WorkbenchActions actions, LibraryEntry entry, bool desktop, float row_height, bool selected) {
+  const auto& colors = UseTheme().colors;
+  const auto drop_target = UseState(false);
+  const bool expanded = entry.id.empty() ? actions.workspace->files_open.Get()
+      : std::ranges::find(actions.workspace->library_expanded.Get(), entry.id) != actions.workspace->library_expanded->end();
+  const auto& icon = entry.folder ? (expanded ? app::images::folder_open : app::images::folder) : app::images::file_text;
+  auto label = SidebarLabel(icon, entry.name, selected ? colors.on_primary_container : colors.on_surface);
+  if (desktop) {
+    label = std::move(label).With(Tooltip(entry.name));
+  }
+  auto row = SidebarActionRow(std::move(label), entry.name, desktop, row_height, actions.Available(),
+      [actions, entry] { return LibraryMenu(actions, entry); }, entry.id.empty())
+      .With(Background(drop_target.Get() ? colors.primary_container : Color::Transparent()));
+  if (!desktop) {
+    return row;
+  }
+  if (!entry.id.empty()) {
+    row = std::move(row).With(DragSource(LibraryTransfer{entry.id}));
+  }
+  if (entry.folder) {
+    row = std::move(row).With(DropTarget::Accepts<LibraryTransfer>([actions, entry](const LibraryTransfer& item) {
+      const auto& library = actions.folio->library;
+      const auto source = library->Find(item.id);
+      return actions.Available() && source && source->parent != entry.id && library->CanPlace(item.id, entry.id);
+    })).On<DropEvents<LibraryTransfer>::Entered>([drop_target](const LibraryTransfer&, const DropEvent&) {
+      drop_target = true;
+    }).On<DropEvents<LibraryTransfer>::Exited>([drop_target](const LibraryTransfer&, const DropEvent&) {
+      drop_target = false;
+    }).On<DropEvents<LibraryTransfer>::Dropped>([actions, entry, drop_target](const LibraryTransfer& item, const DropEvent&) {
+      drop_target = false;
+      actions.MoveLibraryEntry(item.id, entry.id);
     });
   }
   return row;
 }
 
+std::vector<SidebarItem> LibraryChildren(const std::shared_ptr<DocumentLibrary>& library, std::string_view parent) {
+  if (!library) {
+    return {};
+  }
+  std::vector<LibraryEntry> children;
+  for (const auto& entry : library->Entries()) {
+    if (entry.parent == parent) {
+      children.push_back(entry);
+    }
+  }
+  std::ranges::sort(children, [](const LibraryEntry& first, const LibraryEntry& second) {
+    return first.folder != second.folder ? first.folder : first.name < second.name;
+  });
+  return {children.begin(), children.end()};
+}
+
+[[huxerui::composable]]
+View RecentTreeRow(WorkbenchActions actions, Recent item, bool desktop, float row_height) {
+  const auto& colors = UseTheme().colors;
+  const auto name = item->Name(actions.folio->library.get());
+  const auto& icon = item->record.kind == RecentKind::File ? app::images::file_text : app::images::folder;
+  auto label = SidebarLabel(icon, name, colors.on_surface_variant);
+  if (desktop) {
+    label = std::move(label).With(Tooltip(item->record.location.path.empty() ? name : item->record.location.path));
+  }
+  return SidebarActionRow(std::move(label), name, desktop, row_height, actions.Available(), [actions, item] {
+    const auto& record = item->record;
+    std::vector<MenuEntry> menu;
+    if (record.library_document.empty()) {
+      const auto kind = RecentOpenKind(record.kind);
+      const bool can_locate = kind == OpenKind::File ? actions.picker->CanOpenFiles() : actions.picker->CanOpenDirectories();
+      menu.emplace_back(MenuItem(l10n::workspace_relocate, [actions, kind, id = record.id] {
+        actions.PickOpen({.kind = kind, .recent_id = id});
+      }).Enabled(can_locate));
+    }
+    menu.emplace_back(MenuItem(l10n::remove_recent, [actions, id = record.id] { actions.folio->RemoveRecent(id); }));
+    return menu;
+  });
+}
+
 [[huxerui::composable]]
 View FilesSidebar(WorkbenchActions actions, bool desktop, float row_height) {
-  const auto& theme = UseTheme();
-  const auto& colors = theme.colors;
+  const auto& colors = UseTheme().colors;
   const auto workspace = actions.workspace;
   const auto selected = workspace->Selected();
   const auto selected_entry = selected ? FolderFileRow(selected, *workspace) : Entry{};
+  const auto saved = selected ? selected->saved.Get() : nullptr;
+  const auto library_selection = saved ? saved->target->library_id : std::string{};
+  const auto library = actions.folio->library;
+  const auto workspace_name = UseString(l10n::workspace);
+  std::vector<SidebarItem> roots{SidebarSection::Workspace};
+  if (std::ranges::any_of(workspace->folders.Get(), [](const Entry& folder) { return folder->mounted.Get(); })) {
+    roots.emplace_back(SidebarSection::External);
+  }
+  roots.emplace_back(SidebarSection::Recent);
   const auto open = [actions](const SidebarItem& item) {
-    if (const auto* tab = std::get_if<Tab>(&item)) {
-      if (actions.Available()) {
-        actions.Select(*tab);
-      }
-    } else if (const auto* entry = std::get_if<Entry>(&item); entry && (*entry)->file) {
+    if (const auto* entry = std::get_if<Entry>(&item); entry && (*entry)->file) {
       actions.OpenKnown((*entry)->file, (*entry)->parent.lock());
-    } else if (const auto* file = std::get_if<Target>(&item)) {
-      actions.OpenKnown(*file);
+    } else if (const auto* recent = std::get_if<Recent>(&item)) {
+      actions.OpenRecent(*recent);
+    } else if (const auto* entry = std::get_if<LibraryEntry>(&item); entry && !entry->folder) {
+      actions.OpenLibraryDocument(entry->id);
     }
   };
-  return TreeView<SidebarItem>({SidebarSection::Workspace, SidebarSection::Recent},
-      [actions, colors, desktop, row_height, selected, selected_entry](const SidebarItem& item) -> View {
+  return TreeView<SidebarItem>(std::move(roots),
+      [actions, colors, desktop, row_height, selected_entry, library_selection, workspace_name, library](const SidebarItem& item) -> View {
+        if (const auto* entry = std::get_if<LibraryEntry>(&item)) {
+          return LibraryTreeRow(actions, *entry, desktop, row_height, !entry->folder && entry->id == library_selection)
+              .Key("library-" + entry->id);
+        }
         if (const auto* node = std::get_if<Entry>(&item)) {
           const auto& entry = *node;
           if (entry->directory) {
@@ -1842,88 +2920,96 @@ View FilesSidebar(WorkbenchActions actions, bool desktop, float row_height) {
                               entry == selected_entry ? colors.on_primary_container : colors.on_surface)
               .With(Tooltip(LocationLabel(*entry->file))).Key(entry->id);
         }
-        if (const auto* tab = std::get_if<Tab>(&item)) {
-          const auto& saved = (*tab)->saved.Get();
-          return SidebarLabel(app::images::file_text, (*tab)->Name(),
-                              *tab == selected ? colors.on_primary_container : colors.on_surface)
-              .With(Tooltip(LocationLabel(*saved->target))).Key("open-file-" + std::to_string((*tab)->id));
-        }
-        if (const auto* target = std::get_if<Target>(&item)) {
-          const auto& file = *target;
-          return SidebarLabel(app::images::file_text, file->reference.Name(), colors.on_surface_variant)
-              .With(Tooltip(LocationLabel(*file))).Key(reinterpret_cast<std::uintptr_t>(file.get()));
+        if (const auto* recent = std::get_if<Recent>(&item)) {
+          return RecentTreeRow(actions, *recent, desktop, row_height).Key((*recent)->record.id);
         }
         const auto section = std::get<SidebarSection>(item);
-        const auto label = SidebarSectionLabel(section);
-        const auto key = "sidebar-section-" + std::to_string(static_cast<int>(section));
-        if (section == SidebarSection::EmptyWorkspace || section == SidebarSection::NoRecent) {
-          return Text(label, TextRole::Label).With(FontSize(12.0F), Foreground(colors.on_surface_variant)).Key(key);
+        if (section == SidebarSection::Workspace && library) {
+          return LibraryTreeRow(actions, {.name = workspace_name, .folder = true}, desktop, row_height, false)
+              .Key("workspace-root");
         }
-        const bool files_section = section == SidebarSection::Workspace;
-        return Row {
-          Text(files_section ? l10n::workspace_heading : l10n::recent_edits_heading, TextRole::Label)
-              .With(Grow(), FontSize(11.0F), Foreground(colors.on_surface_variant)),
-          files_section ? IconButton(app::images::plus, l10n::add_folder)
-              .OnClick([actions] { actions.PickOpen(OpenKind::Folder); })
-              .With(Frame{.width = row_height, .height = row_height},
-                    Enabled(actions.picker->CanOpenDirectories() && actions.Available()), Tooltip(l10n::open_folder)) : View{},
-        }.With(CrossAlign(CrossAxisAlignment::Center)).Key(key);
-      }, [workspace, selected, selected_entry](const SidebarItem& item) {
+        const bool heading = section == SidebarSection::Workspace || section == SidebarSection::External ||
+            section == SidebarSection::Recent;
+        return Text(SidebarSectionLabel(section), TextRole::Label)
+            .With(FontSize(heading ? 11.0F : 12.0F), Foreground(colors.on_surface_variant))
+            .Key("sidebar-section-" + std::to_string(static_cast<int>(section)));
+      }, [workspace, selected_entry, library_selection, library](const SidebarItem& item) {
+        if (const auto* entry = std::get_if<LibraryEntry>(&item)) {
+          const auto& expanded = workspace->library_expanded.Get();
+          return TreeItemInfo{.label = entry->name, .expandable = entry->folder,
+                              .expanded = std::ranges::find(expanded, entry->id) != expanded.end(),
+                              .selected = entry->folder ? std::nullopt : std::optional(entry->id == library_selection)};
+        }
         if (const auto* node = std::get_if<Entry>(&item)) {
           const auto& entry = *node;
           return TreeItemInfo{.label = entry->name, .expandable = entry->directory.has_value(),
                               .expanded = entry->expanded.Get(),
                               .selected = entry->file ? std::optional(entry == selected_entry) : std::nullopt};
         }
-        if (const auto* tab = std::get_if<Tab>(&item)) {
-          return TreeItemInfo{.label = (*tab)->Name(), .selected = *tab == selected};
-        }
-        if (const auto* file = std::get_if<Target>(&item)) {
-          return TreeItemInfo{.label = (*file)->reference.Name(), .selected = false};
+        if (const auto* recent = std::get_if<Recent>(&item)) {
+          return TreeItemInfo{.label = (*recent)->Name(library.get()), .selected = false};
         }
         const auto section = std::get<SidebarSection>(item);
         const auto label = SidebarSectionLabel(section);
         switch (section) {
         case SidebarSection::Workspace:
           return TreeItemInfo{.label = label, .expandable = true, .expanded = workspace->files_open.Get()};
+        case SidebarSection::External:
+          return TreeItemInfo{.label = label, .expandable = true, .expanded = workspace->external_open.Get()};
         case SidebarSection::Recent:
           return TreeItemInfo{.label = label, .expandable = true, .expanded = workspace->recents_open.Get()};
-        default: return TreeItemInfo{.label = label, .enabled = false};
+        default:
+          return TreeItemInfo{.label = label, .enabled = false};
         }
-      }).Children([actions, workspace, selected, selected_entry](const SidebarItem& item) -> std::vector<SidebarItem> {
+      }).Children([actions, workspace, library](const SidebarItem& item) -> std::vector<SidebarItem> {
+        if (const auto* parent = std::get_if<LibraryEntry>(&item)) {
+          return LibraryChildren(library, parent->id);
+        }
         if (const auto* node = std::get_if<Entry>(&item)) {
           const auto& children = (*node)->children.Get();
           return {children.begin(), children.end()};
         }
-        switch (std::get<SidebarSection>(item)) {
-        case SidebarSection::Workspace: {
-          std::vector<SidebarItem> items;
-          for (const auto& tab : workspace->tabs.Get()) {
-            if (tab->saved.Get() && !(tab == selected ? selected_entry : FolderFileRow(tab, *workspace))) {
-              items.emplace_back(tab);
+        if (const auto* section = std::get_if<SidebarSection>(&item)) {
+          switch (*section) {
+          case SidebarSection::Workspace: {
+            auto children = LibraryChildren(library, {});
+            return children.empty() ? std::vector<SidebarItem>{SidebarSection::EmptyWorkspace} : std::move(children);
+          }
+          case SidebarSection::External: {
+            std::vector<SidebarItem> children;
+            for (const auto& folder : workspace->folders.Get()) {
+              if (folder->mounted.Get()) {
+                children.emplace_back(folder);
+              }
             }
+            return children;
           }
-          const auto& roots = workspace->folders.Get();
-          items.insert(items.end(), roots.begin(), roots.end());
-          if (items.empty()) {
-            items.emplace_back(SidebarSection::EmptyWorkspace);
+          case SidebarSection::Recent: {
+            const auto& recent = actions.folio->recent.Get();
+            return recent.empty() ? std::vector<SidebarItem>{SidebarSection::NoRecent}
+                                  : std::vector<SidebarItem>{recent.begin(), recent.end()};
           }
-          return items;
+          default:
+            break;
+          }
         }
-        case SidebarSection::Recent: {
-          const auto& recent = actions.folio->recent.Get();
-          return recent.empty() ? std::vector<SidebarItem>{SidebarSection::NoRecent}
-                                : std::vector<SidebarItem>{recent.begin(), recent.end()};
-        }
-        default: return {};
-        }
+        return {};
       }).OnExpandedChanged([actions, workspace](const SidebarItem& item, bool expanded) {
-        if (const auto* entry = std::get_if<Entry>(&item)) {
+        if (const auto* entry = std::get_if<LibraryEntry>(&item)) {
+          actions.SetLibraryExpanded(entry->id, expanded);
+        } else if (const auto* entry = std::get_if<Entry>(&item)) {
           actions.SetExpanded(*entry, expanded);
-        } else if (std::get<SidebarSection>(item) == SidebarSection::Workspace) {
-          workspace->files_open = expanded;
-        } else {
-          workspace->recents_open = expanded;
+        } else if (const auto* section = std::get_if<SidebarSection>(&item)) {
+          if (*section == SidebarSection::External) {
+            workspace->external_open = expanded;
+            return;
+          }
+          if (*section == SidebarSection::Workspace) {
+            workspace->files_open = expanded;
+          } else {
+            workspace->recents_open = expanded;
+          }
+          actions.folio->Persist(*workspace);
         }
       }).OnSelectionChanged([open](const SidebarItem& item, bool selected) {
         if (selected) {
@@ -2106,7 +3192,10 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
   tabs_style.minimum_height = row_height;
   tabs_style.expand_items = true;
   const auto section_switch = Tabs({l10n::files, l10n::outline}, outline ? 1U : 0U)
-      .OnChanged([workspace](std::size_t index) { workspace->showing_outline = index == 1; }).With(Grow());
+      .OnChanged([actions](std::size_t index) {
+        actions.workspace->showing_outline = index == 1;
+        actions.folio->Persist(*actions.workspace);
+      }).With(Grow());
   auto settings = ClickableRow(Row {
     Text(l10n::settings, TextRole::Label).With(Grow()),
     Glyph(app::images::chevron_right, colors.on_surface_variant, 13.0F),
@@ -2247,7 +3336,10 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
   const auto workspace = actions.workspace;
   const auto active = workspace->Selected();
   const bool available = actions.Available();
-  const bool document_actions = available && active && !active->Busy();
+  const bool document_actions = available && active && !active->unresolved.Get() && !active->Busy();
+  const auto original = active ? active->saved.Get() : nullptr;
+  const bool managed = original && original->target->library;
+  const bool can_save_to_library = actions.folio->library && document_actions && original && !managed;
   const auto viewport = UseViewportClass();
   const bool narrow_desktop = desktop && viewport == ViewportClass::Compact;
   const bool compact_mobile = !desktop && viewport == ViewportClass::Compact;
@@ -2294,27 +3386,41 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
   } else {
     title = Spacer().With(Grow());
   }
-  const auto menu = [actions, file_menu, active, available, document_actions, desktop, narrow_desktop] {
+  const auto menu = [actions, file_menu, active, available, document_actions, managed, can_save_to_library,
+                     desktop, narrow_desktop] {
     const auto item = [&actions](StringVariant label, FolioCommand command) {
       return MenuItem(label, [actions, command] { actions.Execute(command); }).Enabled(actions.CanExecute(command));
     };
     std::vector<MenuEntry> entries{
         item(l10n::new_document, FolioCommand::NewDocument),
         item(l10n::open_file_menu, FolioCommand::OpenFile),
+    };
+    if (actions.folio->library) {
+      entries.emplace_back(MenuItem(l10n::library_import_menu, [actions] { actions.PickOpen(OpenKind::Import); })
+          .Enabled(available && actions.picker->CanOpenFiles()));
+    }
+    entries.insert(entries.end(), {
         MenuItem(l10n::open_folder_menu, [actions] { actions.PickOpen(OpenKind::Folder); })
             .Enabled(available && actions.picker->CanOpenDirectories()),
         MenuItem(l10n::open_package, [actions] { actions.PickOpen(OpenKind::Package); })
             .Enabled(available && actions.picker->CanOpenDirectories()),
         MenuSection{},
         item(l10n::save, FolioCommand::Save),
-        item(l10n::save_as_menu, FolioCommand::SaveAs),
+    });
+    if (!IsMobilePlatform() && !managed) {
+      entries.emplace_back(item(l10n::save_as_menu, FolioCommand::SaveAs));
+    }
+    if (can_save_to_library) {
+      entries.emplace_back(MenuItem(l10n::library_save_copy, [actions, active] { actions.RequestSave(active, WriteKind::Library); }));
+    }
+    entries.insert(entries.end(), {
         MenuItem(l10n::export_copy_menu, [actions, active] { actions.RequestSave(active, WriteKind::Export); })
             .Enabled(document_actions && (actions.picker->CanSaveFiles() || actions.picker->CanOpenDirectories(true))),
         MenuItem(l10n::locate_attachment_folder, [actions, active] { actions.LocateAttachments(active); })
             .Enabled(document_actions && actions.picker->CanOpenDirectories()),
         MenuSection{},
         MenuItem(l10n::load_sample, [actions] { actions.NewDocument(true); }).Enabled(available),
-    };
+    });
     if (!IsMobilePlatform()) {
       entries.insert(entries.begin(), {item(l10n::command_palette_menu, FolioCommand::OpenCommandPalette), MenuSection{}});
     }
@@ -2367,6 +3473,11 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
 } // namespace
 
 void InstallFolio(ApplicationContext& context) {
+  InstallFolioWithWorkspace(context, nullptr);
+}
+
+void InstallFolioWithWorkspace(ApplicationContext& context, std::shared_ptr<WorkspaceStore> store,
+                               std::optional<File> data_directory) {
   RegisterBrowser(context);
   const auto folio = std::make_shared<FolioState>();
   context.Provide(folio);
@@ -2375,18 +3486,84 @@ void InstallFolio(ApplicationContext& context) {
     folio->QueueActivation(*startup);
   }
   context.OnActivation([folio](ApplicationActivation activation) { folio->QueueActivation(activation); });
-  std::optional<File> directory;
   try {
-    directory = application.Directories().data_directory;
+    if (!data_directory) {
+      data_directory = application.Directories().data_directory;
+    }
+    folio->temporary_directory = application.Directories().temporary_directory;
   } catch (const std::logic_error&) {
     // Settings remain available for the session on hosts without application storage.
   }
-  context.Provide(std::make_shared<SettingsStore>(std::move(directory)));
+  if (data_directory) {
+    folio->library = std::make_shared<DocumentLibrary>(data_directory->Child("library"));
+  }
+  folio->store = store ? std::move(store) : std::make_shared<WorkspaceStore>(data_directory);
+  const auto& saved = folio->store->Get();
+  std::vector<Recent> recent;
+  for (const auto& item : saved.recent) {
+    recent.push_back(std::make_shared<RecentItem>(RecentItem{item, {}, {}}));
+  }
+  folio->recent = std::move(recent);
+  if (!saved.windows.empty()) {
+    const auto active = std::ranges::find(saved.windows, saved.active_window, &WorkspaceWindowRecord::id);
+    const auto& initial = active == saved.windows.end() ? saved.windows.front() : *active;
+    folio->installing = initial;
+    for (const auto& window : saved.windows) {
+      if (window.id != initial.id && application.SupportsMultipleWindows()) {
+        folio->restore_windows.push_back(window);
+      }
+      for (const auto& tab : window.tabs) {
+        folio->next_document = std::max(folio->next_document, tab.id);
+      }
+    }
+    folio->restoring = 1 + folio->restore_windows.size();
+  }
+  context.Provide(std::make_shared<SettingsStore>(std::move(data_directory)));
 }
 
 void InstallWorkbench(WindowContext& context) {
   InstallBrowser(context);
-  context.Provide(std::make_shared<Workspace>());
+  const auto folio = UseService<FolioState>();
+  auto workspace = std::make_shared<Workspace>();
+  if (auto record = std::exchange(folio->installing, std::nullopt)) {
+    workspace->id = record->id;
+    workspace->restoring = true;
+    workspace->files_open = record->files_open;
+    workspace->recents_open = record->recents_open;
+    workspace->library_expanded = std::move(record->library_expanded);
+    workspace->library_expanded.Update([](auto& ids) { std::erase(ids, std::string{}); });
+    workspace->sidebar_visible = record->sidebar_visible;
+    workspace->showing_outline = record->showing_outline;
+    workspace->pane_sizes.Update([&](PaneSizes& sizes) {
+      sizes.sidebar.width = std::clamp(record->sidebar_width, *sizes.sidebar.min_width, *sizes.sidebar.max_width);
+    });
+    std::vector<Entry> folders;
+    for (auto& root : record->folders) {
+      if (std::ranges::none_of(record->tabs, [&](const WorkspaceTabRecord& tab) { return tab.folder == root.id; })) {
+        continue;
+      }
+      auto folder = std::make_shared<FolderEntry>(FolderEntry{root.id, root.name, {}, {}, {}});
+      workspace->next_entry = std::max(workspace->next_entry, root.id);
+      folder->mounted = false;
+      folder->recent_id = root.recent_id;
+      folder->unresolved = std::move(root);
+      folders.push_back(std::move(folder));
+    }
+    workspace->folders = std::move(folders);
+    std::vector<Tab> tabs;
+    for (auto& item : record->tabs) {
+      auto tab = std::make_shared<DocumentTab>(item.id, item.name, NewWorkingDirectory(UseApplication()),
+                                               RichDocument{}, nullptr, std::nullopt);
+      tab->unresolved = std::move(item);
+      tabs.push_back(std::move(tab));
+    }
+    if (!tabs.empty()) {
+      const auto selected = std::ranges::find_if(tabs, [&](const Tab& tab) { return tab->id == record->selected; });
+      workspace->selected = selected == tabs.end() ? tabs.front()->id : (*selected)->id;
+    }
+    workspace->tabs = std::move(tabs);
+  }
+  context.Provide(std::move(workspace));
 }
 
 WindowOptions FolioWindowOptions() {
@@ -2416,7 +3593,14 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
     workspace->window = window;
     folio->windows.push_back(workspace);
     folio->window_revision = folio->window_revision.Get() + 1;
+    if (!workspace->restoring.Get()) {
+      folio->Persist(*workspace);
+    }
     return [folio, workspace, application_tasks] {
+      if (workspace->restoring.Get()) {
+        workspace->restoring = false;
+        folio->restoring = folio->restoring.Get() - 1;
+      }
       workspace->window.reset();
       std::erase_if(folio->windows, [workspace](const auto& weak) {
         const auto owner = weak.lock();
@@ -2438,12 +3622,24 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
       }
     };
   }, workspace);
-  const bool can_open_activated = !folio->pending_files->empty() && actions.Available();
+  Lifecycle([actions] {
+    actions.tasks.Post([actions] {
+      actions.RestoreWindows();
+      actions.RestoreWorkspace();
+    });
+  }, workspace);
+  const auto window_state = window.LifecycleState();
+  Lifecycle([folio, workspace, window_state] {
+    if (window_state == WindowLifecycleState::Active && folio->restoring.Get() == 0) {
+      folio->Persist(*workspace, true);
+    }
+  }, window_state);
+  const bool can_open_activated = !folio->pending_files->empty() && folio->restoring.Get() == 0 && actions.Available();
   Lifecycle([actions, can_open_activated] {
     if (can_open_activated) {
       actions.tasks.Post([actions] { actions.OpenActivated(); });
     }
-  }, can_open_activated, folio->window_revision.Get(), window.LifecycleState());
+  }, can_open_activated, folio->window_revision.Get(), window_state);
   window.OnCloseRequest([actions] { return actions.OnCloseRequest(); }, workspace);
 
   const auto on_key = [actions, settings](const KeyEvent& event) {
@@ -2479,7 +3675,7 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
             .With(sizes.sidebar, sizes.sidebar_grow).Key("sidebar") : View{},
         DocumentArea(actions).With(visible ? sizes.documents : Frame{}, visible ? sizes.documents_grow : Grow{})
             .Key("documents"),
-      }.OnChanged([workspace, visible](const std::vector<SplitChange>& changes) {
+      }.OnChanged([actions, workspace, visible](const std::vector<SplitChange>& changes) {
         if (visible) {
           workspace->pane_sizes.Update([&](PaneSizes& sizes) {
             for (const auto& change : changes) {
@@ -2492,6 +3688,7 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
               }
             }
           });
+          actions.folio->Persist(*workspace);
         }
       }).With(Grow()),
     }.With(CrossAlign(CrossAxisAlignment::Stretch), SafeAreaPadding(), Background(theme.colors.background));
@@ -2502,7 +3699,12 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
   }.With(CrossAlign(CrossAxisAlignment::Stretch)).Key("workspace-content");
   auto layout = modal_sidebar || sidebar_open.Get()
       ? DrawerLayout(content, StartDrawer(Sidebar(actions, false)).Open(sidebar_open)
-            .OnOpenChanged([sidebar_open](bool open) { sidebar_open = open; }))
+            .OnOpenChanged([actions, sidebar_open, modal_sidebar](bool open) {
+              sidebar_open = open;
+              if (!modal_sidebar) {
+                actions.folio->Persist(*actions.workspace);
+              }
+            }))
       : DrawerLayout(content);
   return std::move(layout).With(SafeAreaPadding(), Background(theme.colors.background));
 }

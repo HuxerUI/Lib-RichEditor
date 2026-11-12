@@ -97,7 +97,7 @@ bool WithinDirectory(const File& directory, const File& child) {
   return !relative.empty() && !relative.is_absolute() && *relative.begin() != "..";
 }
 
-Task<IoResult<FileReference>> FindAttachment(FileReference directory, std::vector<std::string> path) {
+Task<IoResult<FileSource>> FindAttachment(FileSource directory, std::vector<std::string> path) {
   const auto root = directory.AsFile();
   for (std::size_t i = 0; i < path.size(); ++i) {
     auto child = co_await FindChild(directory, path[i], i + 1 == path.size() ? FileType::File : FileType::Directory);
@@ -107,10 +107,10 @@ Task<IoResult<FileReference>> FindAttachment(FileReference directory, std::vecto
     directory = std::move(child.Value());
     if (const auto local = directory.AsFile(); root && local &&
         !(co_await RunWorker(WithinDirectory, *root, *local))) {
-      co_return IoResult<FileReference>::Failure({IoErrorCode::PermissionDenied, "Attachment is outside its folder"});
+      co_return IoResult<FileSource>::Failure({IoErrorCode::PermissionDenied, "Attachment is outside its folder"});
     }
   }
-  co_return IoResult<FileReference>::Success(std::move(directory));
+  co_return IoResult<FileSource>::Success(std::move(directory));
 }
 
 std::set<std::string> LocalReferences(const RichDocument& document) {
@@ -138,45 +138,43 @@ std::set<std::string> LocalReferences(const RichDocument& document) {
   return sources;
 }
 
-using AttachmentFile = std::variant<File, FileReference>;
-
-Task<IoResult<AttachmentFile>> ResolveAttachment(std::optional<File> working_directory,
-                                                const std::vector<FileReference>& directories,
-                                                const std::vector<std::string>& path) {
+Task<IoResult<FileSource>> ResolveAttachment(std::optional<File> working_directory,
+                                             const std::vector<FileSource>& directories,
+                                             const std::vector<std::string>& path) {
   if (working_directory) {
     const auto staged = ChildFile(*working_directory, path);
     const auto info = co_await staged.StatAsync();
     if (info.Succeeded()) {
       if (info.Value().type != FileType::File) {
-        co_return IoResult<AttachmentFile>::Failure({IoErrorCode::IsDirectory, "Attachment is not a file"});
+        co_return IoResult<FileSource>::Failure({IoErrorCode::IsDirectory, "Attachment is not a file"});
       }
-      co_return IoResult<AttachmentFile>::Success(staged);
+      co_return IoResult<FileSource>::Success(FileSource(staged, FileType::File, true));
     }
     if (info.Error().code != IoErrorCode::NotFound) {
-      co_return IoResult<AttachmentFile>::Failure(info.Error());
+      co_return IoResult<FileSource>::Failure(info.Error());
     }
   }
   for (const auto& directory : directories) {
     auto child = co_await FindAttachment(directory, path);
     if (child.Succeeded()) {
-      co_return IoResult<AttachmentFile>::Success(std::move(child.Value()));
+      co_return IoResult<FileSource>::Success(std::move(child.Value()));
     }
     if (child.Error().code != IoErrorCode::NotFound) {
-      co_return IoResult<AttachmentFile>::Failure(child.Error());
+      co_return IoResult<FileSource>::Failure(child.Error());
     }
   }
-  co_return IoResult<AttachmentFile>::Failure(
+  co_return IoResult<FileSource>::Failure(
       {IoErrorCode::NotFound, directories.empty() ? "Choose the attachment folder" : "Attachment is missing"});
 }
 
 struct AttachmentCopy {
   std::string reference;
   std::vector<std::string> path;
-  AttachmentFile source;
+  FileSource source;
 };
 
 Task<IoResult<std::vector<AttachmentCopy>>> PrepareAttachments(
-    std::optional<File> working_directory, const std::vector<FileReference>& directories, const RichDocument& document,
+    std::optional<File> working_directory, const std::vector<FileSource>& directories, const RichDocument& document,
     std::string document_name, const RichDocument* baseline = nullptr) {
   const auto existing = baseline ? LocalReferences(*baseline) : std::set<std::string>{};
   std::vector<AttachmentCopy> copies;
@@ -222,7 +220,7 @@ IoResult<void> CheckOriginal(const File& target, const Bytes& expected) {
   return IoResult<void>::Success();
 }
 
-IoResult<void> CommitLocalFile(const File& target, std::span<const std::byte> content, const Bytes* expected) {
+IoResult<void> CommitLocalFile(const File& target, std::span<const std::byte> content, const Bytes& expected) {
   const auto parent = target.Parent();
   if (!parent) {
     return IoResult<void>::Failure({IoErrorCode::Unsupported, "The file has no parent directory"});
@@ -245,21 +243,28 @@ IoResult<void> CommitLocalFile(const File& target, std::span<const std::byte> co
     (void)staged.Delete();
     return written;
   }
-  if (expected) {
-    const auto checked = CheckOriginal(target, *expected);
-    if (!checked.Succeeded()) {
-      (void)staged.Delete();
-      return checked;
-    }
+  const auto checked = CheckOriginal(target, expected);
+  if (!checked.Succeeded()) {
+    (void)staged.Delete();
+    return checked;
   }
-  if (!staged.MoveTo(target, expected != nullptr)) {
+  if (!staged.MoveTo(target, true)) {
     (void)staged.Delete();
     return IoResult<void>::Failure({IoErrorCode::Io, "Could not commit " + target.Name()});
   }
   return IoResult<void>::Success();
 }
 
-Task<IoResult<void>> CopyAttachments(FileReference destination, std::vector<AttachmentCopy> copies, bool in_place) {
+Task<bool> CommitPackageFile(File target, Bytes content, bool overwrite) {
+  const auto staged = target.Parent()->Child(UniqueName(".folio-") + ".tmp");
+  if ((co_await staged.WriteBytesAsync(std::move(content))) && (co_await staged.MoveToAsync(target, overwrite))) {
+    co_return true;
+  }
+  (void)co_await staged.DeleteAsync();
+  co_return false;
+}
+
+Task<IoResult<void>> CopyAttachments(FileSource destination, std::vector<AttachmentCopy> copies, bool in_place) {
   const auto root = destination.AsFile();
   for (auto& copy : copies) {
     auto folder = destination;
@@ -283,15 +288,12 @@ Task<IoResult<void>> CopyAttachments(FileReference destination, std::vector<Atta
         co_return IoResult<void>::Failure(existing.Error());
       }
       if (existing.Succeeded()) {
-        if (const auto* reference = std::get_if<FileReference>(&copy.source)) {
-          const auto from = reference->AsFile();
-          const auto to = existing.Value().AsFile();
-          if (from && from == to) {
-            continue;
-          }
+        const auto from = copy.source.AsFile();
+        if (from && from == existing.Value().AsFile()) {
+          continue;
         }
       }
-      auto bytes = co_await std::visit([](const auto& file) { return file.ReadBytesAsync(); }, copy.source);
+      auto bytes = co_await copy.source.ReadBytesAsync();
       if (!bytes.Succeeded()) {
         co_return IoResult<void>::Failure(bytes.Error());
       }
@@ -307,17 +309,18 @@ Task<IoResult<void>> CopyAttachments(FileReference destination, std::vector<Atta
       if (!local) {
         co_return IoResult<void>::Failure({IoErrorCode::Unsupported, "Cannot safely add " + copy.reference});
       }
-      auto saved = co_await RunWorker([](File file, Bytes content) {
-        return CommitLocalFile(file, content, nullptr);
-      }, local->Child(name), std::move(bytes.Value()));
-      if (!saved.Succeeded()) {
-        co_return IoResult<void>::Failure(saved.Error());
+      if (!co_await CommitPackageFile(local->Child(name), std::move(bytes.Value()), false)) {
+        co_return IoResult<void>::Failure({IoErrorCode::Io, "Could not copy " + copy.reference});
       }
       continue;
     }
-    auto saved = co_await std::visit([&](const auto& file) {
-      return folder.CopyFileFromAsync(file, name);
-    }, copy.source);
+    const auto* target = folder.Reference();
+    if (!target) {
+      co_return IoResult<void>::Failure({IoErrorCode::Unsupported, "Choose an export folder"});
+    }
+    auto saved = copy.source.Reference()
+        ? co_await target->CopyFileFromAsync(*copy.source.Reference(), name)
+        : co_await target->CopyFileFromAsync(*copy.source.AsFile(), name);
     if (!saved.Succeeded()) {
       co_return IoResult<void>::Failure({saved.Error().code, "Could not copy " + copy.reference});
     }
@@ -357,7 +360,7 @@ bool ValidDocumentName(std::string_view name, DocumentFormat format) {
 }
 
 std::shared_ptr<const ImageResolver> AttachmentResolver(std::optional<File> working_directory,
-                                                       std::vector<FileReference> directories) {
+                                                       std::vector<FileSource> directories) {
   if (!working_directory && directories.empty()) {
     return {};
   }
@@ -372,7 +375,7 @@ std::shared_ptr<const ImageResolver> AttachmentResolver(std::optional<File> work
         if (!file.Succeeded()) {
           co_return IoResult<ImageAsset>::Failure(file.Error());
         }
-        auto bytes = co_await std::visit([](const auto& entry) { return entry.ReadBytesAsync(); }, file.Value());
+        auto bytes = co_await file.Value().ReadBytesAsync();
         if (!bytes.Succeeded()) {
           co_return IoResult<ImageAsset>::Failure(bytes.Error());
         }
@@ -413,7 +416,7 @@ bool HasLocalAttachments(const RichDocument& document) {
   return !LocalReferences(document).empty();
 }
 
-bool NeedsAttachmentWrite(const FileReference& target, const std::vector<FileReference>& directories,
+bool NeedsAttachmentWrite(const FileSource& target, const std::vector<FileSource>& directories,
                           const RichDocument& document, const RichDocument& baseline) {
   const auto current = LocalReferences(document);
   if (current.empty()) {
@@ -441,7 +444,7 @@ std::string_view DocumentSource::Text() const {
   return text;
 }
 
-Task<IoResult<DocumentSource>> ReadDocument(FileReference source) {
+Task<IoResult<DocumentSource>> ReadDocument(FileSource source) {
   const auto format = FormatOf(source.Name());
   if (!format) {
     co_return IoResult<DocumentSource>::Failure({IoErrorCode::Unsupported, "Choose a JSON or Markdown document"});
@@ -459,20 +462,20 @@ Task<IoResult<DocumentSource>> ReadDocument(FileReference source) {
   co_return IoResult<DocumentSource>::Success(std::move(document));
 }
 
-Task<IoResult<FileReference>> FindChild(FileReference directory, std::string name, FileType type) {
+Task<IoResult<FileSource>> FindChild(FileSource directory, std::string name, FileType type) {
   auto children = co_await directory.ListChildrenAsync();
   if (!children.Succeeded()) {
-    co_return IoResult<FileReference>::Failure(children.Error());
+    co_return IoResult<FileSource>::Failure(children.Error());
   }
   for (auto& child : children.Value()) {
     if (child.Type() == type && child.Name() == name) {
-      co_return IoResult<FileReference>::Success(std::move(child));
+      co_return IoResult<FileSource>::Success(std::move(child));
     }
   }
-  co_return IoResult<FileReference>::Failure({IoErrorCode::NotFound, "Missing " + name});
+  co_return IoResult<FileSource>::Failure({IoErrorCode::NotFound, "Missing " + name});
 }
 
-Task<IoResult<FileReference>> FindPackageDocument(FileReference directory) {
+Task<IoResult<FileSource>> FindPackageDocument(FileSource directory) {
   auto entry = co_await FindChild(directory, "article.json", FileType::File);
   if (!entry.Succeeded() && entry.Error().code == IoErrorCode::NotFound) {
     co_return co_await FindChild(std::move(directory), "article.md", FileType::File);
@@ -480,7 +483,7 @@ Task<IoResult<FileReference>> FindPackageDocument(FileReference directory) {
   co_return entry;
 }
 
-Task<std::optional<File>> LocalIdentity(FileReference reference) {
+Task<std::optional<File>> LocalIdentity(FileSource reference) {
   auto local = reference.AsFile();
   if (!local) {
     co_return std::nullopt;
@@ -492,10 +495,10 @@ Task<std::optional<File>> LocalIdentity(FileReference reference) {
   }, *local);
 }
 
-Task<IoResult<void>> WriteOriginal(FileReference target, const Bytes& expected, std::string text,
-                                  std::optional<File> working_directory, std::vector<FileReference> attachments,
-                                  std::optional<FileReference> destination, RichDocument document,
-                                  const RichDocument& baseline) {
+Task<IoResult<void>> WriteOriginal(FileSource target, const Bytes& expected, std::string text,
+                                   std::optional<File> working_directory, std::vector<FileSource> attachments,
+                                   std::optional<FileSource> destination, RichDocument document,
+                                   const RichDocument& baseline) {
   const auto local = target.AsFile();
   if (!target.CanWrite() || !local) {
     co_return IoResult<void>::Failure({IoErrorCode::PermissionDenied, "The original does not support safe replacement"});
@@ -526,12 +529,12 @@ Task<IoResult<void>> WriteOriginal(FileReference target, const Bytes& expected, 
     }
   }
   co_return co_await RunWorker([](File file, Bytes previous, std::string content) {
-    return CommitLocalFile(file, std::as_bytes(std::span(content)), &previous);
+    return CommitLocalFile(file, std::as_bytes(std::span(content)), previous);
   }, *local, expected, std::move(text));
 }
 
 Task<IoResult<DocumentCopy>> WriteCopy(FileReference parent, File staged_file, std::string name,
-                                     std::optional<File> working_directory, std::vector<FileReference> attachments,
+                                     std::optional<File> working_directory, std::vector<FileSource> attachments,
                                      RichDocument document) {
   auto copies = co_await PrepareAttachments(working_directory, attachments, document, name);
   if (!copies.Succeeded()) {
@@ -555,6 +558,32 @@ Task<IoResult<DocumentCopy>> WriteCopy(FileReference parent, File staged_file, s
     co_return IoResult<DocumentCopy>::Failure(saved.Error());
   }
   co_return IoResult<DocumentCopy>::Success({std::move(saved.Value()), std::move(destination)});
+}
+
+Task<IoResult<void>> WriteLibraryPackage(File directory, std::string text, std::optional<File> working_directory,
+                                        std::vector<FileSource> attachments, RichDocument document,
+                                        std::optional<RichDocument> baseline) {
+  const auto file = directory.Child("article.json");
+  if (!baseline && !(co_await directory.CreateDirectoriesAsync())) {
+    co_return IoResult<void>::Failure({IoErrorCode::Io, "Could not create the document package"});
+  }
+  if (!baseline || NeedsAttachmentWrite(FileSource(file, FileType::File, true), attachments, document, *baseline)) {
+    auto copies = co_await PrepareAttachments(working_directory, attachments, document, file.Name(),
+                                               baseline ? &*baseline : nullptr);
+    if (!copies.Succeeded()) {
+      co_return IoResult<void>::Failure(copies.Error());
+    }
+    auto copied = co_await CopyAttachments(FileSource(directory, FileType::Directory, true),
+                                           std::move(copies.Value()), true);
+    if (!copied.Succeeded()) {
+      co_return copied;
+    }
+  }
+  const auto bytes = std::as_bytes(std::span(text));
+  if (!(co_await CommitPackageFile(file, Bytes(bytes.begin(), bytes.end()), baseline.has_value()))) {
+    co_return IoResult<void>::Failure({IoErrorCode::Io, "Could not write the document package"});
+  }
+  co_return IoResult<void>::Success();
 }
 
 } // namespace folio

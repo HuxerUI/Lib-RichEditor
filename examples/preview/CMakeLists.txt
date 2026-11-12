@@ -60,6 +60,7 @@ huxerui_use_library(example_lib_rich_editor
 )
 
 if(NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+    target_link_libraries(example_lib_rich_editor PRIVATE nlohmann_json::nlohmann_json)
     if (APPLE)
         set_property(TARGET example_lib_rich_editor PROPERTY OBJCXX_STANDARD 20)
     elseif (WIN32)

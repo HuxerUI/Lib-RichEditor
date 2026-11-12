@@ -1,13 +1,18 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/testing/ui_test.h>
+#include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 #include "../examples/preview/src/attachments.h"
+#include "../examples/preview/src/document_library.h"
 #include "../examples/preview/src/web_url.h"
 #include "../examples/preview/src/workbench.h"
+#include "../examples/preview/src/workspace_store.h"
 #include "folio_test_resources.h"
 
 using namespace huxerui;
@@ -23,6 +28,18 @@ void Check(bool condition, const char* message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+void WaitForFixture(UiTest& ui, const std::function<bool()>& check) {
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  do {
+    ui.Pump(16ms);
+    if (check()) {
+      return;
+    }
+    std::this_thread::sleep_for(1ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  Check(false, "The fixture operation completed before the timeout");
 }
 
 void Send(UiTest& ui, std::initializer_list<TextInputCommand> commands) {
@@ -47,6 +64,330 @@ void WebUrls() {
   Check(remote.document && !folio::HasLocalAttachments(*remote.document) &&
             local.document && folio::HasLocalAttachments(*local.document),
         "Attachment discovery uses the same HTTP and HTTPS policy as browser links");
+}
+
+void WorkspaceStorage(const File& directory) {
+  using namespace folio;
+  const auto folder = directory.Child("Project");
+  const auto saved = WorkspaceRecord{
+      .active_window = "second",
+      .windows = {
+          {.id = "first",
+           .folders = {{1, "Project", {folder.Path(), true}}},
+           .tabs = {{.id = 10, .name = "Outline.md", .location = {folder.Child("Outline.md").Path(), false},
+                     .attachments = {folder.Path(), true}, .folder = 1, .relative = {"Outline.md"}},
+                    {.id = 12, .name = "Notes.md", .folder = 1, .relative = {"Meeting", "Notes.md"}}},
+           .selected = 12, .sidebar_width = 310.0F, .sidebar_visible = false, .showing_outline = true},
+          {.id = "second", .folders = {{1, "Shared", {}}},
+           .tabs = {{.id = 16, .name = "article.json", .package = "Shared draft"}}, .selected = 16},
+      },
+      .recent = {{"recent-project", "Project", {folder.Path(), true}, RecentKind::Folder},
+                 {"recent-note", "Outline.md", {folder.Child("Outline.md").Path(), false}}},
+  };
+  WorkspaceStore store(directory);
+  Check(store.Get().windows.empty(), "A missing workspace starts empty");
+  store.Set(saved);
+  Check(!store.WriteFailed() && WorkspaceStore(directory).Get() == saved,
+        "Workspace storage preserves ordered windows and tabs, local paths, and opaque grants");
+
+  auto remaining = saved;
+  remaining.windows.pop_back();
+  remaining.active_window = remaining.windows.front().id;
+  store.Set(remaining);
+  Check(WorkspaceStore(directory).Get() == remaining && !directory.Child("workspace.json.tmp").Stat().Succeeded(),
+        "The saved workspace is replaced and its staging file is removed");
+
+  const auto file = directory.Child("workspace.json");
+  auto text = file.ReadString().Value();
+  auto legacy = nlohmann::json::parse(text);
+  legacy.erase("recent");
+  Check(file.WriteString(legacy.dump()), "Write a workspace saved before recent locations existed");
+  const auto migrated = WorkspaceStore(directory).Get().recent;
+  Check(migrated.size() == 1 && migrated.front().kind == RecentKind::Folder && migrated.front().name == "Project",
+        "A previously mounted folder is migrated into the recent list");
+  const auto relative = text.find("\"Meeting\"");
+  Check(relative != std::string::npos, "The nested folder path is stored as components");
+  text.replace(relative, std::string_view("\"Meeting\"").size(), "\"..\"");
+  Check(file.WriteString(text) && WorkspaceStore(directory).Get().windows.empty(),
+        "A corrupt relative path is rejected");
+  Check(file.WriteString(R"({"version":2,"windows":[{"id":"future"}]})") &&
+            WorkspaceStore(directory).Get().windows.empty(),
+        "An unknown workspace version starts empty");
+}
+
+[[huxerui::composable]]
+View WorkspaceFixture() {
+  const auto window = UseWindow();
+  return Column {App().With(Grow()), Button("Request window close").OnClick([window] { window.Close(); })};
+}
+
+void WorkspaceRestoreFlow(const File& directory, const char* package_path) {
+  using namespace folio;
+  const auto document = directory.Child("Notes.md");
+  const auto missing = directory.Child("Missing.md");
+  Check(directory.CreateDirectories() && document.WriteString("# Restored heading\n\nRestored body."),
+        "Write the saved document fixture");
+  const WorkspaceRecord initial{
+      .active_window = "workbench",
+      .windows = {{.id = "workbench", .tabs = {{.id = 1, .name = document.Name(), .location = {document.Path(), false}},
+                                               {.id = 2, .name = missing.Name(), .location = {missing.Path(), false}}},
+                   .selected = 2}},
+  };
+  bool seed = true;
+  const Application app(WorkspaceFixture, {
+      .show_debug_overlay = false,
+      .application_hooks = {[&](ApplicationContext& context) {
+        auto store = std::make_shared<WorkspaceStore>(directory);
+        if (seed) {
+          store->Set(initial);
+          seed = false;
+        }
+        InstallFolioWithWorkspace(context, std::move(store));
+      }},
+      .window_hooks = {InstallWorkbench},
+  });
+  const auto options = UiTestOptions{.viewport = {360, 640},
+                                     .resource_provider = std::make_shared<PackageResources>(package_path)};
+  const auto window_count = [&] {
+    return nlohmann::json::parse(directory.Child("workspace.json").ReadString().Value()).at("windows").size();
+  };
+  const auto wait = WaitForFixture;
+  {
+    UiTest ui(app, options);
+    const auto pending = ui.FindSemantics(UiSemanticSelector::Identifier("restore-document"));
+    wait(ui, [&] { return pending.Exists(); });
+    Check(ui.FindSemantics(UiSemanticSelector::Label("Missing.md, switch document")).Exists(),
+          "The selected missing document stays in its tab");
+  }
+  {
+    UiTest ui(app, options);
+    const auto pending = ui.FindSemantics(UiSemanticSelector::Identifier("restore-document"));
+    wait(ui, [&] { return pending.Exists(); });
+    const auto switcher = ui.FindSemantics(UiSemanticSelector::Identifier("document-switcher"));
+    const auto center = [](const UiSemanticQuery& target) {
+      const auto bounds = target.One().bounds;
+      return Point{bounds.x + bounds.width / 2, bounds.y + bounds.height / 2};
+    };
+    ui.TapAt(center(switcher));
+    const auto notes = ui.FindSemantics(UiSemanticSelector::Label("Notes.md"));
+    wait(ui, [&] { return notes.Exists(); });
+    ui.TapAt(center(notes));
+    const auto article = ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
+    wait(ui, [&] { return article.Exists(); });
+    Check(article.One().value == "Restored heading\nRestored body.", "The local document reopens with its disk contents");
+    ui.Pump(400ms);
+    ui.Pump();
+    ui.Find(UiSelector::Key("file-menu")).Tap();
+    ui.Find(UiSelector::Text("Load sample")).Tap();
+    ui.Pump(400ms);
+    ui.Pump();
+
+    const auto close = ui.Find(UiSelector::Text("Request window close"));
+    const auto cancel = ui.Find(UiSelector::Text("Cancel"));
+    const auto discard = ui.Find(UiSelector::Text("Discard"));
+    close.Tap();
+    wait(ui, [&] { return cancel.Exists(); });
+    cancel.Tap();
+    wait(ui, [&] { return !cancel.Exists(); });
+    Check(window_count() == 1, "Cancel keeps the window in the saved workspace");
+    close.Tap();
+    wait(ui, [&] { return discard.Exists(); });
+    discard.Tap();
+    wait(ui, [&] { return window_count() == 0; });
+  }
+}
+
+void LibraryStorageFlow(const File& directory, const char* package_path) {
+  using namespace folio;
+  const auto attachments = directory.Child("source").Child("attachments");
+  const auto source = *attachments.Parent();
+  constexpr std::string_view image = "image bytes";
+  Check(attachments.CreateDirectories() && attachments.Child("sample.png").WriteString(image),
+        "Prepare the document's local attachment");
+  const auto input = Codec(DocumentFormat::Markdown).Import("# Library article\n\n![Sample](attachments/sample.png)");
+  Check(input.document.has_value(), "The source document imports in Strict mode");
+  const auto encoded = Codec(DocumentFormat::Json).Export(*input.document);
+  Check(encoded.text.has_value(), "The managed package uses the JSON codec");
+  const auto root = directory.Child("library");
+  bool written = false;
+  const Application seed([] { return View{}; }, {.application_hooks = {[&](ApplicationContext&) {
+    auto library = std::make_shared<DocumentLibrary>(root);
+    UseApplicationTaskScope().Launch([&, library]() -> Task<void> {
+      const auto package = *library->Package("library-doc");
+      const std::vector sources{FileSource(source, FileType::Directory, false)};
+      const auto result = co_await WriteLibraryPackage(package, *encoded.text, std::nullopt, sources, *input.document);
+      Check(result.Succeeded(), "The first save copies the attachment into the managed package");
+      const LibraryEntry parent{"project", "Project", "", true};
+      const LibraryEntry nested{"archive", "Archive", "project", true};
+      const LibraryEntry reserved{"reserved", "Reserved", "archive", true};
+      const LibraryEntry initial{"library-doc", "Article", "", false};
+      const LibraryEntry moved{"library-doc", "Planning", "archive", false};
+      Check((co_await library->Put(parent)) == LibraryWriteResult::Saved, "The library creates a top-level folder");
+      Check((co_await library->Put(nested)) == LibraryWriteResult::Saved, "The library creates a nested folder");
+      Check((co_await library->Put(reserved)) == LibraryWriteResult::Saved, "The library creates a sibling name fixture");
+      Check(!library->CanPlace("project", "archive"), "A folder cannot move into its own descendants");
+      Check((co_await library->Put(initial)) == LibraryWriteResult::Saved &&
+                (co_await library->Put(moved)) == LibraryWriteResult::Saved,
+            "The same document ID can move and be renamed");
+      WorkspaceStore workspace(directory);
+      workspace.Set({.active_window = "workbench", .windows = {{.id = "workbench",
+          .tabs = {{.id = 1, .name = "Article", .library_document = "library-doc"}}, .selected = 1,
+          .library_expanded = {"", "project", "archive"}}}});
+      written = true;
+    });
+  }}});
+  {
+    UiTest ui(seed);
+    WaitForFixture(ui, [&] { return written; });
+  }
+  Check(source.DeleteRecursively(), "The original source and attachment can disappear after import");
+  const auto package = root.Child("documents").Child("library-doc");
+  Check(package.Child("attachments").Child("sample.png").ReadString().Value() == image &&
+            Codec(DocumentFormat::Json).Import(package.Child("article.json").ReadString().Value()).document == input.document,
+        "The original JSON and attachment survive folder moves and renaming");
+  const Application app(App, {.show_debug_overlay = false,
+      .application_hooks = {[&](ApplicationContext& context) { InstallFolioWithWorkspace(context, {}, directory); }},
+      .window_hooks = {InstallWorkbench}});
+  UiTest ui(app, {.viewport = {360, 640}, .resource_provider = std::make_shared<PackageResources>(package_path)});
+  const auto editor = ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
+  WaitForFixture(ui, [&] { return editor.Exists(); });
+  Check(editor.One().value.starts_with("Library article") &&
+            ui.FindSemantics(UiSemanticSelector::Label("Planning, switch document")).Exists(),
+        "Restart restores the document by ID and resolves its current display name");
+  const auto sidebar = ui.FindSemantics(UiSemanticSelector::Identifier("show-sidebar")).One().bounds;
+  ui.TapAt({sidebar.x + sidebar.width / 2.0F, sidebar.y + sidebar.height / 2.0F});
+  ui.Pump(400ms);
+  Check(ui.FindSemantics(UiSemanticSelector::Label("Workspace")).Exists() &&
+            !ui.FindSemantics(UiSemanticSelector::Label("My Documents")).Exists() &&
+            ui.FindSemantics(UiSemanticSelector::Label("Archive")).Exists() &&
+            ui.FindSemantics(UiSemanticSelector::Label("Planning")).Exists(),
+        "The workspace root directly contains the previously saved folders and documents");
+  const auto rename = ui.FindSemantics(UiSemanticSelector::Label("Actions for Planning")).One().bounds;
+  ui.TapAt({rename.x + rename.width / 2.0F, rename.y + rename.height / 2.0F});
+  ui.Find(UiSelector::Text("Rename…")).Tap();
+  const auto name_field = ui.Find(UiSelector::Key("library-entry-name"));
+  const auto name_semantics = ui.FindSemantics(UiSemanticSelector::Identifier("library-entry-name"));
+  name_field.Tap();
+  name_field.ReplaceText("invalid/name");
+  ui.PressKey(Key::Enter);
+  Check(name_semantics.One().error == "Enter a valid name." && name_semantics.One().focused,
+        "An invalid name keeps the dialog open and shows an inline error");
+  name_field.ReplaceText("Reserved");
+  ui.PressKey(Key::Enter);
+  WaitForFixture(ui, [&] { return name_semantics.One().error.starts_with("A file or folder already uses that name."); });
+  Check(name_semantics.One().value == "Reserved" && name_semantics.One().focused,
+        "A duplicate name keeps the input and keyboard focus");
+  name_field.ReplaceText("Product plan");
+  Send(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "jihua"}});
+  ui.PressKey(Key::Enter);
+  Check(name_field.Exists(), "Enter during IME composition keeps the rename dialog open");
+  Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "计划"}});
+  const auto blocked_staging = root.Child("catalog.json.tmp");
+  Check(blocked_staging.CreateDirectories() && blocked_staging.Child("fixture").WriteString(""),
+        "Block the catalog staging write for the rename fixture");
+  ui.PressKey(Key::Enter);
+  WaitForFixture(ui, [&] { return name_semantics.One().error.starts_with("Could not write the change"); });
+  Check(name_semantics.One().value == "Product plan计划" && name_semantics.One().focused,
+        "A storage write failure retains the attempted name and focus");
+  Check(blocked_staging.DeleteRecursively(), "Allow the catalog staging write to be retried");
+  ui.PressKey(Key::Enter);
+  WaitForFixture(ui, [&] {
+    return !name_field.Exists() && ui.FindSemantics(UiSemanticSelector::Label("Product plan计划")).Exists();
+  });
+  const auto renamed = nlohmann::json::parse(root.Child("catalog.json").ReadString().Value());
+  Check(std::ranges::any_of(renamed.at("entries"), [](const auto& entry) {
+    return entry.at("id") == "library-doc" && entry.at("parent") == "archive" && entry.at("name") == "Product plan计划";
+  }), "Enter persists the committed name on the same document in the same folder");
+  const auto bounds = ui.FindSemantics(UiSemanticSelector::Label("Archive")).One().bounds;
+  const Point touch{bounds.x + bounds.width / 2.0F, bounds.y + bounds.height / 2.0F};
+  ui.SendPointer({.type = PointerEventType::Down, .pointer_id = 7, .position = touch,
+                  .device_kind = PointerDeviceKind::Touch, .changed_button = PointerButton::Primary,
+                  .pressed_buttons = PointerButton::Primary});
+  ui.Pump(800ms);
+  ui.SendPointer({.type = PointerEventType::Up, .pointer_id = 7, .position = touch,
+                  .device_kind = PointerDeviceKind::Touch, .changed_button = PointerButton::Primary});
+  ui.Pump();
+  Check(ui.Find(UiSelector::Text("New folder…")).Exists(), "Long pressing a library folder opens its actions on release");
+  Check(ui.Find(UiSelector::Text("Import into this folder…")).Exists(), "Each workspace folder has a targeted import action");
+  ui.Find(UiSelector::Text("New document")).Tap();
+  ui.Pump(400ms);
+#if defined(__APPLE__)
+  ui.PressKey(Key::S, {.meta = true});
+#else
+  ui.PressKey(Key::S, {.control = true});
+#endif
+  WaitForFixture(ui, [&] {
+    const auto record = nlohmann::json::parse(root.Child("catalog.json").ReadString().Value());
+    return std::ranges::any_of(record.at("entries"), [](const auto& entry) {
+      return !entry.at("folder").template get<bool>() && entry.at("id") != "library-doc" && entry.at("parent") == "archive";
+    });
+  });
+}
+
+void ExternalHistoryFlow(const File& directory, const char* package_path) {
+  using namespace folio;
+  const auto project = directory.Child("Project");
+  const auto document = project.Child("Notes.md");
+  Check(project.CreateDirectories() && document.WriteString("# Notes\n\nAn external document."),
+        "Create the external document fixture");
+  const WorkspaceLocation folder_location{project.Path(), true};
+  const WorkspaceLocation file_location{document.Path(), false};
+  bool seed = true;
+  const Application app(App, {.show_debug_overlay = false,
+      .application_hooks = {[&](ApplicationContext& context) {
+        auto store = std::make_shared<WorkspaceStore>(directory);
+        if (std::exchange(seed, false)) {
+          store->Set({.active_window = "external", .windows = {{.id = "external",
+              .folders = {{1, "Project", folder_location, "folder"}},
+              .tabs = {{.id = 1, .name = "Notes.md", .location = file_location, .folder = 1,
+                        .relative = {"Notes.md"}}}, .selected = 1}},
+              .recent = {{"folder", "Project", folder_location, RecentKind::Folder},
+                         {"file", "Notes.md", file_location}}});
+        }
+        InstallFolioWithWorkspace(context, std::move(store), directory);
+      }},
+      .window_hooks = {InstallWorkbench}});
+  const auto options = UiTestOptions{.viewport = {360, 640},
+      .resource_provider = std::make_shared<PackageResources>(package_path)};
+  const auto tap = [](UiTest& ui, const SemanticNode& node) {
+    const auto bounds = node.bounds;
+    ui.TapAt({bounds.x + bounds.width / 2.0F, bounds.y + bounds.height / 2.0F});
+  };
+  for (const bool first_launch : {true, false}) {
+    UiTest ui(app, options);
+    const auto by_label = [&](std::string label) { return ui.FindSemantics(UiSemanticSelector::Label(std::move(label))); };
+    const auto editor = ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
+    WaitForFixture(ui, [&] { return editor.Exists(); });
+    Check(editor.One().value == "Notes\nAn external document.", "The open external tab survives restart");
+    tap(ui, ui.FindSemantics(UiSemanticSelector::Identifier("show-sidebar")).One());
+    ui.Pump(400ms);
+    const auto locations = by_label("External locations");
+    Check(!locations.Exists() && by_label("Project").Count() == 1,
+          "Previously mounted folders start in history and remain unmounted");
+    if (!first_launch) {
+      Check(!by_label("Notes.md").Exists(), "An explicitly removed recent entry stays removed on restart");
+      continue;
+    }
+    tap(ui, by_label("Project").One());
+    WaitForFixture(ui, [&] { return locations.Exists() && by_label("Project").Count() == 2; });
+    tap(ui, by_label("Actions for Project").All().front());
+    ui.Find(UiSelector::Text("New folder…")).Tap();
+    const auto external_name = ui.Find(UiSelector::Key("name"));
+    external_name.Tap();
+    external_name.ReplaceText("Created with Enter");
+    ui.PressKey(Key::Enter);
+    WaitForFixture(ui, [&] { return !external_name.Exists() && project.Child("Created with Enter").IsDirectory(); });
+    tap(ui, by_label("Actions for Project").All().front());
+    ui.Find(UiSelector::Text("Remove from external locations")).Tap();
+    WaitForFixture(ui, [&] { return !locations.Exists(); });
+    Check(by_label("Project").Count() == 1, "Unmounting the folder preserves its recent entry");
+    tap(ui, by_label("Actions for Notes.md").One());
+    ui.Find(UiSelector::Text("Remove from recently opened")).Tap();
+    WaitForFixture(ui, [&] { return !by_label("Notes.md").Exists(); });
+    tap(ui, ui.FindSemantics(UiSemanticSelector::Identifier("hide-sidebar")).One());
+    ui.Pump(400ms);
+    Check(editor.Exists() && document.ReadString().Succeeded(), "Removing a recent item preserves the tab and file");
+  }
 }
 
 [[huxerui::composable]]
@@ -465,14 +806,26 @@ void OutlineFlow(const char* package_path) {
 } // namespace
 
 int main(int argc, char** argv) {
+  const auto directory = File(std::filesystem::temp_directory_path().u8string()).Child(folio::UniqueName("workspace-test-"));
   try {
     Check(argc == 2, "The Folio resource package path is required");
     WebUrls();
+    {
+      const Application storage([] { return View{}; }, {
+          .application_hooks = {[&](ApplicationContext&) { WorkspaceStorage(directory.Child("store")); }},
+      });
+      UiTest ui(storage);
+    }
+    WorkspaceRestoreFlow(directory.Child("flow"), argv[1]);
+    LibraryStorageFlow(directory.Child("library-flow"), argv[1]);
+    ExternalHistoryFlow(directory.Child("external-history"), argv[1]);
     CompactCodeTools(argv[1]);
     PaletteFlow(argv[1]);
     OutlineFlow(argv[1]);
   } catch (const std::exception& error) {
+    (void)directory.DeleteRecursively();
     std::cerr << error.what() << '\n';
     return 1;
   }
+  (void)directory.DeleteRecursively();
 }

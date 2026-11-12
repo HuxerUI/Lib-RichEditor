@@ -8,6 +8,8 @@
 
 namespace folio {
 
+class WorkspaceStore;
+
 struct FindPanelState {
   bool open = false;
   bool field_focused = false;
@@ -32,6 +34,8 @@ using WorkbenchKeyHandler = std::function<bool(const huxerui::KeyEvent&)>;
 huxerui::View Workbench(huxerui::State<WorkbenchKeyHandler> dispatch);
 huxerui::WindowOptions FolioWindowOptions();
 void InstallFolio(huxerui::ApplicationContext& context);
+void InstallFolioWithWorkspace(huxerui::ApplicationContext& context, std::shared_ptr<WorkspaceStore> store,
+                               std::optional<huxerui::File> data_directory = {});
 void InstallWorkbench(huxerui::WindowContext& context);
 
 } // namespace folio
