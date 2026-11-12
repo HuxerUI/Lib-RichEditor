@@ -266,6 +266,9 @@ struct BlockData {
   unsigned list_start = 1;
   /// Whether a list is tight in formats that distinguish tight and loose lists.
   bool tight = true;
+  /// Completion state of a task list item. An empty value denotes an ordinary list item.
+  /// Available on ListItem blocks only. The marker belongs to the item and occupies no text offsets.
+  std::optional<bool> task_checked;
   /// Single-line UTF-8 metadata for a code block, such as a language name. An empty string omits the info string.
   std::string fence_info;
   /// Whether the first row is a header. Available on Table blocks.

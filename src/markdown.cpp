@@ -477,10 +477,7 @@ private:
       if (block.children.empty()) {
         block.children.emplace_back(BlockData{});
       }
-      if (node.task_checked) {
-        Report("markdown.task", "Task marker converted to literal text");
-        block.children.insert(block.children.begin(), Block(BlockData{.text = *node.task_checked ? "[x]" : "[ ]"}));
-      }
+      block.task_checked = node.task_checked;
       break;
     case NodeKind::OrderedList:
     case NodeKind::UnorderedList:
@@ -1039,7 +1036,21 @@ private:
           const std::string marker = data.ordered
               ? std::to_string(ordinal <= 999999999 ? ordinal : 1) + (alternate_marker ? ") " : ". ")
               : alternate_marker ? "+ " : "- ";
-          PrefixLines(out, Blocks(data.children[j].Data().children, data.tight), marker, std::string(marker.size(), ' '));
+          const auto& item = data.children[j].Data();
+          const std::string indent(marker.size(), ' ');
+          const auto content = Blocks(item.children, data.tight);
+          auto first = marker;
+          if (item.task_checked.has_value()) {
+            first += *item.task_checked ? "[x]" : "[ ]";
+            if (item.children.front().Data().kind != BlockKind::Paragraph) {
+              // A standalone marker lets the parser recognize the first child as a block.
+              first += '\n';
+              first += indent;
+            } else if (!content.empty() && content.front() != '\n') {
+              first += ' ';
+            }
+          }
+          PrefixLines(out, content, first, indent);
         }
         break;
       case BlockKind::Table:

@@ -240,28 +240,44 @@ std::vector<Block> BlocksBetween(std::span<const Block> blocks, std::size_t begi
   return {part.begin(), part.end()};
 }
 
-RichDocument Splice(const RichDocument& document, const TreeRange& range, std::vector<Block> replacement, EditChanges& edit) {
-  const auto siblings = ChildrenAt(document, range.parent);
-  for (const auto& block : siblings.subspan(range.first, range.last - range.first + 1)) {
-    edit.Touch(block);
-  }
-  auto children = BlocksBetween(siblings, 0, range.first);
-  children.insert(children.end(), replacement.begin(), replacement.end());
-  children.insert(children.end(), siblings.begin() + static_cast<std::ptrdiff_t>(range.last + 1), siblings.end());
-  const ChildChange change{range.first, range.last + 1, range.first + replacement.size()};
-  if (range.parent.empty()) {
-    return edit.Build(document, std::move(children), {{0, change}});
-  }
-  const auto& parent = BlockAt(document, range.parent);
-  auto data = parent.Data();
-  data.children = std::move(children);
-  Replacements changes;
-  if (!data.children.empty()) {
-    changes[DocumentAccess::Id(parent)] = {DocumentAccess::WithData(parent, std::move(data))};
-  } else {
-    changes[DocumentAccess::Id(parent)] = {};
-  }
-  return Rewrite(document, changes, edit, {{DocumentAccess::Id(parent), change}});
+RichDocument Splice(const RichDocument& document, const TreeRange& range, std::vector<Block> replacement,
+                    EditChanges& edit, bool touch_leaves = true) {
+  ChildChanges changes;
+  const auto splice_children = [&](std::span<const Block> siblings, std::size_t first, std::size_t end,
+                                    std::span<const Block> inserted, BlockId parent) {
+    const auto before = siblings.first(first);
+    const auto after = siblings.subspan(end);
+    std::vector<Block> children;
+    children.reserve(before.size() + inserted.size() + after.size());
+    children.insert(children.end(), before.begin(), before.end());
+    children.insert(children.end(), inserted.begin(), inserted.end());
+    children.insert(children.end(), after.begin(), after.end());
+    changes.emplace(parent, ChildChange{first, end, first + inserted.size()});
+    return children;
+  };
+  const auto splice_path = [&](const auto& self, std::span<const Block> siblings,
+                                std::span<const std::size_t> path, BlockId parent) -> std::vector<Block> {
+    if (path.empty()) {
+      if (touch_leaves) {
+        for (const auto& block : siblings.subspan(range.first, range.last - range.first + 1)) {
+          edit.Touch(block);
+        }
+      }
+      return splice_children(siblings, range.first, range.last + 1, replacement, parent);
+    }
+    const auto index = path.front();
+    const auto& block = siblings[index];
+    auto children = self(self, block.Data().children, path.subspan(1), DocumentAccess::Id(block));
+    if (children.empty()) {
+      return splice_children(siblings, index, index + 1, {}, parent);
+    }
+    auto data = block.Data();
+    data.children = std::move(children);
+    const auto updated = DocumentAccess::WithData(block, std::move(data));
+    return splice_children(siblings, index, index + 1, std::span(&updated, 1), parent);
+  };
+  auto blocks = splice_path(splice_path, document.Blocks(), range.parent, 0);
+  return edit.Build(document, std::move(blocks), changes);
 }
 
 TreeRange Siblings(const RichDocument& document, TextRange range) {
@@ -306,6 +322,7 @@ bool StartsWith(std::span<const std::size_t> path, std::span<const std::size_t> 
 
 struct ListPosition {
   const BlockData* list;
+  const BlockData* item;
   /// Index of the item in the path to the selected leaf.
   std::size_t item_depth;
 
@@ -325,7 +342,7 @@ std::optional<ListPosition> ListAt(const RichDocument& document, std::span<const
   for (std::size_t depth = 0; depth + 1 < path.size(); ++depth) {
     const auto& data = siblings[path[depth]].Data();
     if (data.kind == BlockKind::List) {
-      position = ListPosition{&data, depth + 1};
+      position = ListPosition{&data, &data.children[path[depth + 1]].Data(), depth + 1};
     }
     siblings = data.children;
   }
@@ -353,12 +370,29 @@ struct ListSelection {
   bool numbered = false;
   bool bulleted = false;
   bool plain = false;
+  bool ordinary_item = false;
+  bool complete_task = false;
+  bool incomplete_task = false;
 
   CheckState Checked(bool ordered) const {
     if (!(ordered ? numbered : bulleted)) {
       return CheckState::Off;
     }
     return plain || (ordered ? bulleted : numbered) ? CheckState::Mixed : CheckState::On;
+  }
+
+  CheckState TaskMarkerState() const {
+    if (!complete_task && !incomplete_task) {
+      return CheckState::Off;
+    }
+    return plain || ordinary_item ? CheckState::Mixed : CheckState::On;
+  }
+
+  CheckState TaskCompletionState(bool checked) const {
+    if (!(checked ? complete_task : incomplete_task)) {
+      return CheckState::Off;
+    }
+    return plain || ordinary_item || (complete_task && incomplete_task) ? CheckState::Mixed : CheckState::On;
   }
 };
 
@@ -382,6 +416,10 @@ ListSelection ResolveListSelection(const RichDocument& document, TextRange range
       if (includes_marker) {
         result.numbered |= position->list->ordered;
         result.bulleted |= !position->list->ordered;
+        const auto checked = position->item->task_checked;
+        result.ordinary_item |= !checked.has_value();
+        result.complete_task |= checked == true;
+        result.incomplete_task |= checked == false;
       } else {
         result.plain = true;
       }
@@ -551,6 +589,17 @@ RichDocument SpliceList(const RichDocument& document, TreeRange range, std::vect
   return Splice(document, range, std::move(replacement), edit);
 }
 
+RichDocument WrapList(const RichDocument& document, const TreeRange& selected, bool ordered,
+                      std::optional<bool> task_checked, EditChanges& edit) {
+  const auto siblings = ChildrenAt(document, selected.parent);
+  BlockData list{.kind = BlockKind::List, .ordered = ordered};
+  for (std::size_t i = selected.first; i <= selected.last; ++i) {
+    list.children.emplace_back(BlockData{.kind = BlockKind::ListItem, .children = {siblings[i]},
+                                        .task_checked = task_checked});
+  }
+  return SpliceList(document, selected, {Block(std::move(list))}, 0, edit, true);
+}
+
 RichDocument ChangeList(const RichDocument& document, const ListSelection& selection, bool ordered, EditChanges& edit) {
   if (const auto& items = selection.items) {
     const auto& list = BlockAt(document, items->parent);
@@ -572,14 +621,31 @@ RichDocument ChangeList(const RichDocument& document, const ListSelection& selec
     return SpliceList(document, ParentSlot(items->parent), std::move(blocks), converted, edit);
   }
   if (const auto& selected = selection.blocks) {
-    const auto siblings = ChildrenAt(document, selected->parent);
-    BlockData list{.kind = BlockKind::List, .ordered = ordered};
-    for (std::size_t i = selected->first; i <= selected->last; ++i) {
-      list.children.emplace_back(BlockData{.kind = BlockKind::ListItem, .children = {siblings[i]}});
-    }
-    return SpliceList(document, *selected, {Block(std::move(list))}, 0, edit, true);
+    return WrapList(document, *selected, ordered, std::nullopt, edit);
   }
   return document;
+}
+
+RichDocument SetTaskItems(const RichDocument& document, const TreeRange& items, std::optional<bool> checked,
+                          bool add_missing_only, EditChanges& edit) {
+  auto replacement = BlocksBetween(ChildrenAt(document, items.parent), items.first, items.last + 1);
+  bool changed = false;
+  for (auto& item : replacement) {
+    const auto current = item.Data().task_checked;
+    if (current == checked || (add_missing_only && current.has_value())) {
+      continue;
+    }
+    auto data = item.Data();
+    data.task_checked = checked;
+    item = DocumentAccess::WithData(item, std::move(data));
+    changed = true;
+  }
+  if (!changed) {
+    return document;
+  }
+  auto updated = Splice(document, items, std::move(replacement), edit, /*touch_leaves=*/false);
+  edit.task_state_only = true;
+  return updated;
 }
 
 RichDocument ChangeQuote(const RichDocument& document, TextRange range, EditChanges& edit) {
@@ -638,6 +704,9 @@ RichDocument Outdent(const RichDocument& document, const TreeRange& items, EditC
   first_item.children.erase(first_item.children.begin() + static_cast<std::ptrdiff_t>(slot.first), first_item.children.end());
   if (before) {
     first_item.children.push_back(*before);
+  }
+  if (first_item.children.empty() && first_item.task_checked.has_value()) {
+    first_item.children.emplace_back(BlockData{});
   }
   if (!first_item.children.empty()) {
     replacement.push_back(DocumentAccess::WithData(parent, std::move(first_item)));
@@ -1185,6 +1254,13 @@ CommandState ContainerStatus(const RichDocument& document, TextRange range, cons
         : selection.blocks.has_value();
     return {!protected_content && enabled, selection.Checked(ordered)};
   }
+  if (std::holds_alternative<ToggleTaskMarker>(command)) {
+    return {!protected_content && (selection.items || selection.blocks), selection.TaskMarkerState()};
+  }
+  if (const auto* task = std::get_if<SetTaskChecked>(&command)) {
+    return {!protected_content && selection.items && selection.TaskMarkerState() == CheckState::On,
+            selection.TaskCompletionState(task->checked)};
+  }
   return {!protected_content && selection.items &&
           (!std::holds_alternative<IndentList>(command) || selection.items->first > 0)};
 }
@@ -1197,9 +1273,19 @@ RichDocument ChangeContainer(const RichDocument& document, TextRange range, cons
   if (const auto* list = std::get_if<ToggleList>(&command)) {
     return ChangeList(document, selection, list->kind == ListKind::Ordered, edit);
   }
+  if (std::holds_alternative<ToggleTaskMarker>(command)) {
+    if (const auto& items = selection.items) {
+      const bool remove = selection.TaskMarkerState() == CheckState::On;
+      return SetTaskItems(document, *items, remove ? std::nullopt : std::optional(false), !remove, edit);
+    }
+    return selection.blocks ? WrapList(document, *selection.blocks, false, false, edit) : document;
+  }
   const auto& items = selection.items;
   if (!items) {
     return document;
+  }
+  if (const auto* task = std::get_if<SetTaskChecked>(&command)) {
+    return SetTaskItems(document, *items, task->checked, false, edit);
   }
   if (const auto* start = std::get_if<SetListStart>(&command)) {
     const auto& list = BlockAt(document, items->parent);
@@ -1214,6 +1300,25 @@ RichDocument ChangeContainer(const RichDocument& document, TextRange range, cons
     return items->first == 0 ? document : Indent(document, *items, edit);
   }
   return Outdent(document, *items, edit);
+}
+
+RichDocument ToggleTaskAt(const RichDocument& document, BlockId item, EditChanges& edit) {
+  const auto& index = DocumentAccess::Get(document).index;
+  const auto first = index.FirstLeafOf(item);
+  if (!first) {
+    return document;
+  }
+  const auto path = index.At(*first).path;
+  auto siblings = document.Blocks();
+  for (std::size_t depth = 0; depth + 1 < path.size(); ++depth) {
+    const auto& block = siblings[path[depth]];
+    const auto& data = block.Data();
+    if (DocumentAccess::Id(block) == item && data.task_checked.has_value()) {
+      return SetTaskItems(document, ItemSlot(path, depth), !*data.task_checked, false, edit);
+    }
+    siblings = data.children;
+  }
+  return document;
 }
 
 namespace {
@@ -1231,6 +1336,7 @@ EditResult SplitListItem(EditResult result, EditChanges& edit) {
   }
   const auto caret = PositionAt(document, result.caret);
   auto data = item.Data();
+  const auto next_checked = data.task_checked.has_value() ? std::optional(false) : std::nullopt;
   // Return at the end of the text adds a sibling below the existing sublist and continuation blocks.
   const auto end = leaf.block.Data().text.empty() ? slot.first + 1 : data.children.size();
   auto next = BlocksBetween(data.children, slot.first, end);
@@ -1238,7 +1344,8 @@ EditResult SplitListItem(EditResult result, EditChanges& edit) {
                       data.children.begin() + static_cast<std::ptrdiff_t>(end));
   result.document = Splice(document, ParentSlot(slot.parent),
                            {DocumentAccess::WithData(item, std::move(data)),
-                            Block(BlockData{.kind = BlockKind::ListItem, .children = std::move(next)})}, edit);
+                            Block(BlockData{.kind = BlockKind::ListItem, .children = std::move(next),
+                                            .task_checked = next_checked})}, edit);
   result.caret = Absolute(result.document, caret);
   return result;
 }
@@ -1256,7 +1363,9 @@ EditResult BreakTextLine(const RichDocument& document, TextRange range, std::opt
       ? std::nullopt : LeadingListItem(document, leaf.path);
   if (item && range.IsCollapsed() && range.start == leaf.start && !leaf.block.Data().text.empty()) {
     const auto& current = ChildrenAt(document, item->parent)[item->first];
-    const Block empty(BlockData{.kind = BlockKind::ListItem, .children = {Block(BlockData{})}});
+    const auto next_checked = current.Data().task_checked.has_value() ? std::optional(false) : std::nullopt;
+    const Block empty(BlockData{.kind = BlockKind::ListItem, .children = {Block(BlockData{})},
+                                .task_checked = next_checked});
     return {Splice(document, *item, {empty, current}, edit), range.start};
   }
   auto split = ReplaceText(document, range, "\n", marks, hard_break, edit);

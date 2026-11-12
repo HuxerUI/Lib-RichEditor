@@ -88,6 +88,23 @@ struct ToggleList {
   ListKind kind;
 };
 
+/// @brief Adds or removes task markers using the same selection rules as ToggleList.
+///
+/// Wraps eligible non-list blocks in a bulleted list with unchecked task items. For sibling list items,
+/// adds unchecked markers to ordinary items and preserves existing completion states. If every selected item
+/// already has a marker, removes the markers while retaining the list and its child blocks.
+/// GetCommandState() reports marker presence independently of command availability.
+struct ToggleTaskMarker {};
+
+/// @brief Sets the completion state of the task items targeted by the selection in one undoable edit.
+///
+/// The selection must target task items in one list. GetCommandState() reports how much of the selection
+/// matches checked. The command preserves the selection and any pending typing marks.
+struct SetTaskChecked {
+  /// True marks the tasks complete. False marks them incomplete.
+  bool checked;
+};
+
 /// @brief Changes the first number of the ordered list targeted by the current list selection.
 /// Targets the same list as ToggleList. The items and selection are preserved in one undoable edit.
 struct SetListStart {
@@ -269,7 +286,7 @@ struct Redo {};
 /// @brief Typed command accepted by RichEditorController::Execute() and GetCommandState().
 using EditorCommand = std::variant<
     ToggleMark, ClearFormatting, SetLink, SetBlockKind,
-    ToggleList, SetListStart, ToggleQuote, IndentList, OutdentList,
+    ToggleList, ToggleTaskMarker, SetTaskChecked, SetListStart, ToggleQuote, IndentList, OutdentList,
     InsertTable, InsertTableRow, InsertTableColumn, DeleteTableRow, DeleteTableColumn,
     ToggleTableHeader, SetTableColumnAlignment, DeleteTable, ExitTable,
     ContinueInParagraph, InsertThematicBreak,
@@ -382,8 +399,8 @@ public:
   /// @brief Reads command state for the current selection, typing marks, and history.
   /// Calls in composition observe changes so application controls can refresh.
   /// Table actions other than insertion require a caret or selection within a single cell. Image replacement,
-  /// deletion, and resizing require the entire image to be selected. Table and image actions are unavailable
-  /// during preedit.
+  /// deletion, and resizing require the entire image to be selected. Table, image, and task actions are
+  /// unavailable during preedit.
   /// @param command The same command value that the control passes to Execute().
   /// @return Availability and a check state when the command describes an active format.
   CommandState GetCommandState(const EditorCommand& command) const;

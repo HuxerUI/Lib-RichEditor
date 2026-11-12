@@ -92,6 +92,8 @@ public:
   IndexedPosition AtOffset(TextOffset absolute) const;
   /// Returns the ordinal of a live leaf ID, or an empty value for absent IDs and containers.
   std::optional<std::size_t> IndexOf(BlockId id) const;
+  /// Returns the ordinal of the first leaf in a live block, including a container.
+  std::optional<std::size_t> FirstLeafOf(BlockId id) const;
   /// Borrows a live leaf from this snapshot, or returns null for absent IDs and containers.
   const Block* FindLeaf(BlockId id) const;
   /// Returns the flattened start of a live leaf. Throws std::out_of_range for an absent ID or a container.

@@ -71,6 +71,8 @@ public:
   bool BackspaceAtStart();
   bool AppendTableRow();
   bool SetCodeLanguage(BlockId block, std::string_view language);
+  /// Applies one undoable change to the indicated task outside IME preedit.
+  bool ToggleTaskChecked(BlockId item);
   void FinishComposition();
 
   CommandState CommandStatus(const EditorCommand& command) const;
@@ -88,6 +90,7 @@ private:
     EditState before;
     EditState after;
     std::vector<BlockId> changed_blocks;
+    bool task_state_only;
   };
 
   bool Publish(Draft next, bool remember, bool reset_block_changes = false);

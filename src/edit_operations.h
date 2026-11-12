@@ -10,6 +10,8 @@ namespace huxerui::richeditor::detail {
 struct EditChanges {
   BlockId last_id;
   std::vector<BlockId> touched;
+  /// Set for a task state edit that preserves the ordered leaves and their UTF-16 text. Publishing consumes it.
+  bool task_state_only = false;
 
   /// Records leaves before a subtree is replaced or erased, including atomic blocks that may become text.
   void Touch(const Block& block);
@@ -53,6 +55,8 @@ RichDocument Format(const RichDocument& document, TextRange range, const EditorC
 std::optional<unsigned> ListStartAt(const RichDocument& document, TextRange range);
 CommandState ContainerStatus(const RichDocument& document, TextRange range, const EditorCommand& command);
 RichDocument ChangeContainer(const RichDocument& document, TextRange range, const EditorCommand& command, EditChanges& edit);
+/// Toggles the task marker identified by a live list-item ID without changing text or selection.
+RichDocument ToggleTaskAt(const RichDocument& document, BlockId item, EditChanges& edit);
 /// Replaces the selection with a break, creating a sibling item when splitting a list item's leading text.
 EditResult BreakTextLine(const RichDocument& document, TextRange range, std::optional<Mark> marks,
                          bool hard_break, EditChanges& edit);

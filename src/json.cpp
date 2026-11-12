@@ -112,10 +112,15 @@ Block DecodeBlock(const Json& object) {
     data.fence_info = object.value("info", std::string{});
     break;
   case BlockKind::Quote:
-  case BlockKind::ListItem:
   case BlockKind::TableRow:
   case BlockKind::TableCell:
     CheckFields(object, {"type", "children"});
+    break;
+  case BlockKind::ListItem:
+    CheckFields(object, {"type", "children", "task_checked"});
+    if (const auto checked = object.find("task_checked"); checked != object.end()) {
+      data.task_checked = checked->get<bool>();
+    }
     break;
   case BlockKind::Table:
     CheckFields(object, {"type", "children", "has_header", "column_alignments"});
@@ -249,6 +254,9 @@ Json EncodeBlock(const Block& block) {
     object["ordered"] = data.ordered;
     object["start"] = data.list_start;
     object["tight"] = data.tight;
+  }
+  if (data.task_checked.has_value()) {
+    object["task_checked"] = *data.task_checked;
   }
   if (data.kind == BlockKind::Table) {
     object["has_header"] = data.table_has_header;

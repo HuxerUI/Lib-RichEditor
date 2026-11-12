@@ -74,10 +74,19 @@ public:
     bool operator==(const LinkLocation&) const = default;
   };
 
+  struct TaskMarker {
+    BlockId item;
+    bool checked;
+    /// Content-local tap target, including the space around the drawn checkbox.
+    Rect bounds;
+    std::string label;
+  };
+
   struct ListMarker {
     std::string text;
-    float left;
-    float width;
+    Rect bounds;
+    TextAlign alignment;
+    std::optional<TaskMarker> task;
   };
 
   struct InlineBackground {
@@ -220,6 +229,8 @@ public:
   TextPosition Hit(const RichDocument& document, Point point) const;
   /// Hits the laid-out link fragments, including wrapped text and clipped table cells.
   std::optional<LinkLocation> LinkAt(const RichDocument& document, Point point) const;
+  /// Returns the owning item ID when a point hits a task checkbox.
+  std::optional<BlockId> TaskAt(Point point) const;
   /// Records the normal row text or replaces the hovered link's foreground using the existing layout inputs.
   void PaintText(PaintContext& paint, std::size_t index, std::optional<LinkLocation> hovered_link) const;
   /// Finds the caret within a known row, for navigation between visual lines.

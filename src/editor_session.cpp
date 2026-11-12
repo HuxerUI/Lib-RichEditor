@@ -4,6 +4,7 @@
 
 #include <bit>
 #include <stdexcept>
+#include <utility>
 
 namespace huxerui::richeditor::detail {
 namespace {
@@ -339,13 +340,14 @@ std::optional<TextRange> EditorSession::CompositionRange() const {
 bool EditorSession::Publish(Draft next, bool remember, bool reset_block_changes) {
   const auto& before = Committed(draft_);
   const auto& after = Committed(next);
+  const bool task_state_only = std::exchange(next.changes.task_state_only, false);
   const bool snapshot_changed = !DocumentAccess::Same(before.document, after.document);
-  const bool committed_changed = before.document != after.document;
+  const bool committed_changed = task_state_only ? snapshot_changed : before.document != after.document;
   const bool visible_changed = !DocumentAccess::Same(draft_.edit.document, next.edit.document);
   const bool selection_changed = draft_.edit.selection != next.edit.selection || draft_.edit.pending != next.edit.pending;
   const auto composition = next.composition ? std::optional(next.composition->range) : std::nullopt;
   const bool changed = visible_changed || selection_changed || CompositionRange() != composition || committed_changed;
-  const bool text_changed = visible_changed && !SameText(draft_.edit.document, next.edit.document);
+  const bool text_changed = visible_changed && !task_state_only && !SameText(draft_.edit.document, next.edit.document);
   auto& touched = next.changes.touched;
   std::ranges::sort(touched);
   touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
@@ -361,7 +363,7 @@ bool EditorSession::Publish(Draft next, bool remember, bool reset_block_changes)
     touched.clear();
   }
   if (remember && committed_changed) {
-    undo_.push_back({before, after, changed_blocks});
+    undo_.push_back({before, after, changed_blocks, task_state_only});
     if (undo_.size() > history_limit) {
       undo_.pop_front();
     }
@@ -482,6 +484,15 @@ bool EditorSession::SetCodeLanguage(BlockId block, std::string_view language) {
   auto next = draft_;
   next.edit.document = Format(next.edit.document, {offset, offset}, SetBlockKind{BlockKind::CodeBlock, 0, std::move(info)},
                               false, next.changes);
+  return Publish(std::move(next), true);
+}
+
+bool EditorSession::ToggleTaskChecked(BlockId item) {
+  if (draft_.composition) {
+    return false;
+  }
+  auto next = draft_;
+  next.edit.document = ToggleTaskAt(next.edit.document, item, next.changes);
   return Publish(std::move(next), true);
 }
 
@@ -612,7 +623,12 @@ CommandState EditorSession::CommandStatus(const EditorCommand& command) const {
   if (std::holds_alternative<SetListStart>(command)) {
     return {OrderedListStart().has_value()};
   }
-  return ContainerStatus(document, range, command);
+  auto state = ContainerStatus(document, range, command);
+  if (draft_.composition && (std::holds_alternative<ToggleTaskMarker>(command) ||
+                             std::holds_alternative<SetTaskChecked>(command))) {
+    state.enabled = false;
+  }
+  return state;
 }
 
 bool EditorSession::Execute(const EditorCommand& command) {
@@ -635,6 +651,7 @@ bool EditorSession::Execute(const EditorCommand& command) {
     const bool reset_block_changes = !DocumentAccess::Same(next.edit.document, expected);
     next.edit = undoing ? entry.before : entry.after;
     next.changes.touched = entry.changed_blocks;
+    next.changes.task_state_only = !reset_block_changes && entry.task_state_only;
     destination.push_back(std::move(source.back()));
     source.pop_back();
     return Publish(std::move(next), false, reset_block_changes);

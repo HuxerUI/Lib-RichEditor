@@ -104,6 +104,12 @@ android {
         checkReleaseBuilds = false
         abortOnError = false
     }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            output.outputFileName = "${rootProject.name}-${variant.versionName}.APK"
+        }
+    }
 }
 
 androidComponents.onVariants(androidComponents.selector().all()) { variant ->

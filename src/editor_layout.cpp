@@ -447,6 +447,11 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
   tables_.clear();
   std::unordered_map<BlockId, CachedLayout> next_cache;
   std::unordered_map<BlockId, std::size_t> quote_indices;
+  struct ListSpacing {
+    float marker = 0.0F;
+    float checkbox = 0.0F;
+  };
+  std::unordered_map<BlockId, ListSpacing> list_spacing;
   std::vector<std::size_t> leaf_quote_rules;
   const TextStyle body{
       style.body_font.value_or(Font::FromFamily(theme.typography.family, theme.typography.body_large)),
@@ -459,6 +464,7 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
   marker_style_ = {body.font, style.list_marker_color.value_or(theme.colors.on_surface_variant)};
   const auto& padding = style.content_padding;
   const float indent_scale = std::max(1.0F, body.font.Size() / 16.0F);
+  const float text_left_limit = std::max(padding.left, width - padding.right - 32.0F);
   const auto append = [&](const Leaf& leaf, Point origin, float block_width, EdgeInsets insets,
                           std::vector<ListMarker> markers, bool header, std::optional<Cell> cell = {},
                           TableColumnAlignment alignment = TableColumnAlignment::Default) {
@@ -745,27 +751,78 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         x += style.quote_rule_width + 12.0F * indent_scale;
       } else if (data.kind == BlockKind::List) {
         const auto start = static_cast<std::uint64_t>(data.list_start);
-        const std::string marker = data.ordered
-            ? std::to_string(start + leaf.path[depth + 1]) + "."
-            : "•";
-        // Keep item text aligned when the list crosses a digit boundary.
-        const float indent = (data.ordered
-            ? std::max(24.0F, 9.0F * (std::to_string(start + data.children.size() - 1).size() + 1) + 5.0F)
-            : 22.0F) * indent_scale;
+        const auto [entry, inserted] = list_spacing.try_emplace(DocumentAccess::Id(container));
+        auto& spacing = entry->second;
+        if (inserted) {
+          // Use one indent across digit boundaries and across ordinary and task items in a list.
+          spacing.marker = (data.ordered
+              ? std::max(24.0F, 9.0F * (std::to_string(start + data.children.size() - 1).size() + 1) + 5.0F)
+              : 22.0F) * indent_scale;
+          if (std::ranges::any_of(data.children, [](const Block& item) { return item.Data().task_checked.has_value(); })) {
+            spacing.checkbox = 28.0F * indent_scale;
+          }
+        }
+        const float indent = data.ordered ? spacing.marker + spacing.checkbox : std::max(spacing.marker, spacing.checkbox);
         const auto inside_item = std::span(leaf.path).subspan(depth + 2);
         if (IsLeadingPath(inside_item)) {
-          markers.push_back({marker, x, indent - 5.0F});
+          const auto& item = data.children[leaf.path[depth + 1]];
+          const auto checked = item.Data().task_checked;
+          const bool task = checked.has_value();
+          const bool center_bullet = !data.ordered && spacing.checkbox > 0.0F;
+          auto& marker = markers.emplace_back(
+              data.ordered ? std::to_string(start + leaf.path[depth + 1]) + "." : task ? "" : "•",
+              Rect{.x = x, .width = center_bullet ? spacing.checkbox : spacing.marker - 5.0F},
+              center_bullet ? TextAlign::Center : TextAlign::Trailing);
+          if (task) {
+            const auto& text = item.Data().children.front().Data().text;
+            marker.task = TaskMarker{DocumentAccess::Id(item), *checked,
+                                     {.x = x + (data.ordered ? spacing.marker : 0.0F), .width = spacing.checkbox},
+                                     text.substr(0, text.find('\n'))};
+          }
         }
         x += indent;
       }
     }
-    x = std::min(x, std::max(padding.left, width - padding.right - 32.0F));
+    if (x > text_left_limit) {
+      if (text_left_limit == padding.left) {
+        markers.clear();
+      } else {
+        // Keep the painted markers and their hit targets inside the same gutter as the text indent.
+        const float scale = (text_left_limit - padding.left) / (x - padding.left);
+        const auto fit = [&](Rect& bounds) {
+          bounds.x = padding.left + (bounds.x - padding.left) * scale;
+          bounds.width *= scale;
+        };
+        for (auto& marker : markers) {
+          fit(marker.bounds);
+          if (marker.task) {
+            fit(marker.task->bounds);
+          }
+        }
+      }
+      x = text_left_limit;
+    }
     const auto& data = leaf.block.Data();
     const bool is_code = data.kind == BlockKind::CodeBlock;
     const auto code_padding = is_code ? style.code_block_padding : EdgeInsets{};
     const float block_width = std::max(0.0F, width - x - padding.right);
     append(leaf, {x, y}, block_width, code_padding, std::move(markers), false);
-    const float bottom = rows_.back().Bottom();
+    auto& row = rows_.back();
+    const float bottom = row.Bottom();
+    if (!row.markers.empty()) {
+      const auto lines = row.layout.Lines();
+      const float top = row.origin.y + (lines.empty() ? 0.0F : lines.front().bounds.y);
+      const float line_height = lines.empty() ? bottom - top : std::min(lines.front().bounds.height, bottom - top);
+      const float hit_padding = style.block_spacing / 2.0F;
+      for (auto& marker : row.markers) {
+        marker.bounds.y = top;
+        marker.bounds.height = line_height;
+        if (marker.task) {
+          marker.task->bounds.y = top - hit_padding;
+          marker.task->bounds.height = line_height + 2.0F * hit_padding;
+        }
+      }
+    }
     for (const auto index : leaf_quote_rules) {
       auto& rule = quote_rules_[index];
       rule.height = bottom - rule.y;
@@ -876,6 +933,18 @@ TextPosition EditorLayout::Hit(const RichDocument& document, Point point) const 
   }
   const auto index = static_cast<std::size_t>(row - rows_.begin());
   return Hit(document, LeafInRow(index, point.x), point);
+}
+
+std::optional<BlockId> EditorLayout::TaskAt(Point point) const {
+  const auto row = std::ranges::lower_bound(rows_, point.y - style_.block_spacing / 2.0F, {}, &Row::Bottom);
+  if (row != rows_.end() && point.x < row->origin.x) {
+    for (const auto& marker : row->markers) {
+      if (marker.task && marker.task->bounds.Contains(point)) {
+        return marker.task->item;
+      }
+    }
+  }
+  return std::nullopt;
 }
 
 TextPosition EditorLayout::Hit(const RichDocument& document, std::size_t index, Point point) const {

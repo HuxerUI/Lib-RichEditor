@@ -518,6 +518,261 @@ void ListEditing() {
   }
 }
 
+void TaskListEditing() {
+  const Application app(App, {.show_debug_overlay = false});
+  UiTest ui(app);
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  using huxerui::richeditor::detail::DocumentAccess;
+  const MarkdownCodec markdown;
+  const auto replace = [&](std::string_view source) {
+    const auto imported = markdown.Import(source);
+    Check(imported.document.has_value(), "Import task editing fixture");
+    controller->ReplaceDocument(*imported.document);
+    ui.Pump();
+    return *imported.document;
+  };
+  const auto select = [&](TextSelection selection) {
+    Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
+  };
+  const auto task = [](std::size_t item) {
+    return controller->Document().Blocks()[0].Data().children[item].Data().task_checked;
+  };
+  const ToggleTaskMarker marker;
+  const SetTaskChecked complete{true};
+  const SetTaskChecked incomplete{false};
+
+  const auto mixed = replace("7. [x] Done🙂\n8. Plain\n9. [ ] Later\n");
+  const TextSelection backward{DocumentAccess::Get(mixed).index.At(1).start + 2, 1};
+  select(backward);
+  Check(controller->GetCommandState(marker).checked == CheckState::Mixed &&
+            !controller->GetCommandState(complete).enabled && controller->Execute(marker) &&
+            task(0) == true && task(1) == false && task(2) == false,
+        "Adding task markers preserves checked items and marks only ordinary items in the selection");
+  const auto with_markers = controller->Document();
+  Check(controller->GetCommandState(complete).checked == CheckState::Mixed && controller->Execute(incomplete) &&
+            task(0) == false && task(1) == false && !controller->Execute(incomplete),
+        "Setting completion updates all targeted tasks and ignores a no-op");
+  Check(controller->Execute(Undo{}) && controller->Document() == with_markers &&
+            controller->Execute(Redo{}) && task(0) == false && controller->Execute(Undo{}),
+        "A batch completion change is one undoable edit");
+  Check(controller->Execute(marker) && !task(0) && !task(1) && task(2) == false &&
+            controller->OrderedListStart() == 7 && controller->Execute(Undo{}) &&
+            controller->Document() == with_markers,
+        "Removing task markers preserves the ordinary list, numbering and untouched items");
+  ui.Pump();
+  Check(ui.ActiveTextInput()->selection == backward, "Task operations preserve a backward UTF-16 selection");
+
+  const auto nested = replace("7. [x] Parent\n   - [ ] Child\n8. Tail\n");
+  const auto child = DocumentAccess::Get(nested).index.At(1).start;
+  select({child + 2, 1});
+  Check(controller->GetCommandState(marker).checked == CheckState::On &&
+            !controller->GetCommandState(marker).enabled && !controller->GetCommandState(complete).enabled,
+        "Cross-level selections report their task state but disable batch changes");
+  select({6, 6});
+  ui.PressKey(Key::Enter);
+  const auto split = controller->Document();
+  const auto& split_items = split.Blocks()[0].Data().children;
+  Check(split_items.size() == 3 && split_items[0] == nested.Blocks()[0].Data().children[0] &&
+            task(1) == false && !task(2),
+        "Return creates an unchecked sibling after the original task and its nested blocks");
+  Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "zhongwen"}});
+  Check(!controller->GetCommandState(marker).enabled && !controller->Execute(complete) &&
+            controller->Document() == split, "Task edits stay unavailable during preedit");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "中文🙂"}});
+  ui.PressKey(Key::Enter, {.shift = true});
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "续行"}});
+  const auto edited = controller->Document();
+  Check(edited.Blocks()[0].Data().children[1].Data().children[0].Data().text == "中文🙂\n续行" &&
+            task(1) == false && controller->Execute(complete),
+        "Chinese input and soft breaks stay in the new task");
+  Check(controller->Execute(Undo{}) && controller->Document() == edited && controller->Execute(Redo{}),
+        "Undo and redo toggle completion without removing committed text");
+  const auto saved = JsonCodec().Export(controller->Document());
+  Check(saved.text.has_value(), "Save the edited task list as JSON");
+  const auto reopened = JsonCodec().Import(*saved.text);
+  Check(reopened.document == controller->Document(), "Reopen the edited task list from JSON");
+  const auto exported = markdown.Export(*reopened.document);
+  Check(exported.text && exported.issues.empty() && markdown.Import(*exported.text).document == reopened.document,
+        "The edited task list round trips through JSON and Strict Markdown");
+  CheckDocumentIndex(controller->Document());
+
+  const auto at_start = replace("- [x] Done\n- [ ] Next\n");
+  ui.PressKey(Key::Enter);
+  Check(task(0) == false && task(1) == true, "Return at the start inserts an unchecked task above");
+  ui.PressKey(Key::Enter);
+  Check(controller->Document().Blocks()[0].Data().kind == BlockKind::Paragraph &&
+            controller->Execute(Undo{}) && controller->Execute(Undo{}) && controller->Document() == at_start,
+        "Return in an empty task exits the list and is undoable");
+  ui.Pump();
+  select({5, 5});
+  ui.PressKey(Key::Backspace);
+  Check(task(0) == true && controller->Document().Blocks()[0].Data().children.size() == 1,
+        "Joining tasks keeps the state of the surviving item");
+
+  const auto numbered = replace("7. [x] Parent\n8. [ ] Child\n9. Tail\n");
+  select({7, 7});
+  ui.PressKey(Key::Tab);
+  const auto indented = controller->Document();
+  Check(indented.Blocks()[0].Data().children[0].Data().children[1].Data().children[0].Data().task_checked == false,
+        "Indent moves completion state with the item");
+  ui.PressKey(Key::Tab, {.shift = true});
+  Check(controller->Document() == numbered, "Outdent restores task ownership and numbering");
+
+  const auto structural = replace("- [x]\n  - [ ] Only child\n- Tail\n");
+  Check(controller->Execute(OutdentList{}) && task(0) == true && task(1) == false &&
+            controller->Document().Blocks()[0].Data().children[0].Data().children[0].Data().text.empty(),
+        "Moving the only child out leaves the parent as an empty task");
+  CheckDocumentIndex(controller->Document());
+  Check(controller->Execute(Undo{}) && controller->Document() == structural && controller->Execute(Redo{}),
+        "Undo and redo preserve the task-only parent and its child");
+
+  const auto plain = replace("Create🙂\n\n- [x] Existing\n");
+  Check(controller->Execute(marker) && task(0) == false && task(1) == true &&
+            controller->Document().Blocks().size() == 1 &&
+            controller->Execute(Undo{}) && controller->Document() == plain,
+        "Creating a task list joins only the neighboring compatible list");
+}
+
+void TaskCheckboxInteraction() {
+  const Application app(App, {.show_debug_overlay = false});
+  UiTest ui(app, {.viewport = {340.0F, 380.0F}});
+  std::string source = "- [ ] First task\n\n";
+  for (int i = 0; i < 24; ++i) {
+    source += "Filler paragraph\n\n";
+  }
+  source += "7. [x] Last task\n";
+  const auto initial = *MarkdownCodec().Import(source).document;
+  controller->ReplaceDocument(initial);
+  ui.Pump();
+  const auto checkbox = [&](std::string label) {
+    return ui.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::Checkbox), UiSemanticSelector::Label(std::move(label))));
+  };
+  const auto center = [](Rect bounds) { return Point{bounds.x + bounds.width / 2.0F, bounds.y + bounds.height / 2.0F}; };
+  const auto first = checkbox("First task");
+  const auto last = checkbox("Last task");
+  ui.TapAt(center(first.One().bounds));
+  Check(first.One().checked == SemanticCheckedState::Checked && !ui.ActiveTextInput() &&
+            controller->Execute(Undo{}) && controller->Document() == initial,
+        "Touch toggles a checkbox without focusing the editor or opening an input session");
+  ui.Pump();
+  const auto start = center(first.One().bounds);
+  ui.Drag(start, {start.x, start.y - 60.0F});
+  Check(controller->Document() == initial && first.One().bounds.y < start.y - first.One().bounds.height / 2.0F,
+        "A touch drag beginning on the checkbox scrolls without toggling it");
+
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  const TextSelection selection{4, 1};
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
+  const auto input = *ui.ActiveTextInput();
+  ui.SendScroll({.position = {200.0F, 200.0F}, .delta_y = 1300.0F});
+  ui.Pump(std::chrono::milliseconds(220));
+  const auto point = center(last.One().bounds);
+  Check(point.y > 0.0F && point.y < 380.0F, "Scroll brings the distant checkbox into view");
+  ui.TapAt(point, {.device_kind = PointerDeviceKind::Mouse});
+  Check(last.One().checked == SemanticCheckedState::Unchecked && center(last.One().bounds) == point &&
+            ui.ActiveTextInput()->session_id == input.session_id && ui.ActiveTextInput()->selection == selection &&
+            ui.ActiveTextInput()->content_revision == input.content_revision,
+        "Mouse toggles the hit task while preserving scroll, focus and the backward selection");
+  Check(controller->Execute(Undo{}) && controller->Document() == initial && controller->Execute(Redo{}),
+        "Checkbox toggling uses the editor undo and redo history");
+  ui.Pump();
+  Check(ui.ActiveTextInput()->content_revision == input.content_revision,
+        "Undo and redo of a task state edit preserve the text input content revision");
+  ui.SendScroll({.position = {200.0F, 200.0F}, .delta_y = -1300.0F});
+  ui.Pump(std::chrono::milliseconds(220));
+  const auto first_id = first.One().id;
+  const auto tasks = ui.FindSemantics(UiSemanticSelector::Role(SemanticRole::Checkbox));
+  const auto current_first = [&] {
+    const auto nodes = tasks.All();
+    const auto task = std::ranges::find(nodes, first_id, &SemanticNode::id);
+    Check(task != nodes.end(), "The task retains its semantic identity during preedit");
+    return *task;
+  };
+  Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "ni"}});
+  const auto composing = ui.ActiveTextInput()->composition;
+  Check(composing && !current_first().enabled, "Checkbox semantics is disabled during preedit");
+  ui.TapAt(center(current_first().bounds));
+  Check(ui.ActiveTextInput()->composition == composing && current_first().checked == SemanticCheckedState::Unchecked,
+        "Tapping a checkbox during preedit keeps the composition and task state");
+  Accept(ui, {{.kind = TextInputCommandKind::CancelComposition}});
+  first.PerformSemanticAction({SemanticActionKind::Activate, {}});
+  Check(first.One().checked == SemanticCheckedState::Checked && ui.ActiveTextInput()->selection == selection,
+        "Accessible activation uses the same toggle and preserves the selection");
+}
+
+void NarrowTaskCheckboxInteraction() {
+  const Application app([]() -> View {
+    const auto document = MarkdownCodec().Import(
+        "1. [ ] First level\n"
+        "   1. [ ] Second level\n"
+        "      1. [ ] Third level\n"
+        "         1. [ ] MMMM\n");
+    controller = UseRichEditor(*document.document);
+    return RichEditor(*controller, {.style = {.body_font = Font::System(16.0F)}});
+  }, {.show_debug_overlay = false});
+  UiTest ui(app, {.viewport = {254.0F, 480.0F}});
+  const auto initial = controller->Document();
+  const auto box = ui.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Checkbox), UiSemanticSelector::Label("MMMM")));
+  const auto bounds = box.One().bounds;
+  const float line_center = bounds.y + bounds.height / 2.0F;
+  ui.TapAt({210.0F, line_center});
+  const auto input = ui.ActiveTextInput();
+  const auto leaf = huxerui::richeditor::detail::DocumentAccess::Get(initial).index.At(3);
+  Check(input && input->selection.IsCollapsed() && input->selection.active >= leaf.start &&
+            input->selection.active <= leaf.start + 4 && controller->Document() == initial &&
+            box.One().checked == SemanticCheckedState::Unchecked,
+        "Tapping the body of a deeply nested task places its caret without checking the task");
+  ui.TapAt({bounds.x + bounds.width / 2.0F, line_center});
+  Check(box.One().checked == SemanticCheckedState::Checked && ui.ActiveTextInput()->selection == input->selection,
+        "The fitted checkbox still toggles separately from the text");
+}
+
+void TaskCheckboxFromFind() {
+  const Application app([]() -> View {
+    std::string source = "Start\n\n";
+    for (int i = 0; i < 25; ++i) {
+      source += "Filler paragraph\n\n";
+    }
+    source += "- [ ] Distant task\n";
+    controller = UseRichEditor(*MarkdownCodec().Import(source).document);
+    const auto query = UseState(TextEditingValue{});
+    return Column {
+      TextField(query).Label("Find").Key("find"),
+      RichEditor(*controller).With(Grow()),
+    }.With(CrossAlign(CrossAxisAlignment::Stretch));
+  }, {.show_debug_overlay = false});
+  UiTest ui(app, {.viewport = {340.0F, 380.0F}});
+  ui.Find(UiSelector::Key("find")).Tap();
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "task"}});
+  const auto find_session = ui.ActiveTextInput()->session_id;
+  ui.SendScroll({.position = {200.0F, 220.0F}, .delta_y = 1300.0F});
+  ui.Pump(std::chrono::milliseconds(220));
+  const auto box = ui.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Checkbox), UiSemanticSelector::Label("Distant task")));
+  const auto bounds = box.One().bounds;
+  const Point point{bounds.x + bounds.width / 2.0F, bounds.y + bounds.height / 2.0F};
+  Check(point.y > 0.0F && point.y < 380.0F && ui.ActiveTextInput()->session_id == find_session,
+        "The distant checkbox is visible while Find owns focus");
+  ui.SendPointer({.type = PointerEventType::Down, .pointer_id = 7, .position = point,
+                  .device_kind = PointerDeviceKind::Mouse, .changed_button = PointerButton::Primary,
+                  .pressed_buttons = PointerButton::Primary});
+  ui.Pump();
+  Check(box.One().bounds == bounds && box.One().checked == SemanticCheckedState::Unchecked,
+        "Mouse down on the checkbox keeps the viewport in place until release");
+  ui.SendPointer({.type = PointerEventType::Up, .pointer_id = 7, .position = point,
+                  .device_kind = PointerDeviceKind::Mouse, .changed_button = PointerButton::Primary});
+  ui.Pump();
+  const auto input = ui.ActiveTextInput();
+  Check(box.One().bounds == bounds && box.One().checked == SemanticCheckedState::Checked &&
+            input && input->session_id != find_session && input->selection == TextSelection{0, 0},
+        "Mouse up checks the original target and keeps the editor's caret");
+  ui.PressKey(Key::ArrowRight);
+  Check(ui.ActiveTextInput()->selection == TextSelection{1, 1} && box.One().bounds.y > 380.0F,
+        "Moving the caret resumes caret following after a checkbox click");
+}
+
 void ListSelectionScope() {
   const Application app(App, {.show_debug_overlay = false});
   UiTest ui(app);
@@ -2252,6 +2507,14 @@ int main() {
     LinkActivation();
     controller.reset();
     ListEditing();
+    controller.reset();
+    TaskListEditing();
+    controller.reset();
+    TaskCheckboxInteraction();
+    controller.reset();
+    NarrowTaskCheckboxInteraction();
+    controller.reset();
+    TaskCheckboxFromFind();
     controller.reset();
     ListSelectionScope();
     controller.reset();

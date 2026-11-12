@@ -49,6 +49,14 @@ Applications can implement `DocumentCodec` for another UTF-8 format. A custom co
 
 An unmarked continuation inside a list item keeps its nesting, and Enter splits the continuation inside that item. Applying a list to those blocks creates a sublist. Applying or changing a list style can join adjacent groups of the same kind and spacing at the edit site, provided their existing numbers stay the same. Across list levels, the toolbar reports the selected styles and disables structural list commands. Removing a marker is available for a single text block when the parent retains its own marker and the edit keeps existing child groups together.
 
+## Task lists
+
+Task state belongs to the list item. Ordinary items omit `BlockData::task_checked`, and tasks store `false` for incomplete or `true` for complete. Both numbered and bulleted lists can mix ordinary and task items. The checkbox occupies the list marker area, so text offsets refer to the item content.
+
+Execute `ToggleTaskMarker{}` to create tasks from eligible paragraphs or to add or remove checkboxes on selected list items. Execute `SetTaskChecked{true}` or `SetTaskChecked{false}` to set completion on task items in the same list. Tapping a checkbox changes the associated item in one undoable edit. Return creates an unchecked task when it splits a task item, and Shift+Return adds a line break within the item.
+
+JSON v1 stores the optional `task_checked` boolean on `list_item` blocks. Markdown round trips representable tasks with `[ ]` and `[x]` markers, including mixed and nested lists.
+
 ## Tables
 
 A top-level `Table` contains a rectangular grid of `TableRow` and `TableCell` blocks, up to 4096 cells per table. Each cell contains one paragraph with its own text, line breaks, inline marks, and links. The table's `table_has_header` flag gives the first row the header role.
@@ -152,7 +160,7 @@ JSON version 1 stores all editable content and styles. A `table` block stores it
 
 Text is UTF-8 with LF line endings. Mark and link ranges use half-open UTF-16 offsets relative to their text block. The root contains `version` and `blocks`. The editor normalizes an empty root to one empty paragraph and merges adjacent equal mark ranges. Paragraphs and headings can include an optional `inline_objects` array. Each record stores a block-local UTF-16 `offset`, `type`, `version`, `payload`, `fallback_text` and optional `attachments` with `role` and `source`. Cursor positions, IME state, layout, and history live in the editing session.
 
-Markdown import converts the Lib-Markdown syntax tree to editable content. The supported subset uses CommonMark paragraphs, headings, lists, quotes, code, thematic breaks, emphasis and links plus GFM strikethrough and top-level tables with column alignment. A standalone image in a top-level paragraph preserves its reference, alternative text, and title. GFM pads short data rows with empty cells and ignores extra cells beyond the header width. Ordinary source line breaks become spaces and explicit hard breaks remain line breaks. Raw HTML is literal text. Recognized unsupported content includes nested tables, task markers, and common leading YAML front matter with simple or quoted keys between `---` fences.
+Markdown import converts the Lib-Markdown syntax tree to editable content. The supported subset uses CommonMark paragraphs, headings, lists, quotes, code, thematic breaks, emphasis and links plus GFM strikethrough, task items, and top-level tables with column alignment. A standalone image in a top-level paragraph preserves its reference, alternative text, and title. GFM pads short data rows with empty cells and ignores extra cells beyond the header width. Ordinary source line breaks become spaces and explicit hard breaks remain line breaks. Raw HTML is literal text. Recognized unsupported content includes nested tables and common leading YAML front matter with simple or quoted keys between `---` fences.
 
 Markdown export checks semantic round trips with the same parser. Both import and export default to `LossPolicy::Strict`. Use `LossPolicy::AllowLoss` to receive a conversion with reported losses such as omitted underline or highlight, a synthesized header row, or cell line breaks replaced by spaces. Each issue carries a code and a zero-based tree path, with a block-local range when available. Plain clipboard actions use text fallback. Application clipboard bridges can preserve structure with document fragments.
 
@@ -231,6 +239,8 @@ Choose **File actions** → **Load sample**, then enter Chinese text with an IME
 Open the text style menu to switch between paragraph, heading levels 1 through 6, and code block. Select text to insert a link, or place the caret inside an existing link to edit, copy, or remove its address.
 
 Place the caret in the sample's ordered list and open **List numbering** to set a starting number, restart at one, or change the indent. Undo restores the previous numbering, and the new start can be saved in JSON and Markdown.
+
+Toggle a sample task by clicking or tapping its checkbox. Use **Task list** in the desktop toolbar or under **More formatting** → **Lists and quote** on a compact screen to add a checkbox at the caret. Enter creates an unchecked item. Undo and redo restore task changes, and reopening JSON or Markdown restores their completion states.
 
 To exercise tables, select a cell in the sample. The compact toolbar shows **+ Row** and **+ Column**. Open **Table actions** → **Column alignment** to change the selected column. Enter Chinese text in one cell, save, and reopen JSON. A Markdown copy preserves the table and its alignments while it has a header and representable styles. Turn off **Header row** to verify the diagnostic, then export with loss to save a table with a synthesized header. Use **More formatting** → **Insert** → **Insert divider** to add a thematic break.
 

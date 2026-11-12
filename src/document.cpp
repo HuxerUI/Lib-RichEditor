@@ -87,6 +87,7 @@ void ValidateBlock(const BlockData& data, const AttributedText& body) {
       (data.kind == BlockKind::Heading ? data.heading_level < 1 || data.heading_level > 6 : data.heading_level != 0) ||
       (data.kind != BlockKind::List && (data.ordered || data.list_start != 1 || !data.tight)) ||
       (!data.ordered && data.list_start != 1) ||
+      (data.kind != BlockKind::ListItem && data.task_checked.has_value()) ||
       (data.kind != BlockKind::CodeBlock && !data.fence_info.empty()) ||
       (data.kind != BlockKind::Table && (data.table_has_header || !data.table_column_alignments.empty())) ||
       !std::ranges::all_of(data.table_column_alignments, ValidTableColumnAlignment) ||

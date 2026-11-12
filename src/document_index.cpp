@@ -397,6 +397,11 @@ std::optional<std::size_t> DocumentIndex::IndexOf(BlockId id) const {
   return found.entry && !found.entry->children ? std::optional(found.first_leaf) : std::nullopt;
 }
 
+std::optional<std::size_t> DocumentIndex::FirstLeafOf(BlockId id) const {
+  const auto found = Locate(*root_, *locations_, id);
+  return found.entry ? std::optional(found.first_leaf) : std::nullopt;
+}
+
 const Block* DocumentIndex::FindLeaf(BlockId id) const {
   const auto found = Locate(*root_, *locations_, id);
   return found.entry && !found.entry->children ? &found.entry->block : nullptr;

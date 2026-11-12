@@ -50,9 +50,9 @@ $$
 ## Outline the draft
 
 3. Capture an idea
-   - Save a useful detail
-   - Add a note to revisit
-4. Refine the draft
+   - [x] Save a useful detail
+   - [ ] Add a note to revisit
+4. [ ] Refine the draft
 
 ~~~cpp
 struct Note {
@@ -767,6 +767,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     items.emplace_back(MenuItem(l10n::lists_and_quote, {
         command_item(l10n::bulleted_list, ToggleList{ListKind::Unordered}),
         command_item(l10n::numbered_list, ordered_list),
+        command_item(l10n::task_list, ToggleTaskMarker{}),
         command_item(l10n::block_quote, ToggleQuote{}),
         command_item(l10n::increase_list_indent, IndentList{}),
         command_item(l10n::decrease_list_indent, OutdentList{}),
@@ -924,6 +925,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       separator,
       tool(bulleted_list, l10n::bulleted_list, ToggleList{ListKind::Unordered}),
       list_tool,
+      tool(task_list, l10n::task_list, ToggleTaskMarker{}),
       tool(quote, l10n::block_quote, ToggleQuote{}),
       tool(indent, l10n::increase_list_indent, IndentList{}),
       tool(outdent, l10n::decrease_list_indent, OutdentList{}),

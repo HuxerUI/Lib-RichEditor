@@ -130,6 +130,29 @@ void PaletteFlow(const char* package_path) {
             ui.ActiveTextInput()->selection == backward && by_id("article-editor").One().value == "Alpha\nBeta\nGamma",
         "One undo removes Bold while preserving the text and selection");
 
+  const auto task_list = by_id("palette-editor.task-list");
+  const auto complete_task = by_id("palette-editor.task.complete");
+  open();
+  query.EnterText("task list");
+  Check(task_list.One().enabled && task_list.One().selected == true, "The palette finds the task list command");
+  ui.PressKey(Key::Enter);
+  wait_for_close();
+  const auto first_task = ui.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Checkbox), UiSemanticSelector::Label("Alpha")));
+  Check(first_task.One().checked == SemanticCheckedState::Unchecked && ui.ActiveTextInput()->selection == backward,
+        "The task list command creates unchecked items and returns focus to the original selection");
+  open();
+  query.EnterText("mark task complete");
+  Check(complete_task.One().enabled && complete_task.One().selected == true, "Completion is available within tasks");
+  ui.PressKey(Key::Enter);
+  wait_for_close();
+  Check(first_task.One().checked == SemanticCheckedState::Checked && ui.ActiveTextInput()->selection == backward,
+        "The palette can complete selected tasks");
+  ui.PressKey(Key::Z, primary);
+  Check(first_task.One().checked == SemanticCheckedState::Unchecked, "Undo reverses task completion");
+  ui.PressKey(Key::Z, primary);
+  Check(!first_task.Exists(), "Undo restores the original plain paragraphs");
+
   const auto delete_row = by_id("palette-editor.table.delete-row");
   open();
   query.EnterText("delete row");

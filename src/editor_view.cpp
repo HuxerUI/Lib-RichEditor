@@ -215,6 +215,10 @@ public:
     return layout_.LinkAt(editor_->VisibleDocument(), ContentPoint(point));
   }
 
+  std::optional<BlockId> TaskAt(Point point) const {
+    return HasGeometry() ? layout_.TaskAt(ContentPoint(point)) : std::nullopt;
+  }
+
   bool HitsAtomicBlock(Point point) const {
     const auto index = LeafIndex(editor_->VisibleDocument(), Hit(point).offset);
     const auto* bounds = layout_.Rows()[index].AtomicBounds();
@@ -307,7 +311,7 @@ public:
   }
 
   bool SelectWord(Point point) override {
-    if (!HasGeometry()) {
+    if (!HasGeometry() || layout_.TaskAt(ContentPoint(point))) {
       return false;
     }
     const auto hit = Hit(point);
@@ -724,7 +728,7 @@ public:
     const bool decorations_changed = UpdateDecorations();
     const TextPosition caret{selection.active, selection.affinity};
     const bool follow_focused_caret = client_->CanRevealCaret(selection) && node.IsFocused();
-    const bool revealed = (edited || laid_out) && follow_focused_caret &&
+    const bool revealed = !task_press_ && (edited || laid_out) && follow_focused_caret &&
         layout.RevealCaret(editor_->VisibleDocument(), caret);
     const bool scrolled = UpdateScroll(follow_focused_caret, caret, edited, laid_out);
     const bool hover_changed = UpdateHoveredLink();
@@ -791,6 +795,14 @@ private:
     std::uint64_t content_revision;
   };
 
+  struct TaskPress {
+    std::int64_t pointer_id;
+    Point start;
+    BlockId item;
+    std::uint64_t revision;
+    bool moved = false;
+  };
+
   struct ImageResize {
     std::int64_t pointer_id;
     std::uint64_t revision;
@@ -808,9 +820,11 @@ private:
   std::optional<std::size_t> CodeHeaderAt(Point point) const;
   bool OpenCodeLanguage(std::size_t index);
   bool ActivateInline(TextOffset offset);
+  bool ActivateTask(BlockId item);
   void SetLinkHover(std::optional<Point> pointer, bool modifier);
   bool UpdateHoveredLink();
   PointerResult UpdateLinkPress(ViewNode& node, const PointerEvent& event);
+  PointerResult UpdateTaskPress(ViewNode& node, const PointerEvent& event);
   PointerResult UpdateImageResize(const PointerEvent& event);
   ViewNode& node_;
   std::shared_ptr<EditorClient> client_;
@@ -834,6 +848,7 @@ private:
   float table_drag_x_ = 0.0F;
   std::optional<std::int64_t> drag_id_;
   std::optional<LinkPress> link_press_;
+  std::optional<TaskPress> task_press_;
   std::optional<Point> hover_pointer_;
   std::optional<EditorLayout::LinkLocation> hovered_link_;
   bool hover_modifier_ = false;
@@ -896,6 +911,7 @@ void EditorExtension::ResetClient() {
   touch_table_.reset();
   drag_id_.reset();
   link_press_.reset();
+  task_press_.reset();
   hover_pointer_.reset();
   hovered_link_.reset();
   hover_modifier_ = false;
@@ -962,7 +978,10 @@ bool EditorExtension::UpdateScroll(bool focused, TextPosition position, bool edi
   auto metrics = viewport_->scroll.Metrics();
   const bool focus_gained = focused && !focused_;
   focused_ = focused;
-  if (edited || focus_gained) {
+  if (task_press_) {
+    // A mouse press can focus the editor before the checkbox activates on release.
+    follow_caret_ = false;
+  } else if (edited || focus_gained) {
     follow_caret_ = true;
   } else if (metrics.offset != std::min(observed_scroll_.offset, metrics.maximum_offset)) {
     // A deliberate scroll takes over from the caret. A layout clamp alone keeps the current mode.
@@ -975,7 +994,7 @@ bool EditorExtension::UpdateScroll(bool focused, TextPosition position, bool edi
     aligned_reveal_.reset();
   }
   // The software keyboard can resize the viewport after the search action has already run.
-  if (aligned_reveal_ && (laid_out || extent_changed) && metrics.viewport_extent > 0.0F) {
+  if (!task_press_ && aligned_reveal_ && (laid_out || extent_changed) && metrics.viewport_extent > 0.0F) {
     const float offset = OffsetToAlign(metrics, client_->Layout(), editor_->VisibleDocument(), aligned_reveal_->range,
                                        aligned_reveal_->alignment);
     if (offset != metrics.offset && viewport_->scroll.ScrollTo(offset)) {
@@ -1134,6 +1153,16 @@ bool EditorExtension::ActivateInline(TextOffset offset) {
   return true;
 }
 
+bool EditorExtension::ActivateTask(BlockId item) {
+  if (!node_.IsEnabled() || !editor_->ToggleTaskChecked(item)) {
+    return false;
+  }
+  if (node_.IsFocused()) {
+    client_->SetBlockControlActive(true);
+  }
+  return true;
+}
+
 void EditorExtension::SetLinkHover(std::optional<Point> pointer, bool modifier) {
   if (hover_pointer_ != pointer || hover_modifier_ != modifier) {
     hover_pointer_ = pointer;
@@ -1187,6 +1216,26 @@ NodeExtension::PointerResult EditorExtension::UpdateLinkPress(ViewNode& node, co
   return PointerResult::Handled;
 }
 
+NodeExtension::PointerResult EditorExtension::UpdateTaskPress(ViewNode& node, const PointerEvent& event) {
+  if (event.type == PointerEventType::Cancel) {
+    task_press_.reset();
+    return PointerResult::Ignored;
+  }
+  auto& press = *task_press_;
+  const auto delta = event.position - press.start;
+  press.moved |= std::hypot(delta.x, delta.y) >= GestureSettings{}.pointer_slop;
+  if (event.type != PointerEventType::Up) {
+    return PointerResult::Observe;
+  }
+  const auto finished = *std::exchange(task_press_, std::nullopt);
+  if (!finished.moved && finished.revision == editor_->Revision() && HitTest(node, event.position) &&
+      client_->TaskAt(event.position) == finished.item) {
+    ActivateTask(finished.item);
+  }
+  // A checkbox tap supersedes text selection and the pending touch focus request.
+  return PointerResult::CancelTarget;
+}
+
 NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const PointerEvent& event) {
   if (resize_) {
     return UpdateImageResize(event);
@@ -1194,10 +1243,19 @@ NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const Po
   if (link_press_ && link_press_->down.pointer_id == event.pointer_id) {
     return UpdateLinkPress(node, event);
   }
+  if (task_press_ && task_press_->pointer_id == event.pointer_id) {
+    return UpdateTaskPress(node, event);
+  }
   const bool primary_down = event.type == PointerEventType::Down &&
       (event.changed_button == PointerButton::Primary || event.changed_button == PointerButton::None);
   if (primary_down) {
     SetLinkHover(std::nullopt, false);
+    if (!task_press_ && !event.modifiers.shift) {
+      if (const auto item = client_->TaskAt(event.position)) {
+        task_press_ = TaskPress{event.pointer_id, event.position, *item, editor_->Revision()};
+        return PointerResult::Observe;
+      }
+    }
   }
   if (primary_down && client_->HasGeometry()) {
     // Keep the keyboard closed before touch selection is resolved on release.
@@ -1491,9 +1549,28 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
       paint.DrawLine(tip, {tip.x + 3.0F, tip.y - 3.0F}, header.style.foreground, StrokeStyle{.width = 1.25F});
     }
     for (const auto& marker : row.markers) {
-      paint.DrawText({marker.left, row.origin.y, marker.width, row.layout.Metrics().size.height},
-                     marker.text, layout.MarkerStyle(),
-                     {.align = TextAlign::Trailing, .wrap = TextWrap::NoWrap});
+      if (!marker.text.empty()) {
+        paint.DrawText(marker.bounds, marker.text, layout.MarkerStyle(),
+                       {.align = marker.alignment, .vertical_align = TextVerticalAlign::Center, .wrap = TextWrap::NoWrap});
+      }
+      if (marker.task) {
+        const auto& bounds = marker.task->bounds;
+        const float side = std::min(bounds.width * 0.62F, bounds.height * 0.72F);
+        const Rect box{bounds.x + (bounds.width - side) / 2.0F, bounds.y + (bounds.height - side) / 2.0F,
+                       side, side};
+        const CornerRadii corners{side * 0.22F};
+        if (marker.task->checked) {
+          paint.DrawRect(box, accent, corners);
+          const Point start{box.x + side * 0.23F, box.y + side * 0.51F};
+          const Point middle{box.x + side * 0.42F, box.y + side * 0.69F};
+          const Point end{box.x + side * 0.77F, box.y + side * 0.33F};
+          const StrokeStyle stroke{.width = side * 0.115F, .cap = StrokeCap::Round};
+          paint.DrawLine(start, middle, colors.on_primary, stroke);
+          paint.DrawLine(middle, end, colors.on_primary, stroke);
+        } else {
+          paint.DrawBorder(box, layout.MarkerStyle().foreground, {.width = side * 0.085F}, corners);
+        }
+      }
     }
     if (const auto& rule = row.thematic_break) {
       paint.DrawRect({rule->x, rule->y + rule->height / 2.0F - 1.0F, rule->width, 2.0F},
@@ -1576,8 +1653,21 @@ void EditorExtension::BuildSemantics(SemanticBuilder& builder) const {
   if (client_->HasGeometry()) {
     const auto& leaves = DocumentAccess::Get(document).index;
     const auto& rows = client_->Layout().Rows();
+    const bool task_enabled = !editor_->CompositionRange();
     for (std::size_t i = 0; i < leaves.LeafCount(); ++i) {
       const auto& row = rows[i];
+      for (const auto& marker : row.markers) {
+        if (marker.task) {
+          const auto& task = *marker.task;
+          builder.AddChild(task.item, client_->ToNode(task.bounds),
+                           {.role = SemanticRole::Checkbox, .label = task.label.empty() ? "Task item" : task.label,
+                            .checked = task.checked ? SemanticCheckedState::Checked : SemanticCheckedState::Unchecked},
+                           task_enabled);
+          if (task_enabled) {
+            builder.AddAction(task.item, SemanticActionKind::Activate);
+          }
+        }
+      }
       for (const auto& object : row.inline_objects) {
         auto bounds = AtOrigin(object.bounds, client_->Layout().Origin(row));
         if (row.cell) {
@@ -1625,6 +1715,7 @@ bool EditorExtension::OnSemanticAction(std::uint64_t local_id, const SemanticAct
       if (const auto found = index.IndexOf(local_id)) {
         return OpenCodeLanguage(*found);
       }
+      return ActivateTask(local_id);
     }
     return false;
   }

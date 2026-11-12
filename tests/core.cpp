@@ -122,10 +122,90 @@ void ValidateLoss() {
   Check(image.document && image.issues.size() == 1 && image.issues[0].code == "markdown.image" &&
             image.document->Blocks()[0].Data().text == "See alt",
         "Explicit image fallback");
-  Check(!markdown.Import("- [x] Done\n").document, "Strict Markdown detects unsupported task lists");
   const auto empty = RichDocument::Create({Block(BlockData{.text = "A"}), Block(BlockData{}), Block(BlockData{.text = "B"})});
   Check(!markdown.Export(empty).text && markdown.Export(empty, LossPolicy::AllowLoss).text.has_value(),
         "Empty paragraph loss is reported");
+}
+
+void TaskListCodecs() {
+  const MarkdownCodec markdown;
+  const auto& json = JsonCodec();
+  const auto imported = markdown.Import(R"md(7. [X] **中文🙂**
+   - [ ] Child
+   - \[x\] Literal
+8. Ordinary
+9. [ ]
+10. [x]
+    - [ ] Only child
+)md");
+  Check(imported.document && imported.issues.empty(), "Strict imports mixed, ordered and nested task items");
+  const auto& list = imported.document->Blocks().front().Data();
+  const auto& items = list.children;
+  const auto& first = items[0].Data();
+  const auto& nested = first.children[1].Data().children;
+  Check(list.ordered && list.list_start == 7 && items.size() == 4 && first.task_checked == true &&
+            first.children[0].Data().text == "中文🙂" &&
+            first.children[0].Data().marks == std::vector<MarkRange>{{{0, 4}, Mark::Bold}} &&
+            nested[0].Data().task_checked == false && !nested[1].Data().task_checked &&
+            nested[1].Data().children[0].Data().text == "[x] Literal" && !items[1].Data().task_checked &&
+            items[2].Data().task_checked == false && items[2].Data().children[0].Data().text.empty() &&
+            items[3].Data().task_checked == true && items[3].Data().children[0].Data().kind == BlockKind::List,
+        "Task markers are independent of numbering, children, text and UTF-16 marks");
+  const auto saved = json.Export(*imported.document);
+  Check(saved.text && saved.text->find("\"version\": 1") != std::string::npos &&
+            saved.text->find("\"task_checked\": false") != std::string::npos &&
+            saved.text->find("\"task_checked\": true") != std::string::npos &&
+            json.Import(*saved.text).document == imported.document,
+        "JSON v1 round trips all task states");
+  const auto exported = markdown.Export(*imported.document);
+  Check(exported.text && exported.issues.empty() && exported.text->find("7. [x] ") != std::string::npos &&
+            markdown.Import(*exported.text).document == imported.document,
+        "Strict exports canonical task markers and preserves mixed list structure");
+
+  for (const auto source : {
+           "- [ ] First\n\n  Continuation\n\n- [x] Second\n",
+           "> - [x] Quoted task\n",
+           "- [x]\n  # Heading\n",
+           "- [ ]\n  > Quote\n",
+           "- [x]\n  ```txt\n  Code\n  ```\n",
+           "- [ ]\n  ***\n",
+           "- [ ]\n\n  - Child\n",
+       }) {
+    const auto decoded = markdown.Import(source);
+    Check(decoded.document.has_value(), "Import task with continuation or structural child blocks");
+    const auto encoded = markdown.Export(*decoded.document);
+    if (!encoded.text || markdown.Import(*encoded.text).document != decoded.document) {
+      throw std::runtime_error(std::string("Task list round trip: ") + source);
+    }
+  }
+
+  const auto styled = RichDocument::Create({Block(BlockData{.kind = BlockKind::List, .children = {
+      Block(BlockData{.kind = BlockKind::ListItem, .children = {
+          Block(BlockData{.text = "Done", .marks = {{{0, 4}, Mark::Underline}}})}, .task_checked = true})}})});
+  const auto strict = markdown.Export(styled);
+  const auto lossy = markdown.Export(styled, LossPolicy::AllowLoss);
+  Check(!strict.text && strict.issues.size() == 1 && strict.issues.front().code == "markdown.underline" &&
+            strict.issues.front().block_path == std::vector<std::size_t>{0, 0, 0} &&
+            lossy.text && lossy.issues.size() == 1 &&
+            markdown.Import(*lossy.text).document == markdown.Import("- [x] Done").document,
+        "AllowLoss drops the unsupported mark and retains the task");
+
+  const auto legacy = json.Import(R"({"version":1,"blocks":[{"type":"list","ordered":false,"start":1,"tight":true,
+      "children":[{"type":"list_item","children":[{"type":"paragraph","text":"Ordinary"}]}]}]})");
+  Check(legacy.document && !legacy.document->Blocks()[0].Data().children[0].Data().task_checked &&
+            json.Export(*legacy.document).text->find("task_checked") == std::string::npos,
+        "Ordinary JSON v1 items omit task metadata");
+  Check(!json.Import(R"({"version":1,"blocks":[{"type":"paragraph","text":"Wrong","task_checked":false}]})").document &&
+            !json.Import(R"({"version":1,"blocks":[{"type":"list","ordered":false,"start":1,"tight":true,
+      "children":[{"type":"list_item","task_checked":null,"children":[{"type":"paragraph","text":"Wrong"}]}]}]})").document,
+        "JSON accepts task_checked only as a boolean on a list item");
+  bool rejected = false;
+  try {
+    RichDocument::Create({Block(BlockData{.task_checked = false})});
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  Check(rejected, "Document validation rejects a task marker on a non-list-item block");
 }
 
 void ImageCodecs() {
@@ -521,6 +601,7 @@ int main() {
     ValidateLoss();
     ValidateJsonAndBoundaries();
     DefaultHighlighting();
+    TaskListCodecs();
     TableCodecs();
     ThematicBreakCodecs();
     ImageCodecs();

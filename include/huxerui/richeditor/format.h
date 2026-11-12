@@ -85,8 +85,8 @@ public:
 
 /// @brief Returns the shared Lib-RichEditor JSON codec.
 ///
-/// Version 1 preserves all supported blocks, inline styles, links, object payloads and attachment references
-/// under either loss policy. Applications store attachment bytes separately.
+/// Version 1 preserves all supported blocks, task completion states, inline styles, links, object payloads,
+/// and attachment references under either loss policy. Applications store attachment bytes separately.
 /// Import reports "json.version" for an unsupported version and "json.invalid" for malformed input or invalid
 /// document content.
 /// @return A reference to the built-in codec with process lifetime.
@@ -162,13 +162,13 @@ struct MarkdownOptions {
   std::vector<MarkdownExtension> extensions;
 };
 
-/// @brief CommonMark codec with GFM strikethrough, top-level tables, and optional object mappings.
+/// @brief CommonMark codec with GFM strikethrough, task items, top-level tables, and optional object mappings.
 ///
 /// Import maps paragraphs, headings, lists, quotes, code, thematic breaks, emphasis, and links to editable content.
 /// Soft breaks become spaces in paragraphs and hard breaks become LF. Raw HTML is stored as literal text.
-/// Tables retain their column alignments and follow the parsed GFM grid, which pads missing cells and ignores cells
-/// beyond the header width. Nested tables and tasks report diagnostics. Recognized leading YAML front matter
-/// reports "markdown.front_matter". AllowLoss discards the metadata.
+/// Task markers set the owning list item's completion state. Tables retain their column alignments and follow
+/// the parsed GFM grid, which pads missing cells and ignores cells beyond the header width. Nested tables report
+/// diagnostics. Recognized leading YAML front matter reports "markdown.front_matter". AllowLoss discards the metadata.
 ///
 /// An image occupying its own top-level paragraph becomes an Image block with its reference, alternative text,
 /// and title. Other image placements require inline_images. Codecs preserve image references while the application
