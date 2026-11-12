@@ -1,6 +1,7 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/testing/ui_test.h>
 
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 
@@ -114,6 +115,12 @@ void PaletteFlow(const char* package_path) {
   const auto bold = by_id("palette-editor.bold");
   const auto toolbar_bold = ui.FindSemantics(UiSemanticSelector::Label("Bold"));
   open();
+  const auto search_bounds = by_id("palette-query").One().bounds;
+  const auto close_bounds = by_id("palette-close").One().bounds;
+  Check(std::abs(search_bounds.height - close_bounds.height) < 0.5F &&
+            std::abs(close_bounds.width - close_bounds.height) < 0.5F &&
+            std::abs(search_bounds.y - close_bounds.y) < 0.5F,
+        "The palette search field aligns with the square dismiss button");
   query.EnterText("bld");
   Check(bold.One().enabled && bold.One().selected == true, "Fuzzy search selects Bold");
   ui.PressKey(Key::ArrowDown);
@@ -181,7 +188,7 @@ void PaletteFlow(const char* package_path) {
   Check(palette.Exists(), "Enter during composition does not run a command");
   Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "加粗"}});
   Check(bold.Exists(), "A committed Chinese alias matches Bold");
-  ui.PressKey(Key::Escape);
+  tap_semantic(by_id("palette-close"));
   wait_for_close();
   Check(find.One().focused && find.One().value == "你好" && ui.ActiveTextInput()->selection == TextSelection{2, 1},
         "Cancel restores the focused Find field and its selection");
@@ -320,7 +327,16 @@ void OutlineFlow(const char* package_path) {
   const auto scroll = article.Find(UiSemanticSelector::Role(SemanticRole::ScrollView));
   const auto first = by_id("outline-heading-0");
   const auto child = by_id("outline-heading-1");
+  const auto nested = by_id("outline-heading-2");
   const auto last = by_id("outline-heading-35");
+  const auto end_first = by_id("outline-heading-68");
+  const auto end_second = by_id("outline-heading-69");
+  const auto scroll_by = [&](float delta) {
+    const auto bounds = scroll.One().bounds;
+    ui.SendScroll({.position = {bounds.x + bounds.width / 2, bounds.y + bounds.height / 2}, .delta_y = delta});
+    ui.Pump();
+    ui.Pump();
+  };
 
   ui.PressKey(Key::N, primary);
   tap(by_label("Outline"));
@@ -335,6 +351,8 @@ void OutlineFlow(const char* package_path) {
   for (int i = 0; i < 32; ++i) {
     source += "Another body paragraph\n";
   }
+  const auto end_start = static_cast<TextOffset>(source.size());
+  source += "Tail\nTail";
   editor.Tap();
   editor.EnterText(source);
   const auto set_kind = [&](TextOffset offset, Key key) {
@@ -345,13 +363,17 @@ void OutlineFlow(const char* package_path) {
   set_kind(7, Key::Digit3);
   set_kind(13, Key::Digit6);
   set_kind(last_start, Key::Digit1);
+  set_kind(end_start, Key::Digit2);
+  set_kind(end_start + 5, Key::Digit2);
   Check(first.One().label == "Repeat" && last.One().label == "Repeat" &&
-            child.One().heading_level == 3 && by_id("outline-heading-2").One().heading_level == 6,
+            child.One().heading_level == 3 && nested.One().heading_level == 6,
         "The outline keeps duplicate titles and levels that skip intermediate headings");
 
   editor.SetSelection({6, 6});
+  ui.PumpUntil([&] { return first.One().selected == true; });
   Send(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "nihao"}});
-  Check(first.One().label == "Repeat", "The outline uses committed headings during IME preedit");
+  Check(first.One().label == "Repeat" && first.One().selected == true,
+        "The outline keeps its committed title and highlight during IME preedit");
   Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "你好"}});
   Check(first.One().label == "Repeat你好", "An IME commit updates the heading title");
   ui.PressKey(Key::Z, primary);
@@ -372,6 +394,24 @@ void OutlineFlow(const char* package_path) {
         "The first duplicate independently jumps to the top");
   Check(article.One().text_selection == backward.Range(), "Outline jumps leave the document selection intact");
 
+  scroll_by(240);
+  Check(nested.One().selected == true && first.One().selected == false,
+        "Scrolling into the body follows the nearest preceding heading");
+  tap(end_first);
+  const auto bottom = *scroll.One().scroll;
+  Check(bottom.offset == bottom.maximum_offset && end_first.One().selected == true,
+        "The first tail heading stays highlighted when the jump clamps to the bottom");
+  tap(end_second);
+  ui.Pump(400ms);
+  Check(scroll.One().scroll->offset == bottom.offset && end_second.One().selected == true &&
+            end_first.One().selected == false,
+        "A second jump at the same offset changes the exact highlighted heading");
+  scroll_by(-100);
+  Check(last.One().selected == true && end_second.One().selected == false,
+        "Reverse scrolling releases the jump target and resumes following the reading line");
+  scroll_by(100);
+  Check(end_second.One().selected == true, "Natural scrolling to the bottom highlights the final heading");
+
   ui.SetWindowMetrics({.viewport = {360, 640}});
   ui.Pump();
   editor.Tap();
@@ -388,7 +428,7 @@ void OutlineFlow(const char* package_path) {
   const auto input = ui.ActiveTextInput();
   Check(input && input->selection == backward, "The drawer round trip preserves the selection direction");
 
-  const TextSelection caret{3, 3};
+  const TextSelection caret{last_start + 10, last_start + 10};
   Send(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = caret}});
   tap(by_id("show-sidebar"));
   ui.Pump(400ms);
@@ -401,12 +441,25 @@ void OutlineFlow(const char* package_path) {
 
   ui.SetWindowMetrics({.viewport = {880, 640}});
   ui.Pump();
+  editor.Tap();
+  editor.SetSelection({last_start + 7, end_start - 1});
+  ui.PressKey(Key::Digit2, primary);
+  scroll_by(10000);
+  ui.PumpUntil([&] { return end_second.Exists() && !end_second.One().offscreen; });
+  Check(end_second.One().selected == true, "The sidebar scrolls to show an active heading outside its viewport");
   ui.PressKey(Key::N, primary);
   Check(!first.Exists() && by_label("No headings yet").Exists(), "The outline follows the active document tab");
+  const auto active_editor = ui.Find(UiSelector::AllOf(UiSelector::Key("editor"), UiSelector::Enabled(true)));
+  active_editor.Tap();
+  active_editor.EnterText("An introduction\nFirst chapter");
+  ui.PressKey(Key::Digit1, primary);
+  Check(child.One().label == "First chapter" && child.One().selected == false,
+        "The outline leaves the introduction unselected in a document that fits the viewport");
   tap(by_id("document-switcher"));
   tap(by_label("Untitled, unsaved changes"));
-  ui.PumpUntil([&] { return first.Exists(); });
-  Check(last.One().selected == true && last.One().label == "Repeat", "Switching back restores the tab's own outline");
+  ui.PumpUntil([&] { return end_second.Exists() && !end_second.One().offscreen; });
+  Check(end_second.One().selected == true && end_second.One().label == "Tail",
+        "Switching back follows the restored document position");
 }
 
 } // namespace

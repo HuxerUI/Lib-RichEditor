@@ -260,13 +260,17 @@ View CommandPalette(DialogContext context, CommandPaletteOptions options) {
     }
     return true;
   };
+  const float header_height = IsMobilePlatform() ? 44.0F : 40.0F;
   auto field_style = UseEnvironment<TextFieldStyle>();
   field_style.show_label = false;
+  field_style.padding = EdgeInsets::Symmetric(12.0F, 8.0F);
+  field_style.leading_icon_size = 16.0F;
   field_style.outlined = {
       .background = colors.surface_container_low, .border = colors.outline, .hovered_border = colors.outline,
-      .focused_border = colors.primary, .corner_radii = CornerRadii{theme.shapes.medium}, .minimum_height = 44.0F,
+      .focused_border = colors.primary, .corner_radii = CornerRadii{theme.shapes.medium}, .minimum_height = header_height,
   };
-  View field = TextField(search).Label(l10n::search_commands).Placeholder(l10n::search_commands)
+  const auto field = TextField(search).Label(l10n::search_commands).Placeholder(l10n::search_commands)
+      .LeadingIcon(app::images::search)
       .Variant(TextFieldVariant::Outlined)
       .InputConfiguration({.action = TextInputAction::Search, .autocorrect = false})
       .OnChanged([search, selected, scroll](const TextEditingValue& value) {
@@ -277,15 +281,20 @@ View CommandPalette(DialogContext context, CommandPaletteOptions options) {
         search = value;
       })
       .On<ViewEvents::KeyIntercept>(on_key)
-      .With(options.initial_focus, Grow(), Semantics{.role = SemanticRole::SearchField, .identifier = "palette-query"})
+      .With(options.initial_focus, Grow(), Frame{.height = header_height},
+            Semantics{.role = SemanticRole::SearchField, .identifier = "palette-query"})
       .Key("palette-query");
-  View close = Button(l10n::close).OnClick([context] { context.Dismiss(); })
-      .With(Frame{.min_height = 44.0F}, Background(Color::Transparent()),
-            Semantics{.label = l10n::close_palette, .identifier = "palette-close"});
+  auto close_style = UseEnvironment<IconButtonStyle>();
+  close_style.minimum_interactive_size = header_height;
+  close_style.state_layer_size = header_height;
+  close_style.corner_radius = theme.shapes.medium;
+  const auto close = IconButton(app::images::close, l10n::close_palette).OnClick([context] { context.Dismiss(); })
+      .With(Frame{.width = header_height, .height = header_height}, Background(colors.surface_container_high),
+            CornerRadius(theme.shapes.medium), Tooltip(l10n::close_palette), Semantics{.identifier = "palette-close"});
   const auto header = Row {
     ProvideEnvironment(field_style, field),
-    close,
-  }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center));
+    ProvideEnvironment(close_style, close),
+  }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
   const auto& overrides = UseService<SettingsStore>()->Get().shortcuts;
   Views rows;
   for (std::size_t i = 0; i < results.size(); ++i) {

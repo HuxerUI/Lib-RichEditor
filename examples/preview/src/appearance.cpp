@@ -176,7 +176,7 @@ ThemeDefinition FolioTheme(const ThemePreset& preset) {
       .disabled_label = WithOpacity(colors.on_surface, 0.42F),
       .padding = EdgeInsets::Symmetric(12.0F, 6.0F),
       .minimum_height = 34.0F,
-      .corner_radii = CornerRadii{17.0F},
+      .corner_radii = CornerRadii{shape.medium},
       .indication = theme.interactions.indication,
   });
   definition.Set(IconButtonStyle{
@@ -245,6 +245,10 @@ View PrimaryAction(View button, const ThemeSpec& theme) {
   return std::move(button).With(Background(theme.colors.primary), Foreground(theme.colors.on_primary));
 }
 
+Frame DialogActionFrame() {
+  return {.min_width = 76.0F, .min_height = IsMobilePlatform() ? 44.0F : 36.0F};
+}
+
 View DialogPanel(View content, const ThemeSpec& theme, float width) {
   return std::move(content).With(
       Frame{.width = width}, Padding(20.0F), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch),
@@ -258,9 +262,9 @@ View ScrollableDialogPanel(View header, View body, View actions, const ThemeSpec
 
 View DialogActions(const ThemeSpec& theme, View cancel, View primary, View secondary, bool destructive) {
   const auto& colors = theme.colors;
-  const Frame action_size{.min_height = 44.0F};
+  const auto action_size = DialogActionFrame();
   if (cancel) {
-    cancel = std::move(cancel).With(action_size, Background(Color::Transparent()), Foreground(colors.on_surface));
+    cancel = std::move(cancel).With(action_size);
   }
   if (primary) {
     primary = PrimaryAction(std::move(primary).With(action_size), theme);
@@ -271,10 +275,8 @@ View DialogActions(const ThemeSpec& theme, View cancel, View primary, View secon
   }
   return Flow {
     secondary,
-    Stack {
-      Row {cancel, primary}.With(Spacing(6.0F)),
-    }.With(Grow(), Align(HorizontalAlignment::End, VerticalAlignment::Center)),
-  }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center));
+    Row {cancel, primary}.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
+  }.With(Spacing(10.0F), MainAlign(MainAxisAlignment::End), CrossAlign(CrossAxisAlignment::Center));
 }
 
 } // namespace folio

@@ -400,6 +400,12 @@ void DialogActionLayout() {
         "A short confirmation wraps its message and actions instead of filling the window");
   Check(secondary.One().bounds.y == primary.One().bounds.y && secondary.One().bounds.x < cancel.One().bounds.x,
         "The secondary action stays to the left when the footer fits on one line");
+  const auto discard_bounds = secondary.One().bounds;
+  const auto cancel_bounds = cancel.One().bounds;
+  const auto save_bounds = primary.One().bounds;
+  Check(cancel_bounds.width >= 76.0F && save_bounds.width >= 76.0F && cancel_bounds.height == save_bounds.height &&
+            cancel_bounds.x - discard_bounds.x - discard_bounds.width <= 12.0F,
+        "The footer groups the actions and gives short buttons a consistent footprint");
   ui.SetWindowMetrics({.viewport = {260.0F, 320.0F}});
   ui.Pump();
   Check(secondary.One().bounds.y < cancel.One().bounds.y && cancel.One().bounds.y == primary.One().bounds.y,

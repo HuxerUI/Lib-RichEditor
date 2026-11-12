@@ -26,6 +26,8 @@ const ThemePreset& ResolveTheme(std::string_view id, huxerui::ThemeBrightness sy
 huxerui::ThemeDefinition FolioTheme(const ThemePreset& preset);
 huxerui::Color PendingEditsColor(huxerui::ThemeBrightness brightness);
 huxerui::View PrimaryAction(huxerui::View button, const huxerui::ThemeSpec& theme);
+/// Keeps short dialog actions proportionate while preserving the touch target on mobile.
+huxerui::Frame DialogActionFrame();
 huxerui::View DialogPanel(huxerui::View content, const huxerui::ThemeSpec& theme, float width);
 
 /// Fits the header and actions before sizing the scrollable body to the remaining height.

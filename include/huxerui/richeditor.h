@@ -375,6 +375,17 @@ struct CommandState {
   std::optional<CheckState> checked{};
 };
 
+/// @brief Position in the committed document as seen by the mounted editor.
+/// Indices are zero-based in Document().Blocks() and belong to the snapshot current at the query.
+struct EditorViewportLocation {
+  /// Top-level block at the queried height. Space between blocks belongs to the preceding block.
+  std::size_t root_block_index;
+  /// Top-level block containing the start of the active explicitly aligned reveal, if any.
+  std::optional<std::size_t> revealed_root_block_index;
+  /// Whether the scrollable document has reached its maximum vertical offset.
+  bool at_end;
+};
+
 namespace detail {
 class EditorSession;
 struct EditorViewport;
@@ -439,6 +450,13 @@ public:
   /// @return A rich fragment, or an empty value for a collapsed selection or during IME preedit.
   std::optional<DocumentFragment> SelectedFragment() const;
 
+  /// @brief Resolves a vertical position against the mounted editor's committed layout.
+  /// Calls in composition observe viewport movement, layout changes and explicitly aligned reveals.
+  /// @param y Distance from the viewport top in logical pixels. Finite values are clamped to the viewport.
+  /// @return The location, or an empty value if y is nonfinite or the committed layout is unavailable,
+  /// such as before mounting or while IME preedit changes the visible document.
+  std::optional<EditorViewportLocation> ViewportLocation(float y) const;
+
   /// @brief Reveals a nonempty block-local UTF-16 range in the mounted editor.
   ///
   /// Use a text block from Document() or a decoration request. The editing selection and focus are preserved.
@@ -447,7 +465,7 @@ public:
   /// @param alignment Start aligns the first visual line to the viewport top, Center centers the range, and End
   /// aligns the last visual line to the bottom. The offset is clamped to the scrollable extent. Omit the alignment
   /// to scroll only as far as necessary to reveal the first line. An explicit alignment follows viewport changes
-  /// until the user scrolls, the editing selection changes, or another range is revealed.
+  /// until the user scrolls, caret navigation scrolls the viewport, the document changes, or another range is revealed.
   /// @return True when the mounted editor accepted the range. Returns false for stale blocks, invalid ranges,
   /// unavailable layout, or active IME composition.
   bool RevealTextRange(const Block& block, TextRange range,

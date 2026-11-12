@@ -2443,6 +2443,9 @@ void RevealTextRange() {
   const auto target = controller->Document().Blocks().back();
   const auto editor = ui.FindSemantics(UiSemanticSelector::Identifier("reveal-editor"));
   const auto scroll = editor.Find(UiSemanticSelector::Role(SemanticRole::ScrollView));
+  const auto initial = controller->ViewportLocation(0.0F);
+  Check(initial && initial->root_block_index == 0 && !initial->at_end && !initial->revealed_root_block_index,
+        "The viewport starts at the first block without an aligned target");
   ui.Find(UiSelector::Text("Focus editor")).Tap();
   Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{3, 0}}});
   Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "ni"}});
@@ -2489,9 +2492,38 @@ void RevealTextRange() {
   ui.Pump();
   Check(browsed != expanded.offset && scroll.One().scroll->offset == browsed,
         "Manual scrolling takes over from explicit alignment");
+  Check(!controller->ViewportLocation(0.0F)->revealed_root_block_index,
+        "A manual scroll clears the viewport's aligned target");
   Check(ui.ActiveTextInput()->session_id == query_session->session_id && editor.One().text_selection == TextRange{0, 3},
         "Reveal preserves input focus and the editor selection");
+
+  const auto bottom = reveal_at(target, {5, 11}, ScrollAlignment::Start);
+  const auto bottom_location = controller->ViewportLocation(0.0F);
+  Check(bottom_location && bottom_location->at_end && bottom_location->root_block_index < 40 &&
+            bottom_location->revealed_root_block_index == 40,
+        "The clamped offset and explicit target are reported together");
+  ui.Find(UiSelector::Text("Focus editor")).Tap();
+  Check(scroll.One().scroll->offset == bottom.offset && controller->ViewportLocation(0.0F)->revealed_root_block_index == 40,
+        "Returning focus alone keeps the explicit target in view");
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{1, 1}}});
+  Check(scroll.One().scroll->offset < bottom.offset && !controller->ViewportLocation(0.0F)->revealed_root_block_index,
+        "Caret navigation that scrolls the viewport takes over from the aligned target");
+
+  const auto viewport = scroll.One().bounds;
+  ui.Drag({viewport.x + 100.0F, viewport.y + 220.0F}, {viewport.x + 100.0F, viewport.y + 60.0F},
+          {.duration = 160ms});
+  const auto released = scroll.One().scroll->offset;
+  ui.Pump(80ms);
+  const auto moving = *scroll.One().scroll;
+  Check(moving.offset > released, "The touch drag starts retained momentum");
+  const auto visible = controller->ViewportLocation(moving.viewport_extent / 2.0F);
+  Check(visible && controller->RevealTextRange(document.Blocks()[visible->root_block_index], {0, 1}),
+        "The editor accepts a reveal for an already visible block");
+  ui.Pump(160ms);
+  Check(scroll.One().scroll->offset == moving.offset, "A reveal at the current offset stops retained momentum");
+
   controller->ReplaceDocument(RichDocument{});
+  Check(!controller->ViewportLocation(0.0F), "The previous layout cannot report indices into a replacement document");
   ui.Pump();
   Check(!controller->RevealTextRange(target, {5, 11}), "Reveal rejects a block from a replaced document");
 }

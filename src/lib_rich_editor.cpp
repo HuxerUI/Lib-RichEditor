@@ -72,6 +72,18 @@ std::optional<DocumentFragment> RichEditorController::SelectedFragment() const {
   return session_->SelectedFragment();
 }
 
+std::optional<EditorViewportLocation> RichEditorController::ViewportLocation(float y) const {
+  if (!std::isfinite(y)) {
+    return std::nullopt;
+  }
+  if (const auto locate = viewport_->viewport_location.lock()) {
+    return (*locate)(session_->Document(), y);
+  }
+  // Subscribe before the mounted surface installs its geometry query.
+  (void)viewport_->geometry.Get();
+  return std::nullopt;
+}
+
 bool RichEditorController::RevealTextRange(const Block& block, TextRange range,
                                            std::optional<ScrollAlignment> alignment) const {
   const auto reveal = viewport_->reveal_text.lock();

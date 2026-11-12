@@ -678,6 +678,7 @@ public:
     }
     viewport_->content_width = content_width;
     if (width <= 0) {
+      viewport_->geometry = EditorViewport::Geometry{};
       return PaintInvalidation::None;
     }
     client_->SetViewportOrigin({bounds.x, bounds.y});
@@ -731,6 +732,7 @@ public:
     const bool revealed = !task_press_ && (edited || laid_out) && follow_focused_caret &&
         layout.RevealCaret(editor_->VisibleDocument(), caret);
     const bool scrolled = UpdateScroll(follow_focused_caret, caret, edited, laid_out);
+    PublishViewportGeometry(observed_scroll_, laid_out);
     const bool hover_changed = UpdateHoveredLink();
     if (laid_out || revealed || scrolled) {
       client_->GeometryChanged();
@@ -785,9 +787,11 @@ public:
 
 private:
   struct AlignedReveal {
+    RichDocument document;
     TextRange range;
     ScrollAlignment alignment;
     float applied_offset;
+    std::size_t root_block_index;
   };
 
   struct LinkPress {
@@ -813,6 +817,8 @@ private:
 
   void ResetClient();
   bool UpdateScroll(bool focused, TextPosition position, bool edited, bool laid_out);
+  void PublishViewportGeometry(ScrollMetrics scroll, bool laid_out = false);
+  std::optional<EditorViewportLocation> LocateViewport(const RichDocument& document, float y) const;
   bool RevealText(const RichDocument& document, TextRange range, std::optional<ScrollAlignment> alignment);
   bool ScrollTable(std::size_t table, float delta);
   bool UpdateDecorations();
@@ -834,6 +840,7 @@ private:
   std::shared_ptr<EditorViewport::ScrollInputHandler> scroll_input_;
   std::shared_ptr<EditorViewport::PointerInputHandler> pointer_input_;
   std::shared_ptr<EditorViewport::RevealTextHandler> reveal_text_;
+  std::shared_ptr<EditorViewport::ViewportLocationHandler> viewport_location_;
   std::uint64_t observed_revision_ = 0;
   std::shared_ptr<const DecorationAnalysis> decoration_analysis_;
   std::uint64_t observed_decoration_revision_ = 0;
@@ -900,6 +907,9 @@ void EditorExtension::Update(ViewNode& node, const Surface& surface) {
         return RevealText(document, range, alignment);
       });
   viewport_->reveal_text = reveal_text_;
+  viewport_location_ = std::make_shared<EditorViewport::ViewportLocationHandler>(
+      [this](const RichDocument& document, float y) { return LocateViewport(document, y); });
+  viewport_->viewport_location = viewport_location_;
 }
 
 void EditorExtension::ResetClient() {
@@ -948,6 +958,29 @@ float OffsetToAlign(const ScrollMetrics& metrics, const EditorLayout& layout, co
   return std::clamp(offset, 0.0F, metrics.maximum_offset);
 }
 
+void EditorExtension::PublishViewportGeometry(ScrollMetrics scroll, bool laid_out) {
+  viewport_->geometry = EditorViewport::Geometry{
+      scroll, aligned_reveal_ ? std::optional(aligned_reveal_->root_block_index) : std::nullopt,
+      viewport_->geometry.Get().layout_revision + laid_out};
+}
+
+std::optional<EditorViewportLocation> EditorExtension::LocateViewport(const RichDocument& document, float y) const {
+  const auto& geometry = viewport_->geometry.Get();
+  const auto& scroll = geometry.scroll;
+  const auto& layout = client_->Layout();
+  if (!client_->HasGeometry() || !layout.IsCurrent(document) || !viewport_->scroll.IsConnected() ||
+      scroll.viewport_extent <= 0.0F) {
+    return std::nullopt;
+  }
+  const auto& rows = layout.Rows();
+  const float content_y = scroll.offset + std::clamp(y, 0.0F, scroll.viewport_extent);
+  const auto next = std::ranges::upper_bound(rows, content_y, {}, &EditorLayout::Row::Top);
+  const auto row = next == rows.begin() ? next : std::prev(next);
+  const auto leaf = DocumentAccess::Get(document).index.At(static_cast<std::size_t>(row - rows.begin()));
+  return EditorViewportLocation{leaf.path.front(), geometry.revealed_root_block_index,
+                                scroll.maximum_offset > 0.0F && scroll.offset >= scroll.maximum_offset};
+}
+
 bool EditorExtension::RevealText(const RichDocument& document, TextRange range,
                                  std::optional<ScrollAlignment> alignment) {
   const auto metrics = viewport_->scroll.Metrics();
@@ -957,15 +990,21 @@ bool EditorExtension::RevealText(const RichDocument& document, TextRange range,
   }
   auto& layout = client_->Layout();
   const TextPosition position{range.start, TextAffinity::Downstream};
-  const bool table_moved = layout.RevealCaret(document, position);
   const float next = alignment ? OffsetToAlign(metrics, layout, document, range, *alignment)
                                : OffsetToReveal(metrics, layout.Caret(document, position));
-  follow_caret_ = false;
-  if (next != metrics.offset) {
-    viewport_->scroll.ScrollTo(next);
+  // A new reveal stops retained momentum even when both targets clamp to the same offset.
+  if (!viewport_->scroll.ScrollTo(next)) {
+    return false;
   }
-  aligned_reveal_ = alignment ? std::optional(AlignedReveal{range, *alignment, viewport_->scroll.Offset()})
-                              : std::nullopt;
+  const bool table_moved = layout.RevealCaret(document, position);
+  const auto applied = viewport_->scroll.Metrics();
+  follow_caret_ = false;
+  aligned_reveal_.reset();
+  if (alignment) {
+    const auto leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
+    aligned_reveal_ = AlignedReveal{document, range, *alignment, applied.offset, leaf.path.front()};
+  }
+  PublishViewportGeometry(applied);
   if (table_moved) {
     client_->GeometryChanged();
     InvalidatePaint(PaintInvalidation::Foreground);
@@ -976,38 +1015,42 @@ bool EditorExtension::RevealText(const RichDocument& document, TextRange range,
 
 bool EditorExtension::UpdateScroll(bool focused, TextPosition position, bool edited, bool laid_out) {
   auto metrics = viewport_->scroll.Metrics();
+  const auto& document = editor_->VisibleDocument();
   const bool focus_gained = focused && !focused_;
   focused_ = focused;
+  if (aligned_reveal_ && (!DocumentAccess::Same(aligned_reveal_->document, document) ||
+      metrics.offset != std::min(aligned_reveal_->applied_offset, metrics.maximum_offset))) {
+    aligned_reveal_.reset();
+  }
   if (task_press_) {
     // A mouse press can focus the editor before the checkbox activates on release.
     follow_caret_ = false;
   } else if (edited || focus_gained) {
-    follow_caret_ = true;
+    follow_caret_ = !aligned_reveal_;
   } else if (metrics.offset != std::min(observed_scroll_.offset, metrics.maximum_offset)) {
     // A deliberate scroll takes over from the caret. A layout clamp alone keeps the current mode.
     follow_caret_ = false;
   }
   const bool extent_changed = metrics.content_extent != observed_scroll_.content_extent ||
       metrics.viewport_extent != observed_scroll_.viewport_extent;
-  if (aligned_reveal_ && (edited || focus_gained ||
-      metrics.offset != std::min(aligned_reveal_->applied_offset, metrics.maximum_offset))) {
-    aligned_reveal_.reset();
-  }
-  // The software keyboard can resize the viewport after the search action has already run.
+  // Keep the explicit target aligned when the viewport or document geometry changes.
   if (!task_press_ && aligned_reveal_ && (laid_out || extent_changed) && metrics.viewport_extent > 0.0F) {
-    const float offset = OffsetToAlign(metrics, client_->Layout(), editor_->VisibleDocument(), aligned_reveal_->range,
+    const float offset = OffsetToAlign(metrics, client_->Layout(), document, aligned_reveal_->range,
                                        aligned_reveal_->alignment);
     if (offset != metrics.offset && viewport_->scroll.ScrollTo(offset)) {
       metrics = viewport_->scroll.Metrics();
     }
     aligned_reveal_->applied_offset = metrics.offset;
   }
-  if (focused && follow_caret_ && (edited || focus_gained || laid_out || extent_changed) &&
+  const bool reveal_caret = !task_press_ && (edited || (follow_caret_ && (focus_gained || laid_out || extent_changed)));
+  if (focused && reveal_caret &&
       metrics.viewport_extent > 0.0F && !editor_->SelectedAtomicBlock()) {
-    const auto caret = client_->Layout().Caret(editor_->VisibleDocument(), position);
+    const auto caret = client_->Layout().Caret(document, position);
     const float offset = OffsetToReveal(metrics, caret);
     if (offset != metrics.offset && viewport_->scroll.ScrollTo(offset)) {
       metrics = viewport_->scroll.Metrics();
+      aligned_reveal_.reset();
+      follow_caret_ = true;
     }
   }
   const bool scrolled = metrics.offset != observed_scroll_.offset;

@@ -372,7 +372,7 @@ View SettingsDialog(DialogContext context) {
           Font::FromFamily(theme.typography.family, 22.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
           .With(Grow(), Semantics{.role = SemanticRole::Heading, .heading_level = 1}),
       Button(l10n::done).OnClick([context] { context.Dismiss(); })
-          .With(Frame{.min_height = 44.0F}, Semantics{.identifier = "settings-done"}),
+          .With(DialogActionFrame(), Semantics{.identifier = "settings-done"}),
     }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
     navigation,
   }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch));

@@ -23,6 +23,14 @@ struct EditorViewport {
   using ScrollInputHandler = std::function<bool(const ScrollInputEvent&)>;
   using PointerInputHandler = std::function<void(const PointerEvent&)>;
   using RevealTextHandler = std::function<bool(const RichDocument&, TextRange, std::optional<ScrollAlignment>)>;
+  using ViewportLocationHandler = std::function<std::optional<EditorViewportLocation>(const RichDocument&, float)>;
+
+  struct Geometry {
+    ScrollMetrics scroll;
+    std::optional<std::size_t> revealed_root_block_index;
+    std::uint64_t layout_revision = 0;
+    bool operator==(const Geometry&) const = default;
+  };
 
   ScrollController scroll;
   /// The mounted surface owns the handler and its node-local coordinate mapping.
@@ -49,6 +57,8 @@ struct EditorViewport {
   State<std::uint64_t> decoration_revision{0};
   State<float> content_width{0.0F};
   std::weak_ptr<RevealTextHandler> reveal_text;
+  State<Geometry> geometry{Geometry{}};
+  std::weak_ptr<ViewportLocationHandler> viewport_location;
 };
 
 } // namespace huxerui::richeditor::detail
