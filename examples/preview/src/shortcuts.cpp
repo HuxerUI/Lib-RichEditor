@@ -175,7 +175,7 @@ StringVariant CommandLabel(const ShortcutCommand& command) {
       Label{"folio.save", l10n::save},
       Label{"folio.save-as", l10n::save_as},
       Label{"folio.find", l10n::find_in_document},
-      Label{"folio.toggle-sidebar", l10n::toggle_file_sidebar},
+      Label{"folio.toggle-sidebar", l10n::toggle_sidebar},
       Label{"folio.settings", l10n::open_settings},
       Label{"folio.command-palette", l10n::command_palette},
       Label{"editor.undo", l10n::undo},

@@ -1,6 +1,7 @@
 #include "workbench.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -77,6 +78,7 @@ struct DocumentTab {
   State<std::optional<ViewHandle>> editor_focus{std::nullopt};
   State<Operation> operation{Operation::Idle};
   State<FindPanelState> find{FindPanelState{}};
+  State<std::shared_ptr<const Block>> outline_target{std::shared_ptr<const Block>{}};
   State<std::string> status{std::string{}};
   bool opened_with_attachments;
 
@@ -150,7 +152,7 @@ struct CloseRequest {
 constexpr float default_sidebar_width = 260.0F;
 
 struct PaneSizes {
-  Frame sidebar{.width = default_sidebar_width, .min_width = 150.0F, .max_width = 420.0F};
+  Frame sidebar{.width = default_sidebar_width, .min_width = 180.0F, .max_width = 420.0F};
   Grow sidebar_grow{0.0F};
   Frame documents{.min_width = 160.0F};
   Grow documents_grow{1.0F};
@@ -165,6 +167,7 @@ struct Workspace {
   State<bool> files_open{true};
   State<bool> recents_open{true};
   State<bool> sidebar_visible{true};
+  State<bool> showing_outline{false};
   State<bool> drawer_open{false};
   State<PaneSizes> pane_sizes{PaneSizes{}};
   State<bool> picking{false};
@@ -298,6 +301,7 @@ public:
   bool CanExecute(FolioCommand command) const;
   void Execute(FolioCommand command, bool keyboard = false) const;
   void NewDocument(bool sample = false) const;
+  void JumpToHeading(const Tab& tab, const Block& block, TextOffset length) const;
   void NewWindow() const;
   void PickOpen(OpenKind kind) const;
   void OpenKnown(Target target, Entry source_folder = {}) const;
@@ -472,6 +476,24 @@ void WorkbenchActions::Status(const Tab& tab, StringVariant message) const {
     tab->status = resources->GetString(message);
   } else {
     workspace->status = resources->GetString(message);
+  }
+}
+
+void WorkbenchActions::JumpToHeading(const Tab& tab, const Block& block, TextOffset length) const {
+  if (!Available() || workspace->Selected() != tab) {
+    return;
+  }
+  const auto& editor = tab->editor.Get();
+  if (!editor || !editor->RevealTextRange(block, {0, length}, ScrollAlignment::Start)) {
+    Status(tab, l10n::outline_jump_unavailable);
+    return;
+  }
+  const auto& target = tab->outline_target.Get();
+  if (!target || &target->Data() != &block.Data()) {
+    tab->outline_target = std::make_shared<const Block>(block);
+  }
+  if (modal_sidebar) {
+    sidebar_open = false;
   }
 }
 
@@ -1797,10 +1819,9 @@ View FolderTreeRow(WorkbenchActions actions, Entry entry, bool desktop, float ro
 }
 
 [[huxerui::composable]]
-View Sidebar(WorkbenchActions actions, bool desktop) {
+View FilesSidebar(WorkbenchActions actions, bool desktop, float row_height) {
   const auto& theme = UseTheme();
   const auto& colors = theme.colors;
-  const float row_height = desktop ? 32.0F : 44.0F;
   const auto workspace = actions.workspace;
   const auto selected = workspace->Selected();
   const auto selected_entry = selected ? FolderFileRow(selected, *workspace) : Entry{};
@@ -1815,7 +1836,7 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
       actions.OpenKnown(*file);
     }
   };
-  auto files = TreeView<SidebarItem>({SidebarSection::Workspace, SidebarSection::Recent},
+  return TreeView<SidebarItem>({SidebarSection::Workspace, SidebarSection::Recent},
       [actions, colors, desktop, row_height, selected, selected_entry](const SidebarItem& item) -> View {
         if (const auto* node = std::get_if<Entry>(&item)) {
           const auto& entry = *node;
@@ -1916,6 +1937,95 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
       }).OnActivated(open)
       .DisclosureIcon(app::images::chevron_right).ItemExtent(row_height).Label(l10n::files)
       .With(Grow(), ScrollBar());
+}
+
+struct OutlineHeading {
+  Block block;
+  std::size_t index;
+  std::size_t depth;
+  TextOffset length;
+  std::string title;
+};
+
+std::vector<OutlineHeading> DocumentOutline(const RichDocument& document) {
+  std::vector<OutlineHeading> headings;
+  std::array<unsigned, 6> ancestors{};
+  std::size_t depth = 0;
+  const auto blocks = document.Blocks();
+  for (std::size_t index = 0; index < blocks.size(); ++index) {
+    const auto& block = blocks[index];
+    const auto& data = block.Data();
+    if (data.kind != BlockKind::Heading || data.text.find_first_not_of(" \t") == std::string::npos) {
+      continue;
+    }
+    const AttributedText text(data.text);
+    std::string title;
+    if (data.inline_objects.empty()) {
+      title = data.text;
+    } else {
+      TextOffset start = 0;
+      for (const auto& object : data.inline_objects) {
+        title += text.TextInRange({start, object.offset});
+        title += object.data.fallback_text.empty() ? object.data.type : object.data.fallback_text;
+        start = object.offset + 1;
+      }
+      title += text.TextInRange({start, text.Length()});
+    }
+    // Skipped levels still nest one row beneath the closest preceding ancestor.
+    while (depth > 0 && ancestors[depth - 1] >= data.heading_level) {
+      --depth;
+    }
+    headings.push_back({block, index, depth, text.Length(), std::move(title)});
+    ancestors[depth++] = data.heading_level;
+  }
+  return headings;
+}
+
+[[huxerui::composable]]
+View OutlineSidebar(WorkbenchActions actions, Tab tab, bool desktop, float row_height) {
+  const auto theme = UseTheme();
+  auto headings = tab ? DocumentOutline(tab->Snapshot()) : std::vector<OutlineHeading>{};
+  if (headings.empty()) {
+    return Text(l10n::no_headings, TextRole::Label)
+        .With(Grow(), Padding(12.0F), Foreground(theme.colors.on_surface_variant));
+  }
+  const auto target = tab->outline_target.Get();
+  return VirtualList(std::move(headings), [actions, tab, desktop, row_height, theme, target](const OutlineHeading& heading) {
+    // Value equality also matches different headings with the same title and formatting.
+    const bool selected = target && &target->Data() == &heading.block.Data();
+    const auto foreground = selected ? theme.colors.on_primary_container : theme.colors.on_surface;
+    auto label = EllipsizedLabel(heading.title, foreground).With(Grow());
+    if (desktop) {
+      label = std::move(label).With(Tooltip(heading.title));
+    }
+    const auto id = "outline-heading-" + std::to_string(heading.index);
+    return ClickableRow(Row {std::move(label)}.With(Frame{.height = row_height},
+            Padding(EdgeInsets{.right = 8.0F, .left = 9.0F + 12.0F * static_cast<float>(heading.depth)}),
+            CrossAlign(CrossAxisAlignment::Center),
+            Background(selected ? theme.colors.primary_container : Color::Transparent())),
+        theme, {.role = SemanticRole::Button, .label = heading.title, .identifier = id,
+                .selected = selected, .heading_level = heading.block.Data().heading_level},
+        [actions, tab, block = heading.block, length = heading.length] {
+          actions.JumpToHeading(tab, block, length);
+        }).Key(reinterpret_cast<std::uintptr_t>(&heading.block.Data()));
+  }).ItemExtent(row_height).With(Grow(), ScrollBar(), Semantics{.label = l10n::outline}).Key(tab->id);
+}
+
+[[huxerui::composable]]
+View Sidebar(WorkbenchActions actions, bool desktop) {
+  const auto& theme = UseTheme();
+  const auto& colors = theme.colors;
+  const float row_height = desktop ? 32.0F : 44.0F;
+  const auto workspace = actions.workspace;
+  const bool outline = workspace->showing_outline.Get();
+  auto segments = UseEnvironment<SegmentedButtonStyle>();
+  segments.padding = EdgeInsets::Symmetric(desktop ? 4.0F : 8.0F, 4.0F);
+  if (desktop) {
+    segments.label_style.font = segments.label_style.font.WithSize(theme.typography.body_small);
+  }
+  segments.minimum_height = row_height;
+  auto section_switch = SegmentedButton({l10n::files, l10n::outline}, outline ? 1U : 0U)
+      .OnChanged([workspace](std::size_t index) { workspace->showing_outline = index == 1; });
   auto settings = ClickableRow(Row {
     Text(l10n::settings, TextRole::Label).With(Grow()),
     Glyph(app::images::chevron_right, colors.on_surface_variant, 13.0F),
@@ -1926,14 +2036,17 @@ View Sidebar(WorkbenchActions actions, bool desktop) {
       .With(Enabled(actions.CanExecute(FolioCommand::Settings)));
   return Column {
     Row {
-      Text(l10n::files, TextRole::Label).With(Grow()),
-      IconButton(app::images::panel_left, l10n::hide_files).OnClick([actions] { actions.Execute(FolioCommand::ToggleSidebar); })
-          .With(Frame{.min_width = row_height, .min_height = row_height}, Tooltip(l10n::hide_files),
+      ProvideEnvironment(segments, section_switch),
+      Spacer().With(Grow()),
+      IconButton(app::images::panel_left, l10n::hide_sidebar)
+          .OnClick([actions] { actions.Execute(FolioCommand::ToggleSidebar); })
+          .With(Frame{.min_width = row_height, .min_height = row_height}, Tooltip(l10n::hide_sidebar),
                 Enabled(actions.CanExecute(FolioCommand::ToggleSidebar)),
-                Semantics{.identifier = "hide-files", .expanded = true}),
-    }.With(Padding(EdgeInsets::Symmetric(8.0F, 2.0F)), CrossAlign(CrossAxisAlignment::Center)),
+                Semantics{.identifier = "hide-sidebar", .expanded = true}),
+    }.With(Padding(EdgeInsets::Symmetric(8.0F, 4.0F)), CrossAlign(CrossAxisAlignment::Center)),
     Divider(),
-    files,
+    outline ? OutlineSidebar(actions, workspace->Selected(), desktop, row_height)
+            : FilesSidebar(actions, desktop, row_height),
     Divider(),
     Column {settings}.With(Padding(EdgeInsets::Symmetric(8.0F, 6.0F)), CrossAlign(CrossAxisAlignment::Stretch)),
   }.With(CrossAlign(CrossAxisAlignment::Stretch), Background(colors.surface_container_low));
@@ -2135,13 +2248,13 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
     entries.emplace_back(item(l10n::settings_menu, FolioCommand::Settings));
     file_menu.Show(actions.file_menu_focus, std::move(entries));
   };
-  const bool files_visible = actions.sidebar_open.Get();
-  const auto files_label = files_visible ? l10n::hide_files : l10n::show_files;
+  const bool sidebar_visible = actions.sidebar_open.Get();
+  const auto sidebar_label = sidebar_visible ? l10n::hide_sidebar : l10n::show_sidebar;
   std::vector<View> controls{
-    actions.modal_sidebar || !files_visible ? IconButton(app::images::panel_left, files_label)
+    actions.modal_sidebar || !sidebar_visible ? IconButton(app::images::panel_left, sidebar_label)
         .OnClick([actions] { actions.Execute(FolioCommand::ToggleSidebar); })
-        .With(icon_frame, Tooltip(files_label), Enabled(actions.CanExecute(FolioCommand::ToggleSidebar)),
-              Semantics{.identifier = "show-files", .expanded = files_visible})
+        .With(icon_frame, Tooltip(sidebar_label), Enabled(actions.CanExecute(FolioCommand::ToggleSidebar)),
+              Semantics{.identifier = "show-sidebar", .expanded = sidebar_visible})
         : View{},
     std::move(title).Key("title"),
     active && !narrow_desktop ? IconButton(app::images::search, l10n::find_in_document)

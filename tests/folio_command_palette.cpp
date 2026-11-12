@@ -297,6 +297,118 @@ void PaletteFlow(const char* package_path) {
         "The link menu can open the pasted web address after trimming its outer spaces");
 }
 
+void OutlineFlow(const char* package_path) {
+  const Application app(App, {
+      .show_debug_overlay = false,
+      .application_hooks = {folio::InstallFolio},
+      .window_hooks = {folio::InstallWorkbench},
+  });
+  UiTest ui(app, {.viewport = {880, 640}, .resource_provider = std::make_shared<PackageResources>(package_path)});
+#if defined(__APPLE__)
+  const KeyModifiers primary{.meta = true};
+#else
+  const KeyModifiers primary{.control = true};
+#endif
+  const auto by_id = [&](const char* id) { return ui.FindSemantics(UiSemanticSelector::Identifier(id)); };
+  const auto by_label = [&](const char* label) { return ui.FindSemantics(UiSemanticSelector::Label(label)); };
+  const auto tap = [&](const UiSemanticQuery& node) {
+    const auto rect = node.One().bounds;
+    ui.TapAt({rect.x + rect.width / 2, rect.y + rect.height / 2});
+  };
+  const auto editor = ui.Find(UiSelector::Key("editor"));
+  const auto article = by_id("article-editor");
+  const auto scroll = article.Find(UiSemanticSelector::Role(SemanticRole::ScrollView));
+  const auto first = by_id("outline-heading-0");
+  const auto child = by_id("outline-heading-1");
+  const auto last = by_id("outline-heading-35");
+
+  ui.PressKey(Key::N, primary);
+  tap(by_label("Outline"));
+  Check(by_label("No headings yet").Exists(), "A new document has an empty outline");
+
+  std::string source = "Repeat\nChild\nNested\n";
+  for (int i = 0; i < 32; ++i) {
+    source += "A body paragraph\n";
+  }
+  const auto last_start = static_cast<TextOffset>(source.size());
+  source += "Repeat\n";
+  for (int i = 0; i < 32; ++i) {
+    source += "Another body paragraph\n";
+  }
+  editor.Tap();
+  editor.EnterText(source);
+  const auto set_kind = [&](TextOffset offset, Key key) {
+    editor.SetSelection({offset, offset});
+    ui.PressKey(key, primary);
+  };
+  set_kind(0, Key::Digit1);
+  set_kind(7, Key::Digit3);
+  set_kind(13, Key::Digit6);
+  set_kind(last_start, Key::Digit1);
+  Check(first.One().label == "Repeat" && last.One().label == "Repeat" &&
+            child.One().heading_level == 3 && by_id("outline-heading-2").One().heading_level == 6,
+        "The outline keeps duplicate titles and levels that skip intermediate headings");
+
+  editor.SetSelection({6, 6});
+  Send(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "nihao"}});
+  Check(first.One().label == "Repeat", "The outline uses committed headings during IME preedit");
+  Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "你好"}});
+  Check(first.One().label == "Repeat你好", "An IME commit updates the heading title");
+  ui.PressKey(Key::Z, primary);
+  Check(first.One().label == "Repeat", "Undo restores the original title");
+  set_kind(7, Key::Digit0);
+  Check(!child.Exists(), "Converting a heading to a paragraph removes its outline entry");
+  ui.PressKey(Key::Z, primary);
+  Check(child.One().heading_level == 3, "Undo restores the removed heading at its original level");
+
+  const TextSelection backward{10, 2};
+  editor.SetSelection(backward);
+  tap(last);
+  const float wide_last = scroll.One().scroll->offset;
+  Check(wide_last > 500 && last.One().selected == true && first.One().selected == false,
+        "The second duplicate jumps down and is the only selected outline row");
+  tap(first);
+  Check(scroll.One().scroll->offset < 50 && first.One().selected == true && last.One().selected == false,
+        "The first duplicate independently jumps to the top");
+  Check(article.One().text_selection == backward.Range(), "Outline jumps leave the document selection intact");
+
+  ui.SetWindowMetrics({.viewport = {360, 640}});
+  ui.Pump();
+  editor.Tap();
+  editor.SetSelection(backward);
+  tap(by_id("show-sidebar"));
+  ui.Pump(400ms);
+  tap(last);
+  ui.Pump(400ms);
+  ui.Pump();
+  Check(by_id("show-sidebar").One().expanded == false && scroll.One().scroll->offset > 500,
+        "A compact outline jump closes the drawer and keeps the requested heading in view");
+  Check(article.One().text_selection == backward.Range(), "Closing the drawer preserves the document selection");
+  article.PerformSemanticAction({SemanticActionKind::Focus, {}});
+  const auto input = ui.ActiveTextInput();
+  Check(input && input->selection == backward, "The drawer round trip preserves the selection direction");
+
+  const TextSelection caret{3, 3};
+  Send(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = caret}});
+  tap(by_id("show-sidebar"));
+  ui.Pump(400ms);
+  Check(last.One().selected == true, "The last jump remains selected after reopening the outline");
+  tap(last);
+  ui.Pump(400ms);
+  Check(by_id("show-sidebar").One().expanded == false && scroll.One().scroll->offset > 500 &&
+            article.One().text_selection == caret.Range(),
+        "Reactivating the same outline row jumps again without moving the caret");
+
+  ui.SetWindowMetrics({.viewport = {880, 640}});
+  ui.Pump();
+  ui.PressKey(Key::N, primary);
+  Check(!first.Exists() && by_label("No headings yet").Exists(), "The outline follows the active document tab");
+  tap(by_id("document-switcher"));
+  tap(by_label("Untitled, unsaved changes"));
+  ui.PumpUntil([&] { return first.Exists(); });
+  Check(last.One().selected == true && last.One().label == "Repeat", "Switching back restores the tab's own outline");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -305,6 +417,7 @@ int main(int argc, char** argv) {
     WebUrls();
     CompactCodeTools(argv[1]);
     PaletteFlow(argv[1]);
+    OutlineFlow(argv[1]);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;
