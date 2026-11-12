@@ -188,6 +188,9 @@ void TableCodecs() {
   };
   Check(table.kind == BlockKind::Table && table.table_has_header && table.children.size() == 3,
         "GFM header and data rows");
+  const auto legacy_json = json.Export(*imported.document);
+  Check(table.table_column_alignments.empty() && legacy_json.text && legacy_json.text->find("column_alignments") ==
+            std::string::npos, "Default column alignment keeps the original JSON v1 representation");
   Check(paragraph(table.children[1], 0).marks == std::vector<MarkRange>{{{0, 4}, Mark::Bold}} &&
             paragraph(table.children[1], 1).text == "a|b" &&
             paragraph(table.children[1], 2).links.size() == 1 &&
@@ -225,18 +228,83 @@ void TableCodecs() {
             paragraph(approximate.children[0], 0).text.empty() && paragraph(approximate.children[2], 0).text == "甲 乙🙂",
         "Lossy export adds a blank header and replaces cell breaks");
 
-  constexpr auto aligned = "| A | B |\n| :--- | ---: |\n| x | y |\n";
-  const auto aligned_strict = markdown.Import(aligned);
-  const auto aligned_lossy = markdown.Import(aligned, LossPolicy::AllowLoss);
-  Check(!aligned_strict.document && aligned_lossy.document && aligned_strict.issues.size() == 2 &&
-            aligned_strict.issues[0].block_path == std::vector<std::size_t>{0, 0, 0, 0},
-        "Unsupported column alignment has a source cell diagnostic");
+  using Alignment = TableColumnAlignment;
+  constexpr auto aligned = "| A | B | C | D |\n| --- | :--- | :---: | ---: |\n| 甲 | س | 乙 | ص |\n";
+  const auto aligned_document = markdown.Import(aligned);
+  Check(aligned_document.document && aligned_document.issues.empty() &&
+            aligned_document.document->Blocks()[0].Data().table_column_alignments ==
+                std::vector{Alignment::Default, Alignment::Left, Alignment::Center, Alignment::Right},
+        "Strict imports all alignments, distinguishing explicit left from default");
+  const auto aligned_json = json.Export(*aligned_document.document);
+  const auto aligned_markdown = markdown.Export(*aligned_document.document);
+  Check(aligned_json.text && json.Import(*aligned_json.text).document == aligned_document.document &&
+            aligned_markdown.text == aligned && markdown.Import(*aligned_markdown.text).document ==
+                aligned_document.document, "Column alignments round trip through JSON and Strict Markdown");
+  for (const std::string_view alignment : {"[]", "[\"right\"]", "[\"default\",\"left\",\"center\",\"invalid\"]", "null"}) {
+    auto invalid = *aligned_json.text;
+    const auto start = invalid.find('[', invalid.find("\"column_alignments\""));
+    invalid.replace(start, invalid.find(']', start) + 1 - start, alignment);
+    Check(!json.Import(invalid).document, "Invalid JSON column alignment arrays are rejected");
+  }
   Check(!markdown.Import("> | A |\n> | --- |\n> | B |\n").document, "Tables are top-level");
   Check(!json.Import(R"({"version":1,"blocks":[{"type":"table","has_header":true,"children":[
       {"type":"table_row","children":[{"type":"table_cell","children":[{"type":"paragraph","text":""}]}]},
       {"type":"table_row","children":[{"type":"table_cell","children":[{"type":"paragraph","text":""}]},
                                     {"type":"table_cell","children":[{"type":"paragraph","text":""}]}]}
   ]}]})", LossPolicy::AllowLoss).document, "JSON rejects ragged tables even under AllowLoss");
+}
+
+void ThematicBreakCodecs() {
+  const auto& markdown = MarkdownCodec();
+  const auto source = markdown.Import("Title\n---\n\n* * *\n\n> ___\n\n- Before\n  ***\n  After\n");
+  Check(source.document && source.issues.empty(), "Strict imports top-level and nested thematic breaks");
+  const auto blocks = source.document->Blocks();
+  Check(blocks.size() == 4 && blocks[3].Data().kind == BlockKind::List, "Thematic break fixture structure");
+  const auto& item = blocks[3].Data().children.front().Data().children;
+  Check(blocks[0].Data().kind == BlockKind::Heading &&
+            blocks[1].Data().kind == BlockKind::ThematicBreak &&
+            blocks[2].Data().children.front().Data().kind == BlockKind::ThematicBreak &&
+            item.size() == 3 && item[1].Data().kind == BlockKind::ThematicBreak,
+        "Setext headings and thematic breaks have distinct structure");
+  const auto encoded = markdown.Export(*source.document);
+  const auto saved = JsonCodec().Export(*source.document);
+  Check(encoded.text && encoded.text->find("> ***") != std::string::npos &&
+            markdown.Import(*encoded.text).document == source.document && saved.text &&
+            saved.text->find("\"version\": 1") != std::string::npos &&
+            JsonCodec().Import(*saved.text).document == source.document,
+        "Thematic breaks preserve their parent through Strict Markdown and JSON v1");
+  Check(!JsonCodec().Import(R"({"version":1,"blocks":[{"type":"thematic_break","text":""}]})").document,
+        "A thematic break cannot carry text");
+  Check(!JsonCodec().Import(R"({"version":1,"blocks":[{"type":"table","has_header":true,"children":[
+      {"type":"table_row","children":[{"type":"table_cell","children":[{"type":"thematic_break"}]}]}
+  ]}]})").document, "Thematic breaks cannot replace table cell paragraphs");
+
+  const auto body = markdown.Import("***\n\nBody").document;
+  Check(body.has_value(), "Front matter body fixture imports");
+  const auto check_front_matter = [&](std::string_view input) {
+    const auto strict = markdown.Import(input);
+    const auto lossy = markdown.Import(input, LossPolicy::AllowLoss);
+    Check(!strict.document && strict.issues.size() == 1 && strict.issues.front().code == "markdown.front_matter" &&
+              lossy.issues.size() == 1 && lossy.issues.front().code == "markdown.front_matter" &&
+              lossy.document == body,
+          "YAML front matter is explicitly diagnosed and only AllowLoss omits it");
+  };
+  check_front_matter("\xef\xbb\xbf---\r\ntitle: Example\r\ntags:\r\n- one\r\n---\r\n\r\n***\r\n\r\nBody");
+  for (const std::string_view mapping : {"title : Example", R"("title": Example)", "标题: 示例",
+                                        R"md("title: \"example\"" : Example)md", "'post''s: title': Example"}) {
+    check_front_matter("---\n" + std::string(mapping) + "\n---\n\n***\n\nBody");
+  }
+  const auto prose = markdown.Import("---\n\nOrdinary prose\n\n---");
+  Check(prose.document && prose.document->Blocks().size() == 3 &&
+            prose.document->Blocks().front().Data().kind == BlockKind::ThematicBreak &&
+            prose.document->Blocks().back().Data().kind == BlockKind::ThematicBreak,
+        "Leading and trailing thematic breaks remain valid around ordinary prose");
+  const auto quoted_prose = markdown.Import("---\n\"Title: example\"\n---");
+  Check(quoted_prose.document && quoted_prose.issues.empty() &&
+            quoted_prose.document->Blocks().size() == 2 &&
+            quoted_prose.document->Blocks().front().Data().kind == BlockKind::ThematicBreak &&
+            quoted_prose.document->Blocks().back().Data().kind == BlockKind::Heading,
+        "A colon inside a quoted heading is not a YAML key separator");
 }
 
 void ValidateJsonAndBoundaries() {
@@ -454,6 +522,7 @@ int main() {
     ValidateJsonAndBoundaries();
     DefaultHighlighting();
     TableCodecs();
+    ThematicBreakCodecs();
     ImageCodecs();
     CustomBlockCodecs();
     MarkdownObjectMappings();

@@ -1246,6 +1246,9 @@ void PresentationExtensions() {
 }
 
 void TableEditing() {
+  using Alignment = TableColumnAlignment;
+  const SetTableColumnAlignment default_alignment{};
+  const SetTableColumnAlignment right_alignment{Alignment::Right};
   const Application app(App, {.show_debug_overlay = false});
   UiTest ui(app, {.viewport = {220.0F, 380.0F}});
   controller->ReplaceDocument(RichDocument{});
@@ -1318,6 +1321,7 @@ void TableEditing() {
   select(1, 2);
   Check(!controller->GetCommandState(ToggleMark{Mark::Bold}).enabled &&
             !controller->GetCommandState(ToggleQuote{}).enabled &&
+            !controller->GetCommandState(right_alignment).enabled &&
             Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "x"}}).result_code ==
                 TextInputResultCode::Rejected,
         "Cross-cell text and formatting edits are rejected");
@@ -1327,6 +1331,9 @@ void TableEditing() {
         "Table structure remains stable during preedit");
   const auto header = controller->GetCommandState(ToggleTableHeader{});
   Check(!header.enabled && header.checked == CheckState::On, "Header state remains observable during preedit");
+  const auto alignment = controller->GetCommandState(default_alignment);
+  Check(!alignment.enabled && alignment.checked == CheckState::On,
+        "Column alignment stays observable but cannot be changed during preedit");
   Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "你好"}});
   const auto committed = controller->Document();
   Check(cell(committed, 1, 1).text == "你好Y" && cell(committed, 1, 2).text == "Z",
@@ -1338,15 +1345,31 @@ void TableEditing() {
 
   select(12, 10);
   Check(controller->Execute(ToggleMark{Mark::Bold}), "Format a backward cell selection");
+  const auto bold = controller->Document();
+  Check(controller->GetCommandState(default_alignment).checked == CheckState::On &&
+            !controller->GetCommandState(InsertThematicBreak{}).enabled && controller->Execute(right_alignment),
+        "The alignment command applies to the selected column and the cell cannot contain a thematic break");
   const auto formatted = controller->Document();
+  Check(formatted.Blocks()[0].Data().table_column_alignments ==
+            std::vector{Alignment::Default, Alignment::Right, Alignment::Default, Alignment::Default} &&
+            controller->GetCommandState(right_alignment).checked == CheckState::On &&
+            !controller->Execute(right_alignment) && controller->Execute(Undo{}) && controller->Document() == bold &&
+            controller->Execute(Redo{}) && controller->Document() == formatted,
+        "Alignment is undoable and applying the same alignment adds no undo entry");
+  ui.Pump();
+  Check(ui.ActiveTextInput()->selection == TextSelection{12, 10}, "Column alignment keeps the backward selection");
   Check(controller->Execute(InsertTableRow{}) &&
             controller->Execute(InsertTableColumn{TableInsertSide::Before}),
         "Insert a row and column");
   const auto expanded = controller->Document();
   Check(expanded.Blocks()[0].Data().children.size() == 3 && cell(expanded, 1, 2).text == "你好Y" &&
-            cell(expanded, 1, 1).text.empty() && cell(expanded, 2, 2).text.empty(),
+            cell(expanded, 1, 1).text.empty() && cell(expanded, 2, 2).text.empty() &&
+            expanded.Blocks()[0].Data().table_column_alignments ==
+                std::vector{Alignment::Default, Alignment::Default, Alignment::Right, Alignment::Default,
+                            Alignment::Default},
         "Grid expansion preserves the active cell and creates empty cells");
   Check(controller->Execute(DeleteTableColumn{}) && cell(controller->Document(), 1, 2).text == "Z" &&
+            controller->Document().Blocks()[0].Data().table_column_alignments.empty() &&
             controller->Execute(Undo{}) && controller->Document() == expanded,
         "Column deletion and undo restore the selected cell");
   Check(controller->Execute(DeleteTableRow{}) && cell(controller->Document(), 1, 2).text.empty() &&
@@ -1382,6 +1405,78 @@ void TableEditing() {
   Check(controller->Document().Blocks().size() == 2 && controller->Execute(Undo{}) &&
             controller->Document() == broken,
         "Exit creates a paragraph and undo restores the grid");
+}
+
+void ThematicBreakEditing() {
+  const Application app(App, {.show_debug_overlay = false});
+  UiTest ui(app, {.viewport = {360.0F, 420.0F}});
+  const auto select = [&](TextOffset anchor, TextOffset active) {
+    Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{anchor, active}}});
+  };
+  const auto& markdown = MarkdownCodec();
+  const auto original = markdown.Import("> [**甲🙂乙**](https://example.org)\n\nTail").document;
+  Check(original.has_value(), "Quote fixture imports");
+  controller->ReplaceDocument(*original);
+  ui.Pump();
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  select(3, 3);
+  Check(controller->Execute(InsertThematicBreak{}), "Insert a thematic break in a quote");
+  const auto split = controller->Document();
+  const auto& children = split.Blocks().front().Data().children;
+  Check(children.size() == 3 && children[0].Data().text == "甲🙂" &&
+            children[0].Data().marks == std::vector<MarkRange>{{{0, 3}, Mark::Bold}} &&
+            children[0].Data().links.front().range == TextRange{0, 3} &&
+            children[1].Data().kind == BlockKind::ThematicBreak && children[2].Data().text == "乙" &&
+            children[2].Data().marks == std::vector<MarkRange>{{{0, 1}, Mark::Bold}} &&
+            children[2].Data().links.front().range == TextRange{0, 1},
+        "A thematic break splits the paragraph in its quote and preserves marks and links");
+  ui.Pump();
+  Check(ui.ActiveTextInput()->selection == TextSelection{6, 6}, "The caret moves to the text after the break");
+  CheckDocumentIndex(split);
+  select(5, 4);
+  ui.PressKey(Key::Backspace);
+  const auto without_break = controller->Document();
+  Check(without_break.Blocks().front().Data().children.size() == 2 &&
+            without_break.Blocks().back().Data().text == "Tail" && controller->Execute(Undo{}) &&
+            controller->Document() == split, "Deleting a nested break keeps its siblings and can be undone");
+  ui.Pump();
+  Check(ui.ActiveTextInput()->selection == TextSelection{5, 4} && controller->Execute(Redo{}) &&
+            controller->Document() == without_break && controller->Execute(Undo{}) && controller->Execute(Undo{}) &&
+            controller->Document() == original, "Undo and redo restore the split and directed selection");
+
+  const auto end = markdown.Import("7. End").document;
+  controller->ReplaceDocument(*end);
+  ui.Pump();
+  select(3, 3);
+  Check(controller->Execute(InsertThematicBreak{}), "Insert a break at the end of a list item");
+  const auto with_break = controller->Document();
+  ui.Pump();
+  Check(ui.ActiveTextInput()->selection.active == 5 && markdown.Export(with_break).text,
+        "The trailing boundary is editable without adding an empty paragraph");
+  Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "ni"}});
+  Check(ui.ActiveTextInput()->composition == TextRange{6, 8} && controller->Document() == with_break,
+        "Preedit after a thematic break accounts for the new paragraph separator");
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "你好"}});
+  const auto continued = controller->Document();
+  Check(continued.Blocks().front().Data().children.front().Data().children.back().Data().text == "你好" &&
+            controller->Execute(Undo{}) && controller->Document() == with_break,
+        "Typing after the break stays in the same list item and undoes in one step");
+  ui.Pump();
+  select(4, 5);
+  ui.PressKey(Key::Delete);
+  Check(controller->Document() == end && ui.ActiveTextInput()->selection.active == 3,
+        "Deleting a final nested break removes its preceding separator");
+
+  const auto nested = markdown.Import("7. Keep\n   ***\n8. ***\n   Tail").document;
+  Check(nested.has_value(), "Nested break range fixture imports");
+  controller->ReplaceDocument(*nested);
+  ui.Pump();
+  select(5, 8);
+  ui.PressKey(Key::Delete);
+  const auto remaining = controller->Document();
+  Check(remaining == markdown.Import("7. Keep\n8. Tail").document,
+        "Deleting between two nested breaks preserves the surrounding list items");
+  CheckDocumentIndex(remaining);
 }
 
 void AppearanceChanges() {
@@ -2183,6 +2278,8 @@ int main() {
     IncrementalBlockDecorations();
     controller.reset();
     TableEditing();
+    controller.reset();
+    ThematicBreakEditing();
     controller.reset();
     AppearanceChanges();
     controller.reset();

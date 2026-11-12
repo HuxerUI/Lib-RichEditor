@@ -20,7 +20,11 @@ inline bool IsTextBlock(BlockKind kind) {
 }
 
 inline bool IsAtomicBlock(BlockKind kind) {
-  return kind == BlockKind::Image || kind == BlockKind::Custom;
+  return kind == BlockKind::ThematicBreak || kind == BlockKind::Image || kind == BlockKind::Custom;
+}
+
+inline bool RequiresDocumentRoot(BlockKind kind) {
+  return kind == BlockKind::Table || kind == BlockKind::Image || kind == BlockKind::Custom;
 }
 
 inline bool IsLeaf(BlockKind kind) {
@@ -34,6 +38,15 @@ inline bool IsLeadingPath(std::span<const std::size_t> path) {
 
 inline bool ValidTableSize(std::size_t rows, std::size_t columns) {
   return columns != 0 && rows != 0 && rows <= max_table_cells / columns;
+}
+
+inline bool ValidTableColumnAlignment(TableColumnAlignment alignment) {
+  return alignment >= TableColumnAlignment::Default && alignment <= TableColumnAlignment::Right;
+}
+
+/// Reads an alignment from a validated table, including tables that omit the all-default array.
+inline TableColumnAlignment ColumnAlignment(const BlockData& table, std::size_t column) {
+  return table.table_column_alignments.empty() ? TableColumnAlignment::Default : table.table_column_alignments[column];
 }
 
 inline bool Has(Mark marks, Mark mark) {

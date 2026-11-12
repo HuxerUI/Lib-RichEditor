@@ -430,6 +430,17 @@ bool NeedsAttachmentWrite(const FileReference& target, const std::vector<FileRef
   return !std::ranges::includes(previous, current);
 }
 
+std::string_view DocumentSource::Text() const {
+  std::string_view text;
+  if (!bytes.empty()) {
+    text = {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+  }
+  if (text.starts_with("\xef\xbb\xbf")) {
+    text.remove_prefix(3);
+  }
+  return text;
+}
+
 Task<IoResult<DocumentSource>> ReadDocument(FileReference source) {
   const auto format = FormatOf(source.Name());
   if (!format) {
@@ -439,25 +450,13 @@ Task<IoResult<DocumentSource>> ReadDocument(FileReference source) {
   if (!contents.Succeeded()) {
     co_return IoResult<DocumentSource>::Failure(contents.Error());
   }
-  const auto& bytes = contents.Value();
-  std::string_view text;
-  if (!bytes.empty()) {
-    text = {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
-  }
-  if (text.starts_with("\xef\xbb\xbf")) {
-    text.remove_prefix(3);
-  }
+  DocumentSource document{*format, std::move(contents.Value())};
   try {
-    (void)AttributedText(std::string(text));
+    (void)AttributedText(std::string(document.Text()));
   } catch (const std::invalid_argument&) {
     co_return IoResult<DocumentSource>::Failure({IoErrorCode::InvalidEncoding, "The document is not valid UTF-8"});
   }
-  auto imported = Codec(*format).Import(text);
-  if (!imported.document) {
-    auto message = imported.issues.empty() ? std::string("Could not open the document") : imported.issues.front().message;
-    co_return IoResult<DocumentSource>::Failure({IoErrorCode::InvalidEncoding, std::move(message)});
-  }
-  co_return IoResult<DocumentSource>::Success({std::move(*imported.document), *format, std::move(contents.Value())});
+  co_return IoResult<DocumentSource>::Success(std::move(document));
 }
 
 Task<IoResult<FileReference>> FindChild(FileReference directory, std::string name, FileType type) {

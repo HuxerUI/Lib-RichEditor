@@ -43,7 +43,7 @@ $$
 $$
 
 | Topic | Note | Status | Next |
-| --- | --- | --- | --- |
+| --- | :--- | :---: | ---: |
 | **Talk** | 中文输入 | Draft | Add a quote |
 | Source | [Reading list](https://github.com/HuxerUI) | Ready | |
 
@@ -74,6 +74,8 @@ notes = [("Trail", 3)]
 for title in ready(notes):
     print(title)
 ~~~
+
+***
 
 Built with [HuxerUI](https://github.com/HuxerUI).
 )markdown";
@@ -586,6 +588,8 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const bool in_code = editor.GetCommandState(SetBlockKind{BlockKind::CodeBlock}).checked == CheckState::On;
   const ContinueInParagraph continue_in_paragraph;
   const EditorCommand insert_table = InsertTable{};
+  const EditorCommand insert_thematic_break = InsertThematicBreak{};
+  const bool can_insert_thematic_break = editor.GetCommandState(insert_thematic_break).enabled;
   const auto run = [editor, focus](const EditorCommand& command) {
     if (editor.Execute(command)) {
       focus.RequestFocus();
@@ -665,7 +669,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const bool in_numbered_list = ordered_state.checked == CheckState::On;
   const auto list_start = editor.OrderedListStart();
   const auto list_label = in_numbered_list ? l10n::list_numbering : l10n::numbered_list;
-  const auto table_entries = [command_item, continue_in_paragraph] {
+  const auto table_entries = [command_item, continue_in_paragraph, header_state] {
     return std::vector<MenuEntry>{
         command_item(l10n::insert_row_above, InsertTableRow{TableInsertSide::Before}),
         command_item(l10n::insert_row_below, InsertTableRow{}),
@@ -674,6 +678,12 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         command_item(l10n::insert_column_before, InsertTableColumn{TableInsertSide::Before}),
         command_item(l10n::insert_column_after, InsertTableColumn{}),
         command_item(l10n::delete_column, DeleteTableColumn{}),
+        MenuItem(l10n::column_alignment, {
+            command_item(l10n::align_default, SetTableColumnAlignment{TableColumnAlignment::Default}),
+            command_item(l10n::align_left, SetTableColumnAlignment{TableColumnAlignment::Left}),
+            command_item(l10n::align_center, SetTableColumnAlignment{TableColumnAlignment::Center}),
+            command_item(l10n::align_right, SetTableColumnAlignment{TableColumnAlignment::Right}),
+        }).Enabled(header_state.enabled),
         MenuSection{},
         command_item(l10n::header_row, ToggleTableHeader{}),
         command_item(l10n::continue_below_table, continue_in_paragraph),
@@ -747,11 +757,12 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     }));
     items.emplace_back(MenuItem(l10n::insert, {
         command_item(l10n::insert_table, insert_table),
+        command_item(l10n::insert_thematic_break, insert_thematic_break),
         MenuItem(l10n::insert_image, [pick_image] { pick_image(false, false); }).Enabled(can_insert_image),
         MenuItem(l10n::insert_inline_image, [pick_image] { pick_image(false, true); }).Enabled(can_insert_inline_image),
         MenuItem(l10n::insert_inline_formula_menu, insert_inline_formula).Enabled(can_insert_inline_formula),
         MenuItem(l10n::insert_display_formula_menu, insert_formula).Enabled(can_insert_formula),
-    }).Enabled(can_insert_table || can_insert_image || can_insert_inline_image ||
+    }).Enabled(can_insert_table || can_insert_thematic_break || can_insert_image || can_insert_inline_image ||
                can_insert_formula || can_insert_inline_formula));
     items.emplace_back(MenuItem(l10n::lists_and_quote, {
         command_item(l10n::bulleted_list, ToggleList{ListKind::Unordered}),

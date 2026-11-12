@@ -38,7 +38,8 @@ bool ExitBlockAtCaret(Draft& draft, bool empty_only) {
   auto& edit = draft.edit;
   const auto leaf = DocumentAccess::Get(edit.document).index.AtOffset(range.start);
   const auto& data = leaf.block.Data();
-  if (range.start != leaf.start || (empty_only && (!data.text.empty() || data.kind == BlockKind::CodeBlock))) {
+  if (range.start != leaf.start || IsAtomicBlock(data.kind) ||
+      (empty_only && (!data.text.empty() || data.kind == BlockKind::CodeBlock))) {
     return false;
   }
   auto document = data.kind == BlockKind::Heading
@@ -578,6 +579,9 @@ CommandState EditorSession::CommandStatus(const EditorCommand& command) const {
     state.enabled = state.enabled && !draft_.composition;
     return state;
   }
+  if (std::holds_alternative<InsertThematicBreak>(command)) {
+    return {!draft_.composition && CanInsertThematicBreak(document, range)};
+  }
   if (IsImageCommand(command)) {
     return draft_.composition ? CommandState{} : ImageStatus(document, range, command);
   }
@@ -663,6 +667,10 @@ bool EditorSession::Execute(const EditorCommand& command) {
       }
     } else if (IsImageCommand(command)) {
       next.edit.document = ChangeImage(next.edit.document, next.edit.selection, command, next.changes);
+      next.edit.pending.reset();
+    } else if (std::holds_alternative<InsertThematicBreak>(command)) {
+      next.edit.document = InsertAtomicBlock(next.edit.document, next.edit.selection,
+                                            {.kind = BlockKind::ThematicBreak}, next.changes);
       next.edit.pending.reset();
     } else if (const auto* insert = std::get_if<InsertCustomBlock>(&command)) {
       next.edit.document = InsertAtomicBlock(next.edit.document, next.edit.selection,

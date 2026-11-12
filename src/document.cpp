@@ -48,6 +48,14 @@ AttributedText BlockBody(const BlockData& data) {
   return IsAtomicBlock(data.kind) ? AttributedText(std::string(object_replacement)) : AttributedText(data.text);
 }
 
+void NormalizeTableColumnAlignments(BlockData& data) {
+  auto& alignments = data.table_column_alignments;
+  if (!alignments.empty() &&
+      std::ranges::all_of(alignments, [](auto value) { return value == TableColumnAlignment::Default; })) {
+    alignments.clear();
+  }
+}
+
 void ValidateNesting(const BlockData& data, BlockKind parent, bool root) {
   const bool leaf = IsLeaf(data.kind);
   if ((!root && parent == BlockKind::List) != (data.kind == BlockKind::ListItem) ||
@@ -55,7 +63,7 @@ void ValidateNesting(const BlockData& data, BlockKind parent, bool root) {
       (!root && parent == BlockKind::TableRow) != (data.kind == BlockKind::TableCell) ||
       (parent == BlockKind::TableCell && data.kind != BlockKind::Paragraph) ||
       (data.kind == BlockKind::TableCell && data.children.size() != 1) ||
-      ((data.kind == BlockKind::Table || IsAtomicBlock(data.kind)) && !root) ||
+      (RequiresDocumentRoot(data.kind) && !root) ||
       (leaf && !data.children.empty()) || (!leaf && data.children.empty())) {
     throw std::invalid_argument("Invalid block nesting");
   }
@@ -67,6 +75,9 @@ void ValidateNesting(const BlockData& data, BlockKind parent, bool root) {
         })) {
       throw std::invalid_argument("Invalid table dimensions");
     }
+    if (!data.table_column_alignments.empty() && data.table_column_alignments.size() != columns) {
+      throw std::invalid_argument("Table column alignments must match the column count");
+    }
   }
 }
 
@@ -77,7 +88,8 @@ void ValidateBlock(const BlockData& data, const AttributedText& body) {
       (data.kind != BlockKind::List && (data.ordered || data.list_start != 1 || !data.tight)) ||
       (!data.ordered && data.list_start != 1) ||
       (data.kind != BlockKind::CodeBlock && !data.fence_info.empty()) ||
-      (data.kind != BlockKind::Table && data.table_has_header) ||
+      (data.kind != BlockKind::Table && (data.table_has_header || !data.table_column_alignments.empty())) ||
+      !std::ranges::all_of(data.table_column_alignments, ValidTableColumnAlignment) ||
       (data.kind == BlockKind::Image) != data.image.has_value() ||
       (data.image && !ValidImageData(*data.image)) ||
       (data.kind == BlockKind::Custom) != data.custom.has_value() ||
@@ -226,6 +238,7 @@ Block DocumentAccess::WithData(const Block& block, BlockData data) {
       data.text == old.data.text;
   const auto body = same_projection ? old.body : BlockBody(data);
   PrepareInlineObjects(data, body, false);
+  NormalizeTableColumnAlignments(data);
   Block changed = block;
   changed.storage_ = std::make_shared<const Block::Storage>(Block::Storage{std::move(data), body});
   return changed;
@@ -240,6 +253,7 @@ void DocumentAccess::AssignId(Block& block, BlockId& last_id, std::vector<BlockI
   const auto body = BlockBody(data);
   ValidateBlock(data, body);
   PrepareInlineObjects(data, body, fresh);
+  NormalizeTableColumnAlignments(data);
   auto marks = std::move(data.marks);
   data.marks.clear();
   for (const auto& mark : marks) {
@@ -337,7 +351,7 @@ static std::string Slice(const RichDocument& document, TextRange range, bool pla
     const auto to = i == last ? range.end - leaf->start : body.Length();
     const auto& data = leaf->block.Data();
     if (plain && from == 0 && to == 1 && IsAtomicBlock(data.kind)) {
-      result += data.image ? data.image->alt_text : data.custom->fallback_text;
+      result += data.image ? data.image->alt_text : data.custom ? data.custom->fallback_text : "---";
     } else if (plain && !data.inline_objects.empty()) {
       auto start = from;
       for (const auto& object : data.inline_objects) {

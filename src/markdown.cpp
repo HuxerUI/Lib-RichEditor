@@ -133,6 +133,102 @@ struct InlineBuilder {
   }
 };
 
+std::string_view TakeLine(std::string_view& source) {
+  const auto line = source.substr(0, source.find_first_of("\r\n"));
+  source.remove_prefix(line.size());
+  if (source.starts_with('\r')) {
+    source.remove_prefix(1);
+  }
+  if (source.starts_with('\n')) {
+    source.remove_prefix(1);
+  }
+  return line;
+}
+
+bool FrontMatterFence(std::string_view line) {
+  return line.starts_with("---") && line.find_first_not_of(" \t", 3) == line.npos;
+}
+
+/// Returns the offset after a single-line quoted key, or npos if the quote is unclosed.
+std::size_t QuotedKeyEnd(std::string_view line) {
+  const auto quote = line.front();
+  for (std::size_t i = 1; i < line.size(); ++i) {
+    if (quote == '"' && line[i] == '\\') {
+      ++i;
+    } else if (line[i] == quote) {
+      if (quote == '\'' && line.substr(i + 1).starts_with('\'')) {
+        ++i;
+      } else {
+        return i + 1;
+      }
+    }
+  }
+  return line.npos;
+}
+
+bool FrontMatterKey(std::string_view line) {
+  if (line.empty()) {
+    return false;
+  }
+  std::size_t end;
+  if (line.starts_with('"') || line.starts_with('\'')) {
+    end = QuotedKeyEnd(line);
+  } else {
+    const auto first_delimiter = std::ranges::find_if_not(line, [](unsigned char byte) {
+      constexpr std::string_view ascii_key = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-";
+      // The codec validates the UTF-8 prefix before reporting it as front matter.
+      return byte >= 0x80 || ascii_key.find(static_cast<char>(byte)) != ascii_key.npos;
+    });
+    end = static_cast<std::size_t>(first_delimiter - line.begin());
+  }
+  if (end == 0 || end == line.npos) {
+    return false;
+  }
+  const auto colon = line.find_first_not_of(" \t", end);
+  return colon != line.npos && line[colon] == ':' &&
+      (colon + 1 == line.size() || line[colon + 1] == ' ' || line[colon + 1] == '\t');
+}
+
+/// Recognizes a leading fenced mapping with simple or quoted keys, indented values, and block sequences.
+std::optional<std::string_view> FrontMatterBody(std::string_view source) {
+  if (source.starts_with("\xef\xbb\xbf")) {
+    source.remove_prefix(3);
+  }
+  if (!FrontMatterFence(TakeLine(source))) {
+    return std::nullopt;
+  }
+  bool has_key = false;
+  while (!source.empty()) {
+    const auto line = TakeLine(source);
+    if (FrontMatterFence(line)) {
+      return has_key ? std::optional(source) : std::nullopt;
+    }
+    if (FrontMatterKey(line)) {
+      has_key = true;
+      continue;
+    }
+    const auto start = line.find_first_not_of(" \t");
+    if (start == line.npos || line[start] == '#') {
+      continue;
+    }
+    const bool sequence_item = line.starts_with("- ") || line.starts_with("-\t");
+    if (!has_key || (start == 0 && !sequence_item)) {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+TableColumnAlignment ConvertAlignment(markdown::CellAlignment alignment) {
+  switch (alignment) {
+  case markdown::CellAlignment::Default: return TableColumnAlignment::Default;
+  case markdown::CellAlignment::Left: return TableColumnAlignment::Left;
+  case markdown::CellAlignment::Center: return TableColumnAlignment::Center;
+  case markdown::CellAlignment::Right: return TableColumnAlignment::Right;
+  }
+  return TableColumnAlignment::Default;
+}
+
 class MarkdownImport {
 public:
   explicit MarkdownImport(const MarkdownOptions& options) : options_(options) {}
@@ -145,6 +241,13 @@ public:
     options.math = FindSyntax(options_, &MarkdownExtension::block, MarkdownObjectSyntax::DoubleDollarBlock()) ||
         FindSyntax(options_, &MarkdownExtension::inline_object, MarkdownObjectSyntax::DollarSpan());
     try {
+      if (source.size() <= options.max_input_bytes) {
+        if (const auto body = FrontMatterBody(source)) {
+          (void)AttributedText(std::string(source.substr(0, source.size() - body->size())));
+          Report("markdown.front_matter", "YAML front matter is unsupported. AllowLoss omits it.");
+          source = *body;
+        }
+      }
       const auto parsed = markdown::ParseMarkdown(source, options);
       auto blocks = ConvertChildren(parsed.Root());
       if (issues_.empty() || policy == LossPolicy::AllowLoss) {
@@ -294,6 +397,10 @@ private:
 
     table.kind = BlockKind::Table;
     table.table_has_header = true;
+    table.table_column_alignments.reserve(columns);
+    for (const auto& cell : header.children) {
+      table.table_column_alignments.push_back(ConvertAlignment(cell.alignment));
+    }
     for (std::size_t s = 0; s < node.children.size(); ++s) {
       const auto& section = node.children[s];
       path_.push_back(s);
@@ -304,9 +411,6 @@ private:
         for (std::size_t c = 0; c < source.children.size(); ++c) {
           const auto& cell = source.children[c];
           path_.push_back(c);
-          if (section.kind == NodeKind::TableHead && cell.alignment != markdown::CellAlignment::Default) {
-            Report("markdown.table_alignment", "Column alignment omitted");
-          }
           BlockData paragraph;
           InlineBuilder builder{paragraph};
           for (const auto& child : cell.children) {
@@ -411,8 +515,7 @@ private:
       }
       break;
     case NodeKind::ThematicBreak:
-      Report("markdown.rule", "Thematic break converted to literal text");
-      block.text = "---";
+      block.kind = BlockKind::ThematicBreak;
       break;
     case NodeKind::Table:
       block = ConvertTable(node);
@@ -864,6 +967,7 @@ private:
   }
 
   void WriteTable(std::string& out, const BlockData& table) const {
+    constexpr std::array delimiters{" --- |", " :--- |", " :---: |", " ---: |"};
     for (std::size_t i = 0; i < table.children.size(); ++i) {
       if (i != 0) {
         out += '\n';
@@ -878,7 +982,7 @@ private:
       if (i == 0) {
         out += "\n|";
         for (std::size_t c = 0; c < cells.size(); ++c) {
-          out += " --- |";
+          out += delimiters[static_cast<std::size_t>(detail::ColumnAlignment(table, c))];
         }
       }
     }
@@ -906,6 +1010,9 @@ private:
       }
       case BlockKind::Custom:
         out += EncodeObject(options_, &MarkdownExtension::block, *data.custom).value();
+        break;
+      case BlockKind::ThematicBreak:
+        out += "***";
         break;
       case BlockKind::Paragraph:
         out += TextWithLinks(blocks[i]);

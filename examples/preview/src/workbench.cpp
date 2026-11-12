@@ -81,13 +81,12 @@ struct DocumentTab {
   bool opened_with_attachments;
 
   DocumentTab(DocumentId id, std::string name, std::optional<File> working_directory, RichDocument initial,
-              std::shared_ptr<const SavedDocument> original)
+              std::shared_ptr<const SavedDocument> original, std::optional<FileReference> attachment_directory)
       : id(id), draft_name(std::move(name)), working_directory(std::move(working_directory)),
         initial(std::move(initial)), saved(original),
         attachments(AttachmentLocation(this->working_directory,
-            original && original->target->directory ? std::vector{*original->target->directory}
-                                                    : std::vector<FileReference>{})),
-        opened_with_attachments(original && HasLocalAttachments(this->initial)) {}
+            attachment_directory ? std::vector{std::move(*attachment_directory)} : std::vector<FileReference>{})),
+        opened_with_attachments(HasLocalAttachments(this->initial)) {}
 
   std::string Name() const {
     const auto& original = saved.Get();
@@ -169,6 +168,7 @@ struct Workspace {
   State<bool> drawer_open{false};
   State<PaneSizes> pane_sizes{PaneSizes{}};
   State<bool> picking{false};
+  State<bool> showing_open_issues{false};
   State<std::shared_ptr<CloseRequest>> closing{std::shared_ptr<CloseRequest>{}};
   State<std::string> status{std::string{}};
   bool allow_close = false;
@@ -257,6 +257,15 @@ struct Choice {
   ChoiceTone tone = ChoiceTone::Cancel;
 };
 
+struct OpenFailure {
+  Target target;
+  std::string message;
+  std::vector<ConversionIssue> issues;
+  std::optional<RichDocument> lossy_copy;
+};
+
+using OpenResult = std::variant<std::shared_ptr<Workspace>, OpenFailure>;
+
 std::string IssueMessage(const std::vector<ConversionIssue>& issues) {
   if (issues.empty()) {
     return "The document could not be converted.";
@@ -283,7 +292,9 @@ public:
   State<bool> sidebar_open;
   bool modal_sidebar;
 
-  bool Available() const { return !workspace->picking.Get() && !workspace->closing.Get(); }
+  bool Available() const {
+    return !workspace->picking.Get() && !workspace->closing.Get() && !workspace->showing_open_issues.Get();
+  }
   bool CanExecute(FolioCommand command) const;
   void Execute(FolioCommand command, bool keyboard = false) const;
   void NewDocument(bool sample = false) const;
@@ -306,9 +317,11 @@ private:
   void Status(const Tab& tab, StringVariant message) const;
   void Launch(bool uses_picker, std::function<Task<void>()> action, std::function<void(std::string)> failed = {}) const;
   void AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved = {},
-              Entry source_folder = {}) const;
+              Entry source_folder = {}, std::optional<FileReference> attachment_directory = {}) const;
   std::shared_ptr<Workspace> ActivateExisting(const Target& target, const Entry& source_folder) const;
-  Task<std::shared_ptr<Workspace>> OpenTarget(Target target, Entry source_folder = {}) const;
+  Task<OpenResult> OpenTarget(Target target, const Entry& source_folder) const;
+  Task<void> OpenTargets(std::vector<Target> targets, Entry source_folder = {}) const;
+  void ShowOpenFailures(std::vector<OpenFailure> failures) const;
   Task<Entry> AddFolder(FileReference directory) const;
   void LoadFolder(Entry entry) const;
   void PromptNewChild(Entry folder, ChildKind kind, std::string name = {}, std::string message = {}) const;
@@ -489,15 +502,18 @@ void WorkbenchActions::Launch(bool uses_picker, std::function<Task<void>()> acti
 }
 
 void WorkbenchActions::AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved,
-                              Entry source_folder) const {
+                              Entry source_folder, std::optional<FileReference> attachment_directory) const {
   std::optional<File> directory;
   try {
     directory = application.Directories().temporary_directory.Child(UniqueName("folio-document-"));
   } catch (const std::logic_error&) {
     // A draft can still be edited on a host without application storage.
   }
+  if (saved) {
+    attachment_directory = saved->target->directory;
+  }
   auto tab = std::make_shared<DocumentTab>(++folio->next_document, std::move(name), std::move(directory),
-                                           std::move(snapshot), std::move(saved));
+                                           std::move(snapshot), std::move(saved), std::move(attachment_directory));
   tab->source_folder = std::move(source_folder);
   workspace->tabs.Update([&](auto& open) { open.push_back(tab); });
   Select(tab);
@@ -576,7 +592,7 @@ std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& targ
   return {};
 }
 
-Task<std::shared_ptr<Workspace>> WorkbenchActions::OpenTarget(Target target, Entry source_folder) const {
+Task<OpenResult> WorkbenchActions::OpenTarget(Target target, const Entry& source_folder) const {
   if (!target->identity) {
     target->identity = co_await LocalIdentity(target->reference);
   }
@@ -585,24 +601,60 @@ Task<std::shared_ptr<Workspace>> WorkbenchActions::OpenTarget(Target target, Ent
   }
   auto read = co_await ReadDocument(target->reference);
   if (!read.Succeeded()) {
-    Status({}, target->reference.Name() + " — " + read.Error().message);
-    co_return nullptr;
+    co_return OpenFailure{target, read.Error().message};
   }
   if (auto owner = ActivateExisting(target, source_folder)) {
     co_return owner;
   }
   auto source = std::move(read.Value());
+  const auto& codec = Codec(source.format);
+  auto imported = codec.Import(source.Text());
+  if (!imported.document) {
+    OpenFailure failure{target, {}, std::move(imported.issues)};
+    if (source.format == DocumentFormat::Markdown) {
+      // The offered copy must come from the same bytes that produced the diagnostics.
+      auto lossy = codec.Import(source.Text(), LossPolicy::AllowLoss);
+      if (lossy.document) {
+        failure.lossy_copy = std::move(lossy.document);
+        failure.issues = std::move(lossy.issues);
+      }
+    }
+    co_return failure;
+  }
   auto original = std::make_shared<const SavedDocument>(
-      SavedDocument{target, source.format, source.document, std::move(source.bytes)});
-  AddTab(target->reference.Name(), std::move(source.document), std::move(original), std::move(source_folder));
+      SavedDocument{target, source.format, *imported.document, std::move(source.bytes)});
+  AddTab(target->reference.Name(), std::move(*imported.document), std::move(original), source_folder);
   co_return workspace;
+}
+
+Task<void> WorkbenchActions::OpenTargets(std::vector<Target> targets, Entry source_folder) const {
+  std::shared_ptr<Workspace> last_owner;
+  std::vector<OpenFailure> failures;
+  for (const auto& target : targets) {
+    try {
+      auto result = co_await OpenTarget(target, source_folder);
+      if (auto* owner = std::get_if<std::shared_ptr<Workspace>>(&result)) {
+        last_owner = std::move(*owner);
+      } else {
+        failures.push_back(std::get<OpenFailure>(std::move(result)));
+      }
+    } catch (const std::exception& error) {
+      failures.push_back({target, error.what()});
+    }
+  }
+  if (!failures.empty()) {
+    window.Activate();
+    ShowOpenFailures(std::move(failures));
+  } else if (last_owner && last_owner->window && last_owner->window->IsOpen()) {
+    last_owner->window->Activate();
+  }
 }
 
 void WorkbenchActions::OpenKnown(Target target, Entry source_folder) const {
   if (Available()) {
     Status({}, {});
     Launch(true, [self = *this, target = std::move(target), source_folder = std::move(source_folder)]() -> Task<void> {
-      co_await self.OpenTarget(target, source_folder);
+      co_await self.OpenTargets(std::vector{target}, source_folder);
     });
   }
 }
@@ -614,22 +666,8 @@ void WorkbenchActions::OpenActivated() const {
   auto files = folio->pending_files.Get();
   folio->pending_files = std::vector<Target>{};
   Status({}, {});
-  Launch(true, [self = *this, files = std::move(files)]() -> Task<void> {
-    std::shared_ptr<Workspace> last_owner;
-    for (const auto& file : files) {
-      try {
-        if (auto owner = co_await self.OpenTarget(file)) {
-          last_owner = std::move(owner);
-        }
-      } catch (const std::exception& error) {
-        self.Status({}, file->reference.Name() + " — " + error.what());
-      }
-    }
-    if (last_owner && last_owner->window && last_owner->window->IsOpen()) {
-      last_owner->window->Activate();
-    } else {
-      self.window.Activate();
-    }
+  Launch(true, [self = *this, files = std::move(files)]() mutable -> Task<void> {
+    co_await self.OpenTargets(std::move(files));
   });
 }
 
@@ -645,7 +683,7 @@ void WorkbenchActions::PickOpen(OpenKind kind) const {
           .content_types = {"application/json", "text/markdown", "text/plain"},
       });
       if (file) {
-        co_await self.OpenTarget(std::make_shared<DocumentFile>(DocumentFile{*file, {}, {}}));
+        co_await self.OpenTargets(std::vector{std::make_shared<DocumentFile>(DocumentFile{*file, {}, {}})});
       }
       co_return;
     }
@@ -659,7 +697,8 @@ void WorkbenchActions::PickOpen(OpenKind kind) const {
     }
     auto file = co_await FindPackageDocument(*folder);
     if (file.Succeeded()) {
-      co_await self.OpenTarget(std::make_shared<DocumentFile>(DocumentFile{std::move(file.Value()), folder, {}}));
+      co_await self.OpenTargets(std::vector{std::make_shared<DocumentFile>(
+          DocumentFile{std::move(file.Value()), folder, {}})});
     } else {
       self.Status({}, file.Error().message);
     }
@@ -924,6 +963,57 @@ void WorkbenchActions::ShowChoices(StringVariant title, StringVariant message, s
   }}, {.dismiss_on_outside_press = false, .dismiss_on_cancel = false});
 }
 
+void WorkbenchActions::ShowOpenFailures(std::vector<OpenFailure> failures) const {
+  std::string message;
+  for (const auto& failure : failures) {
+    if (!message.empty()) {
+      message += "\n\n";
+    }
+    message += failure.target->reference.Name();
+    if (failure.issues.empty()) {
+      message += '\n';
+      message += failure.message.empty() ? resources->GetString(l10n::document_conversion_failed) : failure.message;
+    }
+    for (const auto& issue : failure.issues) {
+      message += "\n• " + issue.message;
+      if (!issue.block_path.empty()) {
+        std::string path;
+        for (const auto index : issue.block_path) {
+          if (!path.empty()) {
+            path += '.';
+          }
+          path += std::to_string(index + 1);
+        }
+        message += " (" + resources->GetString(StringVariant::Format(l10n::source_block, path)) + ")";
+      }
+    }
+    if (failure.lossy_copy && failures.size() > 1) {
+      message += "\n" + resources->GetString(l10n::lossy_copy_available);
+    }
+  }
+  const auto finish = [self = *this] {
+    self.workspace->showing_open_issues = false;
+    self.ContinueClose();
+  };
+  std::vector<Choice> choices{{l10n::cancel, finish}};
+  std::erase_if(failures, [](const OpenFailure& failure) { return !failure.lossy_copy; });
+  if (!failures.empty()) {
+    StringVariant label = l10n::open_lossy_copy;
+    if (failures.size() > 1) {
+      label = StringVariant::Format(l10n::open_lossy_copies, failures.size());
+    }
+    choices.push_back({std::move(label), [self = *this, finish, copies = std::move(failures)] {
+      for (const auto& copy : copies) {
+        self.AddTab(CopyName(copy.target->reference.Name(), DocumentFormat::Markdown),
+                    *copy.lossy_copy, {}, {}, copy.target->directory);
+      }
+      finish();
+    }, ChoiceTone::Primary});
+  }
+  ShowChoices(l10n::open_document_failed, std::move(message), std::move(choices));
+  workspace->showing_open_issues = true;
+}
+
 bool ValidChildName(std::string_view name) {
   return !name.empty() && !name.ends_with('.') && !name.ends_with(' ') &&
       name.find_first_of("\\/:*?\"<>|") == name.npos &&
@@ -1062,8 +1152,8 @@ void WorkbenchActions::CreateChild(Entry folder, ChildKind kind, std::string nam
     folder->expanded = true;
     self.LoadFolder(folder);
     if (kind == ChildKind::File) {
-      co_await self.OpenTarget(std::make_shared<DocumentFile>(
-          DocumentFile{std::move(created.Value()), directory, {}}), folder);
+      co_await self.OpenTargets(std::vector{std::make_shared<DocumentFile>(
+          DocumentFile{std::move(created.Value()), directory, {}})}, folder);
     }
   });
 }
@@ -1384,7 +1474,7 @@ bool WorkbenchActions::OnCloseRequest() const {
 
 void WorkbenchActions::ContinueClose() const {
   const auto request = workspace->closing.Get();
-  if (!request || !request->waiting || workspace->picking.Get()) {
+  if (!request || !request->waiting || workspace->picking.Get() || workspace->showing_open_issues.Get()) {
     return;
   }
   const auto tabs = request->tab ? std::vector<Tab>{request->tab} : workspace->tabs.Get();

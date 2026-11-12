@@ -9,9 +9,11 @@ namespace folio {
 enum class DocumentFormat { Json, Markdown };
 
 struct DocumentSource {
-  huxerui::richeditor::RichDocument document;
   DocumentFormat format;
   huxerui::Bytes bytes;
+
+  /// Validated UTF-8 view for the codec, excluding the optional byte order mark.
+  std::string_view Text() const;
 };
 
 struct DocumentCopy {

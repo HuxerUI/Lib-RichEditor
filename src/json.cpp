@@ -13,8 +13,12 @@ namespace {
 
 using Json = nlohmann::json;
 
-constexpr std::array block_names{"paragraph", "heading", "code_block", "quote", "list", "list_item",
-                                 "table", "table_row", "table_cell", "image", "custom"};
+constexpr std::array block_names{
+    "paragraph", "heading", "code_block",
+    "quote", "list", "list_item", "table", "table_row", "table_cell",
+    "thematic_break", "image", "custom",
+};
+constexpr std::array column_alignment_names{"default", "left", "center", "right"};
 constexpr std::array mark_names{
     std::pair{Mark::Bold, "bold"}, std::pair{Mark::Italic, "italic"}, std::pair{Mark::Strike, "strike"},
     std::pair{Mark::Code, "code"}, std::pair{Mark::Underline, "underline"}, std::pair{Mark::Highlight, "highlight"},
@@ -93,6 +97,9 @@ Block DecodeBlock(const Json& object) {
         object.at("payload").get<std::string>(),
         object.value("fallback_text", std::string{})};
     return Block(std::move(data));
+  case BlockKind::ThematicBreak:
+    CheckFields(object, {"type"});
+    return Block(std::move(data));
   case BlockKind::Paragraph:
     CheckFields(object, {"type", "text", "marks", "links", "inline_objects"});
     break;
@@ -111,8 +118,22 @@ Block DecodeBlock(const Json& object) {
     CheckFields(object, {"type", "children"});
     break;
   case BlockKind::Table:
-    CheckFields(object, {"type", "children", "has_header"});
+    CheckFields(object, {"type", "children", "has_header", "column_alignments"});
     data.table_has_header = object.at("has_header").get<bool>();
+    if (const auto alignments = object.find("column_alignments"); alignments != object.end()) {
+      if (!alignments->is_array() || alignments->empty()) {
+        throw std::invalid_argument("Expected a JSON array of table column alignments");
+      }
+      for (const auto& alignment : *alignments) {
+        const auto name = alignment.get<std::string>();
+        const auto found_alignment = std::ranges::find(column_alignment_names, name);
+        if (found_alignment == column_alignment_names.end()) {
+          throw std::invalid_argument("Unknown JSON table column alignment: " + name);
+        }
+        data.table_column_alignments.push_back(
+            static_cast<TableColumnAlignment>(std::distance(column_alignment_names.begin(), found_alignment)));
+      }
+    }
     break;
   case BlockKind::List:
     CheckFields(object, {"type", "children", "ordered", "start", "tight"});
@@ -215,7 +236,7 @@ Json EncodeBlock(const Block& block) {
     object["fallback_text"] = data.custom->fallback_text;
   } else if (detail::IsTextBlock(data.kind)) {
     object["text"] = data.text;
-  } else {
+  } else if (!detail::IsLeaf(data.kind)) {
     object["children"] = EncodeBlocks(data.children);
   }
   if (data.kind == BlockKind::Heading) {
@@ -231,6 +252,12 @@ Json EncodeBlock(const Block& block) {
   }
   if (data.kind == BlockKind::Table) {
     object["has_header"] = data.table_has_header;
+    if (!data.table_column_alignments.empty()) {
+      auto& alignments = object["column_alignments"] = Json::array();
+      for (const auto alignment : data.table_column_alignments) {
+        alignments.push_back(column_alignment_names[static_cast<std::size_t>(alignment)]);
+      }
+    }
   }
   if (!data.marks.empty()) {
     auto& ranges = object["marks"] = Json::array();

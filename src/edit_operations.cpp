@@ -155,10 +155,6 @@ bool TouchesRootKind(const RichDocument& document, TextRange range, BlockKind ki
   return TouchesRoot(document, range, [kind](BlockKind value) { return value == kind; });
 }
 
-bool TouchesAtomicBlock(const RichDocument& document, TextRange range) {
-  return TouchesRoot(document, range, IsAtomicBlock);
-}
-
 TextRange LocalRange(const Leaf& leaf, TextRange range) {
   const auto length = DocumentAccess::Body(leaf.block).Length();
   return {std::clamp(range.start - leaf.start, TextOffset{0}, length),
@@ -429,6 +425,23 @@ TreeRange ParentSlot(BlockPath path) {
   const auto index = path.back();
   path.pop_back();
   return {std::move(path), index, index};
+}
+
+RichDocument EraseLeaves(const RichDocument& document, std::size_t first, std::size_t last, EditChanges& edit) {
+  const auto& index = DocumentAccess::Get(document).index;
+  auto slot = ParentSlot(index.At(first).path);
+  const auto end = ParentSlot(index.At(last).path);
+  if (slot.parent == end.parent) {
+    slot.last = end.last;
+    return Splice(document, slot, {}, edit);
+  }
+  Replacements removed;
+  auto leaf = index.Leaves(first);
+  for (auto i = first; i <= last; ++i, leaf.Next()) {
+    edit.Touch(leaf->block);
+    removed[DocumentAccess::Id(leaf->block)] = {};
+  }
+  return Rewrite(document, removed, edit);
 }
 
 Block ListSlice(const Block& list, std::size_t begin, std::size_t end, std::size_t removed_before = 0) {
@@ -708,11 +721,13 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
   const auto& storage = DocumentAccess::Get(document);
   const auto first = storage.index.IndexOf(start.block).value();
   const auto last = storage.index.IndexOf(finish.block).value();
-  const auto& head = storage.index.At(first).block;
-  const auto& tail = storage.index.At(last).block;
+  const auto first_leaf = storage.index.At(first);
+  const auto last_leaf = storage.index.At(last);
+  const auto& head = first_leaf.block;
+  const auto& tail = last_leaf.block;
   const bool head_atomic = IsAtomicBlock(head.Data().kind);
   const bool tail_atomic = IsAtomicBlock(tail.Data().kind);
-  hard_break |= TableCellAt(document, storage.index.At(first)).has_value();
+  hard_break |= TableCellAt(document, first_leaf).has_value();
   auto text = NormalizeLineEndings(input);
   const auto inserted_length = AttributedText(text).Length();
   if (head_atomic && range.IsCollapsed()) {
@@ -726,11 +741,9 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
     return result;
   }
   if (head_atomic && tail_atomic && text.empty()) {
-    const auto first_block = storage.index.At(first).path.front();
-    const auto last_block = storage.index.At(last).path.front();
-    const bool has_next = last_block + 1 < document.Blocks().size();
-    const TextOffset leading = !has_next && first_block != 0 ? -1 : 0;
-    return {Splice(document, {{}, first_block, last_block}, {}, edit),
+    const bool has_next = last + 1 < storage.index.LeafCount();
+    const TextOffset leading = !has_next && first != 0 ? -1 : 0;
+    return {EraseLeaves(document, first, last, edit),
             range.start + leading, leading, has_next ? -1 : 0};
   }
 
@@ -1055,8 +1068,7 @@ bool CanSetLink(const RichDocument& document, TextRange range) {
 }
 
 CommandState BlockKindStatus(const RichDocument& document, TextRange range, const SetBlockKind& command) {
-  if (!IsTextBlock(command.kind) || TouchesRootKind(document, range, BlockKind::Table) ||
-      TouchesAtomicBlock(document, range)) {
+  if (!IsTextBlock(command.kind) || TouchesRoot(document, range, RequiresDocumentRoot)) {
     return {};
   }
   const bool heading = command.kind == BlockKind::Heading;
@@ -1070,6 +1082,9 @@ CommandState BlockKindStatus(const RichDocument& document, TextRange range, cons
   auto cursor = leaves.Leaves(first);
   for (std::size_t i = first; i <= last; ++i, cursor.Next()) {
     const auto& data = cursor->block.Data();
+    if (IsAtomicBlock(data.kind)) {
+      return {};
+    }
     if (heading && data.text.find('\n') != std::string::npos) {
       enabled = false;
     }
@@ -1152,7 +1167,7 @@ std::optional<unsigned> ListStartAt(const RichDocument& document, TextRange rang
 }
 
 CommandState ContainerStatus(const RichDocument& document, TextRange range, const EditorCommand& command) {
-  const bool protected_content = TouchesRootKind(document, range, BlockKind::Table) || TouchesAtomicBlock(document, range);
+  const bool protected_content = TouchesRoot(document, range, RequiresDocumentRoot);
   if (std::holds_alternative<ToggleQuote>(command)) {
     if (protected_content) {
       return {};
@@ -1303,7 +1318,8 @@ bool IsTableCommand(const EditorCommand& command) {
   return std::holds_alternative<InsertTable>(command) || std::holds_alternative<InsertTableRow>(command) ||
       std::holds_alternative<InsertTableColumn>(command) || std::holds_alternative<DeleteTableRow>(command) ||
       std::holds_alternative<DeleteTableColumn>(command) || std::holds_alternative<ToggleTableHeader>(command) ||
-      std::holds_alternative<DeleteTable>(command) || std::holds_alternative<ExitTable>(command);
+      std::holds_alternative<DeleteTable>(command) || std::holds_alternative<ExitTable>(command) ||
+      std::holds_alternative<SetTableColumnAlignment>(command);
 }
 
 CommandState TableStatus(const RichDocument& document, TextRange range, const EditorCommand& command) {
@@ -1337,6 +1353,10 @@ CommandState TableStatus(const RichDocument& document, TextRange range, const Ed
   }
   if (std::holds_alternative<ToggleTableHeader>(command)) {
     return {true, table.table_has_header ? CheckState::On : CheckState::Off};
+  }
+  if (const auto* alignment = std::get_if<SetTableColumnAlignment>(&command)) {
+    return {ValidTableColumnAlignment(alignment->alignment),
+            ColumnAlignment(table, cell->column) == alignment->alignment ? CheckState::On : CheckState::Off};
   }
   return {true};
 }
@@ -1396,6 +1416,12 @@ RichDocument ChangeTable(const RichDocument& document, Selection& selection, con
     row = std::min(row, rows.size() - 1);
   } else if (std::holds_alternative<ToggleTableHeader>(command)) {
     data.table_has_header = !data.table_has_header;
+  } else if (const auto* alignment = std::get_if<SetTableColumnAlignment>(&command)) {
+    if (ColumnAlignment(data, column) == alignment->alignment) {
+      return document;
+    }
+    data.table_column_alignments.resize(column_count, TableColumnAlignment::Default);
+    data.table_column_alignments[column] = alignment->alignment;
   } else {
     const auto* insert = std::get_if<InsertTableColumn>(&command);
     const auto at = static_cast<std::ptrdiff_t>(column + (insert && insert->side == TableInsertSide::After));
@@ -1409,6 +1435,14 @@ RichDocument ChangeTable(const RichDocument& document, Selection& selection, con
         cells.erase(cells.begin() + at);
       }
       block = DocumentAccess::WithData(block, std::move(row_data));
+    }
+    auto& alignments = data.table_column_alignments;
+    if (!alignments.empty()) {
+      if (insert) {
+        alignments.insert(alignments.begin() + at, TableColumnAlignment::Default);
+      } else {
+        alignments.erase(alignments.begin() + at);
+      }
     }
     if (!insert) {
       column = std::min(column, column_count - 2);
@@ -1442,12 +1476,18 @@ std::optional<std::size_t> SelectedImageIndex(const RichDocument& document, Text
 }
 
 bool CanInsertAtomicBlock(const RichDocument& document, TextRange range) {
-  if (!range.IsCollapsed()) {
-    return SelectedAtomicIndex(document, range).has_value();
-  }
   const auto& leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
+  if (!range.IsCollapsed()) {
+    return leaf.path.size() == 1 && IsAtomicBlock(leaf.block.Data().kind) &&
+        range == TextRange{leaf.start, leaf.start + 1};
+  }
   const auto kind = leaf.block.Data().kind;
   return leaf.path.size() == 1 && (kind == BlockKind::Paragraph || IsAtomicBlock(kind));
+}
+
+bool CanInsertThematicBreak(const RichDocument& document, TextRange range) {
+  const auto leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
+  return range.IsCollapsed() && leaf.block.Data().kind == BlockKind::Paragraph && !TableCellAt(document, leaf);
 }
 
 CommandState ImageStatus(const RichDocument& document, TextRange range, const EditorCommand& command) {
@@ -1497,10 +1537,11 @@ RichDocument InsertAtomicBlock(const RichDocument& document, Selection& selectio
     }
   }
   auto next = Splice(document, slot, std::move(blocks), edit);
+  const auto siblings = ChildrenAt(next, slot.parent);
   if (!at_atomic && offset < length) {
-    SelectBlock(selection, next.Blocks()[block_index + 1]);
+    SelectBlock(selection, siblings[block_index + 1]);
   } else {
-    SelectBlock(selection, next.Blocks()[block_index], true);
+    SelectBlock(selection, siblings[block_index], true);
   }
   return next;
 }

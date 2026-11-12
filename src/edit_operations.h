@@ -20,7 +20,7 @@ struct EditChanges {
 struct EditResult {
   RichDocument document;
   TextOffset caret;
-  /// Changes to the flattened separators around the replacement when editing next to or deleting an image.
+  /// Changes to the flattened separators around the replacement when editing next to or deleting an atomic block.
   TextOffset leading_separator = 0;
   TextOffset trailing_separator = 0;
 };
@@ -74,6 +74,8 @@ bool IsImageCommand(const EditorCommand& command);
 std::optional<std::size_t> SelectedImageIndex(const RichDocument& document, TextRange range);
 std::optional<std::size_t> SelectedAtomicIndex(const RichDocument& document, TextRange range);
 bool CanInsertAtomicBlock(const RichDocument& document, TextRange range);
+/// Checks for a paragraph caret at a location that accepts a thematic break.
+bool CanInsertThematicBreak(const RichDocument& document, TextRange range);
 RichDocument InsertAtomicBlock(const RichDocument& document, Selection& selection, BlockData data, EditChanges& edit);
 RichDocument ReplaceSelectedCustomBlock(const RichDocument& document, const Selection& selection,
                                         const CustomBlockData& replacement, EditChanges& edit);

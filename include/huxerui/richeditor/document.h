@@ -27,17 +27,28 @@ class EditorSession;
 
 /// @brief Structural role of a block in the document tree.
 enum class BlockKind {
-  Paragraph, ///< Text leaf supporting inline marks, links, and line breaks.
-  Heading,   ///< Single-line text leaf supporting inline marks, links, and a heading level.
-  CodeBlock, ///< Plain-text leaf supporting line breaks and code fence metadata.
-  Quote,     ///< Container holding one or more blocks.
-  List,      ///< Ordered or unordered container holding one or more list items.
-  ListItem,  ///< Container holding the item's content and any nested blocks. Its parent is a List.
-  Table,     ///< Top-level rectangular grid of TableRow blocks, optionally with a header in its first row.
-  TableRow,  ///< Nonempty sequence of TableCell blocks. All rows of a table have the same number of cells.
-  TableCell, ///< Container holding one paragraph, which may be empty and may contain inline styles and breaks.
-  Image,     ///< Top-level image referenced by ImageBlockData.
-  Custom,    ///< Top-level atomic block with application-defined content.
+  Paragraph,     ///< Text leaf supporting inline marks, links, and line breaks.
+  Heading,       ///< Single-line text leaf supporting inline marks, links, and a heading level.
+  CodeBlock,     ///< Plain-text leaf supporting line breaks and code fence metadata.
+
+  Quote,         ///< Container holding one or more blocks.
+  List,          ///< Ordered or unordered container holding one or more list items.
+  ListItem,      ///< Container holding the item's content and any nested blocks. Its parent is a List.
+  Table,         ///< Top-level rectangular grid of TableRow blocks, optionally with a header in its first row.
+  TableRow,      ///< Nonempty sequence of TableCell blocks. All rows of a table have the same number of cells.
+  TableCell,     ///< Container holding one paragraph, which may be empty and may contain inline styles and breaks.
+
+  ThematicBreak, ///< Selectable divider at the document root or inside a quote or list item.
+  Image,         ///< Top-level image referenced by ImageBlockData.
+  Custom,        ///< Top-level atomic block with application-defined content.
+};
+
+/// @brief Horizontal alignment shared by the header and body cells of one table column.
+enum class TableColumnAlignment {
+  Default, ///< Use the leading edge of each cell's paragraph direction.
+  Left,    ///< Align each visual line to the physical left edge of its cell.
+  Center,  ///< Center each visual line horizontally within its cell.
+  Right,   ///< Align each visual line to the physical right edge of its cell.
 };
 
 /// @brief Combinable inline styles supported by paragraphs and headings.
@@ -266,6 +277,10 @@ struct BlockData {
   /// Inline objects in increasing block-local UTF-16 offset order. Each offset must identify a distinct
   /// U+FFFC in text. Available in paragraphs, including table cell paragraphs, and in headings.
   std::vector<InlineObject> inline_objects;
+  /// Column alignments in document order. Available on Table blocks only.
+  /// Leave empty for an all-default table, or supply one value per column. All-default arrays
+  /// are stored as an empty vector in the validated document.
+  std::vector<TableColumnAlignment> table_column_alignments;
   bool operator==(const BlockData&) const = default;
 };
 

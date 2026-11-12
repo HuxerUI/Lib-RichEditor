@@ -164,12 +164,15 @@ struct MarkdownOptions {
 
 /// @brief CommonMark codec with GFM strikethrough, top-level tables, and optional object mappings.
 ///
-/// Import maps paragraphs, headings, lists, quotes, code, emphasis, and links to editable content. Soft breaks
-/// become spaces in paragraphs and hard breaks become LF. Raw HTML is stored as literal text. Tables follow the
-/// parsed GFM grid, which pads missing cells and ignores cells beyond the header width. Explicit column alignment,
-/// nested tables and tasks report diagnostics. An image occupying its own top-level paragraph becomes an Image
-/// block with its reference, alternative text, and title. Other image placements require inline_images. Codecs
-/// preserve image references while the application resolves and stores their bytes.
+/// Import maps paragraphs, headings, lists, quotes, code, thematic breaks, emphasis, and links to editable content.
+/// Soft breaks become spaces in paragraphs and hard breaks become LF. Raw HTML is stored as literal text.
+/// Tables retain their column alignments and follow the parsed GFM grid, which pads missing cells and ignores cells
+/// beyond the header width. Nested tables and tasks report diagnostics. Recognized leading YAML front matter
+/// reports "markdown.front_matter". AllowLoss discards the metadata.
+///
+/// An image occupying its own top-level paragraph becomes an Image block with its reference, alternative text,
+/// and title. Other image placements require inline_images. Codecs preserve image references while the application
+/// resolves and stores their bytes.
 ///
 /// Export writes canonical Markdown and checks that re-import preserves the document. Strict withholds output
 /// when content or styling such as a missing table header, a cell line break, underline, highlight, or a

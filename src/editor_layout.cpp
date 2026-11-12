@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <iterator>
 #include <stdexcept>
@@ -14,6 +15,63 @@ namespace {
 
 constexpr float image_gap = 12.0F;
 constexpr float image_gutter = 7.0F;
+
+#include "bidi_class_ranges.inc"
+
+/// Consumes one scalar from the validated UTF-8 text of a document block.
+char32_t TakeScalar(std::string_view& text) {
+  const auto first = static_cast<unsigned char>(text.front());
+  const auto count = std::countl_one(first);
+  if (count == 0) {
+    text.remove_prefix(1);
+    return first;
+  }
+  char32_t scalar = first & (0x7FU >> count);
+  for (int i = 1; i < count; ++i) {
+    scalar = (scalar << 6) | (static_cast<unsigned char>(text[i]) & 0x3FU);
+  }
+  text.remove_prefix(count);
+  return scalar;
+}
+
+bool InBidiRanges(std::span<const char32_t> boundaries, char32_t scalar) {
+  const auto next = std::ranges::upper_bound(boundaries, scalar);
+  return (next - boundaries.begin()) % 2 != 0;
+}
+
+TextDirection CellDirection(std::string_view text) {
+  // The first strong character outside directional isolates sets the base direction (UAX #9, P2/P3).
+  std::size_t isolates = 0;
+  while (!text.empty()) {
+    const auto scalar = TakeScalar(text);
+    if (scalar >= 0x2066 && scalar <= 0x2068) {
+      ++isolates;
+    } else if (scalar == 0x2069 && isolates != 0) {
+      --isolates;
+    } else if (isolates == 0) {
+      if (InBidiRanges(strong_left_to_right, scalar)) {
+        return TextDirection::LeftToRight;
+      }
+      if (InBidiRanges(strong_right_to_left, scalar)) {
+        return TextDirection::RightToLeft;
+      }
+    }
+  }
+  return TextDirection::LeftToRight;
+}
+
+TextLayoutOptions LayoutOptions(std::string_view text, TableColumnAlignment alignment, const std::string& locale) {
+  TextLayoutOptions options{.shaping = {.locale = locale}};
+  if (alignment == TableColumnAlignment::Center) {
+    options.align = TextAlign::Center;
+  } else if (alignment != TableColumnAlignment::Default) {
+    options.shaping.direction = CellDirection(text);
+    const bool rtl = options.shaping.direction == TextDirection::RightToLeft;
+    const bool right = alignment == TableColumnAlignment::Right;
+    options.align = rtl == right ? TextAlign::Leading : TextAlign::Trailing;
+  }
+  return options;
+}
 
 void ValidateStyle(const RichEditorStyle& style) {
   const auto nonnegative = [](float value) { return std::isfinite(value) && value >= 0.0F; };
@@ -402,7 +460,8 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
   const auto& padding = style.content_padding;
   const float indent_scale = std::max(1.0F, body.font.Size() / 16.0F);
   const auto append = [&](const Leaf& leaf, Point origin, float block_width, EdgeInsets insets,
-                          std::vector<ListMarker> markers, bool header, std::optional<Cell> cell = {}) {
+                          std::vector<ListMarker> markers, bool header, std::optional<Cell> cell = {},
+                          TableColumnAlignment alignment = TableColumnAlignment::Default) {
     const auto& data = leaf.block.Data();
     const float available = std::max(1.0F, block_width - insets.Horizontal());
     const auto id = DocumentAccess::Id(leaf.block);
@@ -429,7 +488,7 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
       if (header) {
         base.font = base.font.WithWeight(FontWeight::Bold);
       }
-      const TextLayoutOptions options{.shaping = {.locale = locale}};
+      const auto options = LayoutOptions(data.text, alignment, locale);
       const auto attributed = Attributed(leaf.block, base, code.font, theme.colors, style, code_presentation);
       std::vector<InlineBox> boxes;
       std::vector<TextInlineObject> metrics;
@@ -471,12 +530,13 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
           if (Has(context.marks, Mark::Italic)) {
             fallback_style.font = fallback_style.font.WithSlant(FontSlant::Italic);
           }
-          const auto run = measurer.MeasureRun(label, fallback_style, options.shaping);
+          const TextShapingOptions label_shaping{.locale = locale};
+          const auto run = measurer.MeasureRun(label, fallback_style, label_shaping);
           if (run.advance > available) {
             fallback_style.font = fallback_style.font.WithSize(std::max(1.0F, base.font.Size() * available / run.advance));
           }
           box.fallback = measurer.CreateTextLayout(AttributedText(std::move(label)), fallback_style, available,
-                                                   {.shaping = options.shaping, .wrap = TextWrap::NoWrap});
+                                                   {.shaping = label_shaping, .wrap = TextWrap::NoWrap});
           const auto geometry = box.fallback->Metrics();
           measure.width = std::clamp(geometry.size.width, 1.0F, available);
           measure.ascent = std::clamp(geometry.first_baseline, 1.0F, std::max(1.0F, geometry.size.height));
@@ -515,12 +575,13 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         }
       }
       auto linked_text = data.links.empty() ? nullptr
-          : std::make_shared<const CachedLayout::LinkedText>(CachedLayout::LinkedText{std::move(text), base});
+          : std::make_shared<const CachedLayout::LinkedText>(CachedLayout::LinkedText{std::move(text), base, options});
       return CachedLayout{leaf.block, available, std::move(layout), std::move(offsets), std::move(backgrounds),
-                          std::move(boxes), sources, std::move(graphic), header, std::move(linked_text)};
+                          std::move(boxes), sources, std::move(graphic), header, alignment, std::move(linked_text)};
     };
     auto cached = found != cache_.end() && found->second.width == available && found->second.block == leaf.block &&
-            found->second.header == header && found->second.inline_sources == sources ? found->second : create();
+            found->second.header == header && found->second.alignment == alignment &&
+            found->second.inline_sources == sources ? found->second : create();
     std::optional<Rect> code_bounds;
     std::optional<CodeHeader> code_header;
     float header_height = 0.0F;
@@ -552,6 +613,9 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         .inline_objects = cached.inline_objects,
         .cell = cell,
     });
+    if (data.kind == BlockKind::ThematicBreak) {
+      rows_.back().thematic_break = Rect{origin.x, origin.y, block_width, std::max(16.0F, body.font.Size())};
+    }
     if (data.custom) {
       const float inset = std::min(12.0F, block_width / 4.0F);
       const auto label = data.custom->fallback_text.empty() ? data.custom->type : data.custom->fallback_text;
@@ -608,7 +672,7 @@ bool EditorLayout::Prepare(TextMeasurer& measurer, const RichDocument& document,
         for (std::size_t column = 0; column < columns; ++column) {
           const float x = padding.left + static_cast<float>(column) * column_width;
           append(*cursor, {x, y}, column_width, insets, {}, grid.has_header && row == 0,
-                 Cell{table_index, {x, y, column_width, 0.0F}});
+                 Cell{table_index, {x, y, column_width, 0.0F}}, ColumnAlignment(table, column));
           ++i;
           cursor.Next();
           height = std::max(height, rows_.back().layout.Metrics().size.height);
@@ -871,7 +935,7 @@ void EditorLayout::PaintText(PaintContext& paint, std::size_t index, std::option
     }
   }
   paint.DrawText({origin.x, origin.y, cached.width, row.layout.Metrics().size.height},
-                 text.text.WithStyles(std::move(styles)), text.base, {.shaping = {.locale = locale_}});
+                 text.text.WithStyles(std::move(styles)), text.base, text.options);
 }
 
 Rect EditorLayout::Caret(const RichDocument& document, TextPosition position) const {

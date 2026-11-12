@@ -1495,6 +1495,11 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
                      marker.text, layout.MarkerStyle(),
                      {.align = TextAlign::Trailing, .wrap = TextWrap::NoWrap});
     }
+    if (const auto& rule = row.thematic_break) {
+      paint.DrawRect({rule->x, rule->y + rule->height / 2.0F - 1.0F, rule->width, 2.0F},
+                     colors.outline, CornerRadii{1.0F});
+      continue;
+    }
     for (const auto& fill : row.inline_backgrounds) {
       paint.DrawRect(AtOrigin(fill.bounds, origin), fill.color, CornerRadii{fill.corner_radius});
     }

@@ -156,8 +156,12 @@ public:
     std::optional<Cell> cell;
     std::optional<ImageBox> image;
     std::optional<CustomBox> custom;
+    std::optional<Rect> thematic_break;
 
     const Rect* AtomicBounds() const {
+      if (thematic_break) {
+        return &*thematic_break;
+      }
       return image ? &image->bounds : custom ? &custom->bounds : nullptr;
     }
 
@@ -170,8 +174,8 @@ public:
       if (image) {
         return image->line_bottom;
       }
-      if (custom) {
-        return custom->bounds.y + custom->bounds.height;
+      if (const auto* bounds = AtomicBounds()) {
+        return bounds->y + bounds->height;
       }
       if (cell) {
         return cell->bounds.y + cell->bounds.height;
@@ -239,6 +243,7 @@ private:
     struct LinkedText {
       AttributedText text;
       TextStyle base;
+      TextLayoutOptions options;
     };
 
     Block block;
@@ -250,6 +255,7 @@ private:
     std::vector<InlineSource> inline_sources;
     std::optional<CustomBlockGraphic> custom_graphic;
     bool header;
+    TableColumnAlignment alignment;
     std::shared_ptr<const LinkedText> linked_text;
   };
 

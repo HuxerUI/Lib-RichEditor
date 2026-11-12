@@ -55,7 +55,13 @@ A top-level `Table` contains a rectangular grid of `TableRow` and `TableCell` bl
 
 Use `InsertTable{.rows = 3, .columns = 2}` at a top-level paragraph caret. Once the selection is inside one cell, `InsertTableRow`, `InsertTableColumn`, `DeleteTableRow`, and `DeleteTableColumn` act on that cell's row or column. Use `ToggleTableHeader` to change the first row's role and `DeleteTable` to remove the whole table. Query `GetCommandState()` before offering an action and pass the same command to `Execute()`.
 
+Use `SetTableColumnAlignment{TableColumnAlignment::Center}` to align the header and body cells of the current column. Default alignment follows each cell's reading direction. Explicit left and right refer to physical edges. The command preserves the selection and participates in undo and redo.
+
 Tab and Shift+Tab navigate within a table. Tab from the last cell adds a row and moves the caret into its first cell. Enter adds a line break within a cell. Ctrl+Enter, Command+Enter, or `ExitTable` continues in a paragraph after the table. Cross-cell selections can be copied. Text and formatting edits stay inside a single cell. Each grid change is one undoable edit. A table wider than the editor's content area scrolls horizontally with a touch drag, horizontal wheel, or Shift+wheel.
+
+## Thematic breaks
+
+Use `InsertThematicBreak{}` at a paragraph caret to insert a divider in the current document, quote, or list item. Inserting within text preserves the inline content on both sides. Select the divider to delete it, or move past it to continue typing. Markdown exports it as `***`.
 
 ## Images
 
@@ -98,7 +104,7 @@ Call `editor.RevealTextRange(block, range, ScrollAlignment::Center)` to center a
 
 `DefaultEditorShortcuts()` lists the configurable editor commands and their default aliases. Pass a shared immutable `EditorKeymap` as `RichEditorOptions::keymap` to supply the complete editor binding table. A null pointer uses the defaults and an empty map clears them. Replace the shared map in composition to apply changes without restarting the text-input session. Use `RichEditorController::Execute()` for the same editing commands from toolbar controls.
 
-Use Ctrl or Command with 0–6 for the paragraph and heading styles. Add Shift with T, R, or Backslash to insert a table, a row below, or a column after the current cell. The other table actions can be assigned in Folio's desktop **Keyboard** settings.
+Use Ctrl or Command with 0–6 for the paragraph and heading styles. Add Shift with T, R, or Backslash to insert a table, a row below, or a column after the current cell. Folio's desktop **Keyboard** settings list the configurable grid commands.
 
 Ctrl+Enter or Command+Enter runs `ContinueInParagraph{}`. It splits a top-level paragraph or heading at the caret and starts typing without marks. Inside a list, quote, table, or code block, it goes to the paragraph below the enclosing top-level block and inserts one if needed. The existing content retains its formatting.
 
@@ -142,9 +148,11 @@ Register an `InlineObjectExtension` per type for custom async rendering. The ren
 
 ## Formats
 
-JSON version 1 stores all editable content and styles. A `table` block stores its `has_header` flag and its ordered `table_row` children. Rows contain `table_cell` blocks that each contain a `paragraph`. Text is UTF-8 with LF line endings. Mark and link ranges use half-open UTF-16 offsets relative to their text block. The root contains `version` and `blocks`. The editor normalizes an empty root to one empty paragraph and merges adjacent equal mark ranges. Paragraphs and headings can include an optional `inline_objects` array. Each record stores a block-local UTF-16 `offset`, `type`, `version`, `payload`, `fallback_text` and optional `attachments` with `role` and `source`. Cursor positions, IME state, layout, and history live in the editing session.
+JSON version 1 stores all editable content and styles. A `table` block stores its `has_header` flag and its ordered `table_row` children. Rows contain `table_cell` blocks that each contain a `paragraph`. Optional `column_alignments` contains one `default`, `left`, `center`, or `right` value per column. Omit it when all columns use the default. A divider is `{"type":"thematic_break"}`.
 
-Markdown import converts the Lib-Markdown syntax tree to editable content. The supported subset uses CommonMark paragraphs, headings, lists, quotes, code, emphasis and links plus GFM strikethrough and top-level tables. A standalone image in a top-level paragraph preserves its reference, alternative text, and title. GFM pads short data rows with empty cells and ignores extra cells beyond the header width. Ordinary source line breaks become spaces and explicit hard breaks remain line breaks. Raw HTML is literal text. Recognized unsupported content, including explicit table column alignment, nested tables, and tasks, returns issues.
+Text is UTF-8 with LF line endings. Mark and link ranges use half-open UTF-16 offsets relative to their text block. The root contains `version` and `blocks`. The editor normalizes an empty root to one empty paragraph and merges adjacent equal mark ranges. Paragraphs and headings can include an optional `inline_objects` array. Each record stores a block-local UTF-16 `offset`, `type`, `version`, `payload`, `fallback_text` and optional `attachments` with `role` and `source`. Cursor positions, IME state, layout, and history live in the editing session.
+
+Markdown import converts the Lib-Markdown syntax tree to editable content. The supported subset uses CommonMark paragraphs, headings, lists, quotes, code, thematic breaks, emphasis and links plus GFM strikethrough and top-level tables with column alignment. A standalone image in a top-level paragraph preserves its reference, alternative text, and title. GFM pads short data rows with empty cells and ignores extra cells beyond the header width. Ordinary source line breaks become spaces and explicit hard breaks remain line breaks. Raw HTML is literal text. Recognized unsupported content includes nested tables, task markers, and common leading YAML front matter with simple or quoted keys between `---` fences.
 
 Markdown export checks semantic round trips with the same parser. Both import and export default to `LossPolicy::Strict`. Use `LossPolicy::AllowLoss` to receive a conversion with reported losses such as omitted underline or highlight, a synthesized header row, or cell line breaks replaced by spaces. Each issue carries a code and a zero-based tree path, with a block-local range when available. Plain clipboard actions use text fallback. Application clipboard bridges can preserve structure with document fragments.
 
@@ -214,6 +222,8 @@ Folio starts with an empty workspace. **Open file…** accepts RichEditor JSON, 
 
 Folio accepts `.md` and `.markdown` files opened from Windows File Explorer, macOS Finder, and Files on iOS. The Windows installer adds Folio to **Open with**. On Android, file managers can open a Markdown document in Folio by sending it as `text/markdown`. Opening a file starts Folio or opens it in the running app. If Folio can identify an already open file, it switches to its tab.
 
+If a document fails to open, the dialog lists the import issues by file. When Markdown can be converted with reported losses, **Open lossy copy** opens an unsaved tab. Use **Save** to choose a new destination. The copy can resolve relative attachments from the source folder if it has already been authorized.
+
 Desktop windows have independent tabs and sidebars. **Recent edits** is shared while Folio is running. **Save** checks the source file before writing back in its original format. **Save as…** creates and binds a file in a writable directory. **Export copy…** creates a separate JSON or Markdown copy. Closing a tab or window prompts for unsaved changes.
 
 Choose **File actions** → **Load sample**, then enter Chinese text with an IME and select across paragraphs. Apply underline and bold in separate actions, undo bold, and check that the underline and committed text remain. Choose **Save as…** with JSON, then reopen the saved file with **Open file…**. Export a Markdown copy to see the underline diagnostic. Confirm **Export with loss…** to continue.
@@ -222,7 +232,7 @@ Open the text style menu to switch between paragraph, heading levels 1 through 6
 
 Place the caret in the sample's ordered list and open **List numbering** to set a starting number, restart at one, or change the indent. Undo restores the previous numbering, and the new start can be saved in JSON and Markdown.
 
-To exercise tables, select a cell in the sample. The compact toolbar shows **+ Row** and **+ Column**. Use **Table actions** for the other grid changes and undo them. Enter Chinese text in one cell, save, and reopen JSON. A Markdown copy preserves the table while it has a header and representable styles. Turn off **Header row** to verify the diagnostic, then export with loss to save a table with a synthesized header.
+To exercise tables, select a cell in the sample. The compact toolbar shows **+ Row** and **+ Column**. Open **Table actions** → **Column alignment** to change the selected column. Enter Chinese text in one cell, save, and reopen JSON. A Markdown copy preserves the table and its alignments while it has a header and representable styles. Turn off **Header row** to verify the diagnostic, then export with loss to save a table with a synthesized header. Use **More formatting** → **Insert** → **Insert divider** to add a thematic break.
 
 To exercise images, place the caret in a top-level paragraph and choose **Insert image** to select a PNG or JPEG. On compact screens, find it under **More formatting** → **Insert**. Selecting an image dismisses the software keyboard and shows **Size**, **Replace**, and **+ Image** on the compact toolbar. Drag a corner or open the size dialog to set the width or height and watch the other dimension update. Size the pair to fit on the same line and undo a resize. Choose **Save as…**, move the resulting subfolder, and open its document from the folder sidebar. A Markdown copy includes the referenced local attachments.
 

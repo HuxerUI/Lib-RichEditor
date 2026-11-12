@@ -105,7 +105,10 @@ View EllipsizedLabel(std::string label, Color color, Semantics semantics, std::o
   auto accessibility = semantics;
   accessibility.role = SemanticRole::Text;
   accessibility.label = label;
-  return Row {}.With(Frame{.height = 20.0F}, LabelPaint{SingleLine(label), style, options}, accessibility);
+  auto text = SingleLine(std::move(label));
+  const float line_height = UseTextMeasurer().MeasureText(
+      text, style, std::numeric_limits<float>::infinity(), options).size.height;
+  return Row {}.With(Frame{.min_height = line_height}, LabelPaint{std::move(text), style, options}, accessibility);
 }
 
 [[huxerui::composable]]

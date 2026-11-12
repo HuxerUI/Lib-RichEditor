@@ -145,6 +145,16 @@ struct DeleteTableColumn {};
 /// including during IME preedit while the command is disabled.
 struct ToggleTableHeader {};
 
+/// @brief Changes the alignment of every cell in the column containing the selection.
+///
+/// Requires the caret or both selection endpoints to lie within a single cell. A change preserves
+/// the selection and is undone in one step. GetCommandState() reports CheckState::On when the
+/// column already has the requested alignment, including during IME preedit.
+struct SetTableColumnAlignment {
+  /// Alignment to apply. Default restores the paragraph's leading alignment.
+  TableColumnAlignment alignment = TableColumnAlignment::Default;
+};
+
 /// @brief Deletes the current table and moves the caret to the following block, or the preceding block at the end.
 /// A document with no remaining blocks becomes an empty paragraph.
 struct DeleteTable {};
@@ -161,6 +171,14 @@ struct ExitTable {};
 /// Requires a caret or selection within one text block, outside IME preedit. Ctrl+Enter and Command+Enter
 /// invoke this command when the editor owns focus, except when activating a selected inline object.
 struct ContinueInParagraph {};
+
+/// @brief Inserts a selectable thematic break at a paragraph caret.
+///
+/// Splits the paragraph at the caret when it has text on both sides, preserving its inline content.
+/// The break stays in the paragraph's container, and the caret moves to the text after it or to
+/// its trailing boundary. Available at the document root and in quotes and list items, outside
+/// table cells and IME preedit.
+struct InsertThematicBreak {};
 
 /// @brief Inserts a top-level image at a paragraph caret or next to another image.
 /// A paragraph split preserves the text and formatting on both sides. The caret moves after the image.
@@ -249,12 +267,15 @@ struct Undo {};
 struct Redo {};
 
 /// @brief Typed command accepted by RichEditorController::Execute() and GetCommandState().
-using EditorCommand = std::variant<ToggleMark, ClearFormatting, SetLink, SetBlockKind, ToggleList, ToggleQuote,
-                                   IndentList, OutdentList, SelectAll, Undo, Redo, InsertTable, InsertTableRow,
-                                   InsertTableColumn, DeleteTableRow, DeleteTableColumn, ToggleTableHeader,
-                                   DeleteTable, ExitTable, InsertImage, ReplaceImage, DeleteImage, ResizeImage,
-                                   SetListStart, InsertCustomBlock, ReplaceCustomBlock, InsertInlineObject,
-                                   ReplaceInlineObject, InsertFragment, ContinueInParagraph>;
+using EditorCommand = std::variant<
+    ToggleMark, ClearFormatting, SetLink, SetBlockKind,
+    ToggleList, SetListStart, ToggleQuote, IndentList, OutdentList,
+    InsertTable, InsertTableRow, InsertTableColumn, DeleteTableRow, DeleteTableColumn,
+    ToggleTableHeader, SetTableColumnAlignment, DeleteTable, ExitTable,
+    ContinueInParagraph, InsertThematicBreak,
+    InsertImage, ReplaceImage, ResizeImage, DeleteImage,
+    InsertCustomBlock, ReplaceCustomBlock, InsertInlineObject, ReplaceInlineObject, InsertFragment,
+    SelectAll, Undo, Redo>;
 
 /// @brief A portable key and its complete modifier state.
 ///
