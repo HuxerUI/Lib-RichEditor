@@ -20,4 +20,4 @@ cmake -S "$HUXERUI_PROJECT_ROOT" -B "$HUXERUI_CORE_BUILD_DIR" \
   -DHUXERUI_BUILD_TESTS=OFF \
   -DHUXERUI_BUILD_EXAMPLES=OFF \
   -DHUXERUI_BUILD_CLI=OFF
-cmake --build "$HUXERUI_CORE_BUILD_DIR" --target example_lib_rich_editor_huxerui_ios_core --parallel
+cmake --build "$HUXERUI_CORE_BUILD_DIR" --target "${TARGET_NAME}_huxerui_ios_core" --parallel

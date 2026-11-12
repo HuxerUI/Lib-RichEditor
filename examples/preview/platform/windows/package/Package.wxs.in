@@ -21,14 +21,14 @@
       <RegistryValue Root="HKLM" Key="Software\Classes\org.huxerui.lib.richeditor.preview.Markdown"
                      Type="string" Value="@DRAFTSPAN_APP_NAME@ Markdown Document" />
       <RegistryValue Root="HKLM" Key="Software\Classes\org.huxerui.lib.richeditor.preview.Markdown\DefaultIcon"
-                     Type="string" Value="&quot;[INSTALLFOLDER]example_lib_rich_editor.exe&quot;,0" />
+                     Type="string" Value="&quot;[INSTALLFOLDER]@target_name@.exe&quot;,0" />
       <RegistryValue Root="HKLM" Key="Software\Classes\org.huxerui.lib.richeditor.preview.Markdown\shell\open\command"
-                     Type="string" Value="&quot;[INSTALLFOLDER]example_lib_rich_editor.exe&quot; &quot;%1&quot;" KeyPath="yes" />
+                     Type="string" Value="&quot;[INSTALLFOLDER]@target_name@.exe&quot; &quot;%1&quot;" KeyPath="yes" />
       <RegistryValue Root="HKLM" Key="Software\Classes\.md\OpenWithProgids"
                      Name="org.huxerui.lib.richeditor.preview.Markdown" Type="string" Value="" />
       <RegistryValue Root="HKLM" Key="Software\Classes\.markdown\OpenWithProgids"
                      Name="org.huxerui.lib.richeditor.preview.Markdown" Type="string" Value="" />
-      <RegistryValue Root="HKLM" Key="Software\Classes\Applications\example_lib_rich_editor.exe"
+      <RegistryValue Root="HKLM" Key="Software\Classes\Applications\@target_name@.exe"
                      Name="FriendlyAppName" Type="string" Value="@DRAFTSPAN_APP_NAME@" />
       <RegistryValue Root="HKLM" Key="Software\RegisteredApplications" Name="@DRAFTSPAN_APP_NAME@"
                      Type="string" Value="Software\org.huxerui.lib.richeditor.preview\Capabilities" />
@@ -43,7 +43,7 @@
     </Component>
     <Component Id="ApplicationShortcut" Directory="APPLICATIONPROGRAMMENU">
       <Shortcut Id="ApplicationStartMenuShortcut" Name="@DRAFTSPAN_APP_NAME@"
-                Target="[INSTALLFOLDER]example_lib_rich_editor.exe" WorkingDirectory="INSTALLFOLDER"
+                Target="[INSTALLFOLDER]@target_name@.exe" WorkingDirectory="INSTALLFOLDER"
                 Icon="ApplicationIcon" />
       <RemoveFolder Id="RemoveApplicationProgramMenu" On="uninstall" />
       <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Shortcuts" Name="installed"
@@ -51,7 +51,7 @@
     </Component>
     <Component Id="ApplicationDesktopShortcut" Directory="DesktopFolder">
       <Shortcut Id="ApplicationDesktopShortcutLink" Name="@DRAFTSPAN_APP_NAME@"
-                Target="[INSTALLFOLDER]example_lib_rich_editor.exe" WorkingDirectory="INSTALLFOLDER"
+                Target="[INSTALLFOLDER]@target_name@.exe" WorkingDirectory="INSTALLFOLDER"
                 Icon="ApplicationIcon" />
       <RegistryValue Root="HKLM" Key="Software\org.huxerui.lib.richeditor.preview\Shortcuts" Name="desktopShortcut"
                      Type="integer" Value="1" KeyPath="yes" />

@@ -10,8 +10,8 @@
         <BuildableReference BuildableIdentifier="primary"
                             BlueprintIdentifier="000000000000000000000500"
                             BuildableName="Draftspan.app"
-                            BlueprintName="example_lib_rich_editor"
-                            ReferencedContainer="container:example_lib_rich_editor.xcodeproj"/>
+                            BlueprintName="Draftspan"
+                            ReferencedContainer="container:Draftspan.xcodeproj"/>
       </BuildActionEntry>
     </BuildActionEntries>
   </BuildAction>
@@ -32,8 +32,8 @@
       <BuildableReference BuildableIdentifier="primary"
                           BlueprintIdentifier="000000000000000000000500"
                           BuildableName="Draftspan.app"
-                          BlueprintName="example_lib_rich_editor"
-                          ReferencedContainer="container:example_lib_rich_editor.xcodeproj"/>
+                          BlueprintName="Draftspan"
+                          ReferencedContainer="container:Draftspan.xcodeproj"/>
     </BuildableProductRunnable>
   </LaunchAction>
   <ProfileAction buildConfiguration="Release"
@@ -45,8 +45,8 @@
       <BuildableReference BuildableIdentifier="primary"
                           BlueprintIdentifier="000000000000000000000500"
                           BuildableName="Draftspan.app"
-                          BlueprintName="example_lib_rich_editor"
-                          ReferencedContainer="container:example_lib_rich_editor.xcodeproj"/>
+                          BlueprintName="Draftspan"
+                          ReferencedContainer="container:Draftspan.xcodeproj"/>
     </BuildableProductRunnable>
   </ProfileAction>
   <AnalyzeAction buildConfiguration="Debug"/>

@@ -8,7 +8,7 @@ if (CMAKE_HOST_APPLE AND (NOT CMAKE_SYSTEM_NAME OR CMAKE_SYSTEM_NAME STREQUAL "D
     set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS deployment target")
 endif ()
 
-project(example_lib_rich_editor VERSION 0.1.0 LANGUAGES NONE)
+project(Draftspan VERSION 0.1.0 LANGUAGES NONE)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/HuxerUIProject.cmake")
 if (HUXERUI_PROJECT_PLAN_ONLY)
@@ -38,7 +38,7 @@ if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     endif ()
 endif ()
 
-huxerui_add_app(example_lib_rich_editor
+huxerui_add_app(${PROJECT_NAME}
         SOURCES
             ${APP_SOURCE_FILES}
         RESOURCES
@@ -52,23 +52,23 @@ huxerui_add_app(example_lib_rich_editor
             "org.huxerui.lib.richeditor.preview"
 )
 
-huxerui_configure_project_app(example_lib_rich_editor)
+huxerui_configure_project_app(${PROJECT_NAME})
 
-huxerui_use_library(example_lib_rich_editor
+huxerui_use_library(${PROJECT_NAME}
         TARGET HuxerUI::RichEditor
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 
 if(NOT HUXERUI_LIBRARY_GRAPH_ONLY)
-    target_link_libraries(example_lib_rich_editor PRIVATE nlohmann_json::nlohmann_json)
+    target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json)
     if (APPLE)
-        set_property(TARGET example_lib_rich_editor PROPERTY OBJCXX_STANDARD 20)
+        set_property(TARGET ${PROJECT_NAME} PROPERTY OBJCXX_STANDARD 20)
     elseif (WIN32)
-        target_link_libraries(example_lib_rich_editor PRIVATE shell32)
+        target_link_libraries(${PROJECT_NAME} PRIVATE shell32)
     elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(FOLIO_GIO REQUIRED IMPORTED_TARGET gio-2.0)
-        target_link_libraries(example_lib_rich_editor PRIVATE PkgConfig::FOLIO_GIO)
+        target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::FOLIO_GIO)
     endif ()
     include(math/renderer.cmake)
 endif()

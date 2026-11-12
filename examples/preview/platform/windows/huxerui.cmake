@@ -90,10 +90,10 @@ function(huxerui_configure_windows_project_package target_name install_component
     )
     target_compile_definitions(${target_name}_installer PRIVATE DRAFTSPAN_APP_NAME="${DRAFTSPAN_APP_NAME}")
     set_target_properties(${target_name}_installer PROPERTIES
-            OUTPUT_NAME "example_lib_rich_editor-Installer"
+            OUTPUT_NAME "${target_name}-Installer"
     )
     file(GENERATE
             OUTPUT "${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/$<CONFIG>/package.json"
-            CONTENT "{\n  \"schema\": 1,\n  \"name\": \"${DRAFTSPAN_APP_NAME}\",\n  \"target\": \"example_lib_rich_editor\",\n  \"version\": \"${PROJECT_VERSION}\",\n  \"installComponent\": \"${install_component}\",\n  \"packageSource\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/Package.wxs\",\n  \"bundleSource\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/Bundle.wxs\",\n  \"installerPlan\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/$<CONFIG>/installer.json\"\n}\n"
+            CONTENT "{\n  \"schema\": 1,\n  \"name\": \"${DRAFTSPAN_APP_NAME}\",\n  \"target\": \"${target_name}\",\n  \"version\": \"${PROJECT_VERSION}\",\n  \"installComponent\": \"${install_component}\",\n  \"packageSource\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/Package.wxs\",\n  \"bundleSource\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/Bundle.wxs\",\n  \"installerPlan\": \"${HUXERUI_WINDOWS_PACKAGE_DIRECTORY}/$<CONFIG>/installer.json\"\n}\n"
     )
 endfunction()

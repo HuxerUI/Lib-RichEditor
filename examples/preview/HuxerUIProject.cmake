@@ -12,7 +12,7 @@ if (HUXERUI_PROJECT_PLAN_OUTPUT)
   "kind": "app",
   "name": "@DRAFTSPAN_APP_NAME@",
   "id": "org.huxerui.lib.richeditor.preview",
-  "target": "example_lib_rich_editor"
+  "target": "@PROJECT_NAME@"
 }
 ]=] @ONLY)
 endif ()

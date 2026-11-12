@@ -21,12 +21,14 @@ function(huxerui_configure_linux_project_package target_name install_component)
                 COMPONENT "${install_component}"
         )
     endif ()
-    install(PROGRAMS "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/AppRun"
+    set(app_run "${CMAKE_CURRENT_BINARY_DIR}/huxerui-platform/linux/AppRun")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/AppRun" "${app_run}" @ONLY NEWLINE_STYLE UNIX)
+    install(PROGRAMS "${app_run}"
             DESTINATION .
             COMPONENT "${install_component}"
     )
     set(desktop_entry "${CMAKE_CURRENT_BINARY_DIR}/huxerui-platform/linux/${target_name}.desktop")
-    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/example_lib_rich_editor.desktop.in"
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/${target_name}.desktop.in"
             "${desktop_entry}" @ONLY)
     install(FILES "${desktop_entry}"
             DESTINATION .

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=@DRAFTSPAN_APP_NAME@
-Exec=example_lib_rich_editor
-Icon=example_lib_rich_editor
+Exec=@target_name@
+Icon=@target_name@
 Categories=Utility;
 Terminal=false

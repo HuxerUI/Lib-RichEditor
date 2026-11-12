@@ -158,7 +158,7 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		000000000000000000000500 /* example_lib_rich_editor */ = {
+		000000000000000000000500 /* Draftspan */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 000000000000000000000702;
 			buildPhases = (
@@ -170,7 +170,7 @@
 			);
 			buildRules = ();
 			dependencies = ();
-			name = example_lib_rich_editor;
+			name = Draftspan;
 			packageProductDependencies = (
 				000000000000000000000901 /* HuxerUILibraries */,
 			);
@@ -208,7 +208,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				000000000000000000000500 /* example_lib_rich_editor */,
+				000000000000000000000500 /* Draftspan */,
 			);
 		};
 /* End PBXProject section */
