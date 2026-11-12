@@ -79,8 +79,6 @@ Store an image file before calling `InsertImage` or `ReplaceImage`. A pointer ca
 
 Consecutive images share a line when they fit and wrap at narrower widths. Drag the bottom-right handle of a selected image to resize it in proportion. Application controls can read `SelectedImageSize()` and execute `ResizeImage{width}` to set the width, or `ResizeImage{}` to restore automatic sizing. A resize is one undoable edit. Strict Markdown export reports `markdown.image_size` for explicitly sized images. AllowLoss exports their references with automatic sizing.
 
-Folio stages newly inserted images under `attachments/` and uses relative references. Replacement gives the new image its own name, keeping the original available to Undo. **Save as…** and **Export copy…** create a subfolder for a document with local attachments. Move the entire subfolder to keep the references valid. **Open Folio document package…** opens an existing `article.json` or `article.md` and resolves its images from the selected folder.
-
 ## Appearance
 
 Use `RichEditorOptions::style` to set the background, text and accent colors, fonts, padding, block spacing, and the corner radii of inline code, highlights, and code blocks. `inline_code_horizontal_padding` reserves space on either side of a code span and participates in wrapping.
@@ -102,17 +100,17 @@ Unset colors and fonts inherit from the enclosing HuxerUI theme. To change the s
 
 ## Links
 
-Subscribe to `RichEditorEvents::LinkActivated` for Control-click or Command-click on linked text. The handler receives the `LinkRange` and returns `true` to handle navigation while keeping the current selection. Holding Control or Command over a link uses `RichEditorStyle::link_hover_color`, which defaults to the theme's `on_primary_container`. Folio opens absolute HTTP and HTTPS links in the system browser. The link menu offers **Open link**, and on Android and iOS the editing toolbar also shows it while the caret or selection is inside a web link.
+Subscribe to `RichEditorEvents::LinkActivated` for Control-click or Command-click on linked text. The handler receives the `LinkRange` and returns `true` to handle navigation while keeping the current selection. Holding Control or Command over a link uses `RichEditorStyle::link_hover_color`, which defaults to the theme's `on_primary_container`.
 
 ## Revealing text ranges
 
-Call `editor.RevealTextRange(block, range, ScrollAlignment::Center)` to center a search match or another range from the current document. `ScrollAlignment::Start` and `ScrollAlignment::End` align its top or bottom to the viewport. Omitting the alignment scrolls just far enough to reveal the first line. The editor keeps the selection and focus during navigation. Folio centers search matches as the viewport resizes, including when the software keyboard is dismissed.
+Call `editor.RevealTextRange(block, range, ScrollAlignment::Center)` to center a search match or another range from the current document. `ScrollAlignment::Start` and `ScrollAlignment::End` align its top or bottom to the viewport. Omitting the alignment scrolls just far enough to reveal the first line. The editor keeps the selection and focus during navigation.
 
 ## Keyboard shortcuts
 
 `DefaultEditorShortcuts()` lists the configurable editor commands and their default aliases. Pass a shared immutable `EditorKeymap` as `RichEditorOptions::keymap` to supply the complete editor binding table. A null pointer uses the defaults and an empty map clears them. Replace the shared map in composition to apply changes without restarting the text-input session. Use `RichEditorController::Execute()` for the same editing commands from toolbar controls.
 
-Use Ctrl or Command with 0–6 for the paragraph and heading styles. Add Shift with T, R, or Backslash to insert a table, a row below, or a column after the current cell. Folio's desktop **Keyboard** settings list the configurable grid commands.
+Use Ctrl or Command with 0–6 for the paragraph and heading styles. Add Shift with T, R, or Backslash to insert a table, a row below, or a column after the current cell.
 
 Ctrl+Enter or Command+Enter runs `ContinueInParagraph{}`. It splits a top-level paragraph or heading at the caret and starts typing without marks. Inside a list, quote, table, or code block, it goes to the paragraph below the enclosing top-level block and inserts one if needed. The existing content retains its formatting.
 
@@ -142,15 +140,13 @@ Choose `DecorationScope::Document` for analysis that needs context across blocks
 
 A top-level `Custom` block stores a namespaced type, payload version, UTF-8 payload, and fallback text. JSON v1 preserves these fields even when no renderer is registered. Register a `CustomBlockExtension` per type to display an image or vector asset. Use `InsertCustomBlock`, `SelectedCustomBlock()` and `ReplaceCustomBlock` to build application controls for its content. Edits and removal are undoable.
 
-Folio uses a custom block for standalone LaTeX and offers source editing and copying LaTeX from the formatting bar. RaTeX renders formulas locally on each supported preview platform. Unsupported expressions and builds with rendering disabled display editable source. Applications can use the same custom block API with their own types and renderers.
-
 ## Inline objects
 
 Paragraphs and headings, including text in lists, quotes and table cells, can contain atomic inline objects. Each object occupies one UTF-16 U+FFFC in the editing projection. The document stores its type, version, payload, fallback text and optional named attachment references. Undo and redo restore objects with their edited context. An inline object target remains valid when the object moves within the open document.
 
 Use `InsertInlineObject` with application-defined object data or the result of `InlineImage(image)`. `SelectedInlineObject()` returns the captured target and data for `ReplaceInlineObject`. Bind `RichEditorEvents::InlineObjectActivated` with `.On<...>()` to open an application editor. Control-click or Command-click, the corresponding Enter shortcut when an object is selected, and semantic activation emit the same event.
 
-Register an `InlineObjectExtension` per type for custom async rendering. The renderer supplies an image or vector with baseline dimensions. A missing or unresolved renderer shows fallback text. The built-in inline image presentation uses the same resolver and document directory as image blocks. Folio resolves local PNG and JPEG files from `attachments/` and migrates structured references alongside the document.
+Register an `InlineObjectExtension` per type for custom async rendering. The renderer supplies an image or vector with baseline dimensions. A missing or unresolved renderer shows fallback text. The built-in inline image presentation uses the same resolver and document directory as image blocks.
 
 `SelectedFragment()` and `InsertFragment` provide rich clipboard primitives for application bridges. Copying part of a table returns the selected cell text as paragraphs. Pasting inline text preserves its marks, links and objects in a text block. Rich block fragments can be inserted in a top-level text block. The SDK's system clipboard service carries plain text.
 
@@ -191,59 +187,18 @@ const MarkdownCodec markdown({.extensions = {MarkdownExtension{
 
 An unregistered fence is ordinary code. When a registered mapping claims a fence info string, exporting a regular code block with that info reports a loss. `AllowLoss` keeps the code body and omits the conflicting info. Missing or unrepresentable object mappings report losses with block paths and, for inline objects, UTF-16 ranges. `AllowLoss` can write the object's fallback text.
 
-Folio registers its own formula mappings and retains the existing `huxerui.latex` type in JSON v1. It imports inline dollar spans, standalone double-dollar spans, and `math` fences. Display formulas export as `math` fences to preserve the source, including whitespace and line breaks. The JSON codec preserves formula data regardless of the active Markdown mappings.
+## Tests
 
-## Preview and tests
-
-Folio builds its math renderer by default and requires Cargo and Rust. For native builds, run `rustup target add` with every target selected for the build.
-
-| Preview target | Rust target |
-| --- | --- |
-| Windows x64 | `x86_64-pc-windows-msvc` |
-| Android arm64-v8a / x86_64 | `aarch64-linux-android` / `x86_64-linux-android` |
-| macOS arm64 / x86_64 | `aarch64-apple-darwin` / `x86_64-apple-darwin` |
-| iOS arm64 device | `aarch64-apple-ios` |
-| iOS arm64 / x86_64 simulator | `aarch64-apple-ios-sim` / `x86_64-apple-ios` |
-| Linux arm64 / x86_64 | `aarch64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu` |
-| Web | `wasm32-unknown-emscripten` |
-
-For Web, run `rustup toolchain install nightly --profile minimal --component rust-src`. The build compiles Rust's standard library with HuxerUI's Emscripten toolchain.
-
-For source-only formulas, configure CMake with `-DFOLIO_BUILD_MATH_RENDERER=OFF`. On Android, pass `-PfolioBuildMathRenderer=OFF` to Gradle. On iOS, set `FOLIO_BUILD_MATH_RENDERER = OFF` in `Config/Local.xcconfig`.
+For MSVC builds, add `/utf-8` and `/bigobj` to the `CL` environment variable in the Visual Studio developer shell.
 
 ```sh
-huxerui run macos --profile debug
-huxerui run android --profile debug --abi arm64-v8a --java-home "$(/usr/libexec/java_home -v 17)"
-
 cmake -S . -B build -DHUXERUI_RICHEDITOR_BUILD_TESTS=ON
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-The mounted tests use `HuxerUI::testing` when the SDK includes it. In Folio, open **Settings** from the sidebar or **File actions**. **Appearance** offers **Follow system** and eight themes. **Editor** controls text size and reading width. In **Keyboard**, choose a command and press a combination on a physical keyboard to replace its current shortcuts. Confirming a conflict removes just the overlapping combination from the other command. Clear or restore a command from its shortcut dialog, or use **Restore all defaults** in the keyboard settings. Preferences apply immediately across windows and are restored on launch. On compact screens, the toolbar pins **Undo** and the overflow menu and puts the actions for the current selection first in the horizontally scrollable area. Hover or long-press an icon to see its command.
+The mounted tests use `HuxerUI::testing` when the SDK includes it.
 
-On desktop, open **Command palette…** from **File actions**, or press **Command+Shift+P** on macOS or **Ctrl+Shift+P** on other platforms. Search by command name or a common Chinese alias. Results show the current shortcut and whether the action can run at the current caret or selection. Use the arrow keys and Enter to run a result, or select it directly. Android and iOS omit the menu entry and the **Keyboard** settings page. The shortcuts, including the palette binding, remain available with a physical keyboard.
+## Example application
 
-Folio follows the system language. Its interface supports English, Simplified Chinese, Japanese, Korean, German, French, and Spanish. English is the fallback.
-
-Folio starts with an empty workspace. **Open file…** accepts RichEditor JSON, `.md`, and `.markdown` and opens a tab. The **Files** sidebar lists standalone documents alongside authorized folders. Select a standalone file to switch to its tab, or expand a folder to open a document from its tree. Closing a standalone tab removes its row from the workspace. **Recent edits** can reopen it. The control at the sidebar’s upper right hides it, and **Show files** in the title bar restores it. On compact mobile hosts, **Show files** opens the drawer. Select the file name in the header to switch tabs. A standalone document with relative image references opens with placeholders. Use **Locate attachments…** to load the images.
-
-Folio accepts `.md` and `.markdown` files opened from Windows File Explorer, macOS Finder, and Files on iOS. The Windows installer adds Folio to **Open with**. On Android, file managers can open a Markdown document in Folio by sending it as `text/markdown`. Opening a file starts Folio or opens it in the running app. If Folio can identify an already open file, it switches to its tab.
-
-If a document fails to open, the dialog lists the import issues by file. When Markdown can be converted with reported losses, **Open lossy copy** opens an unsaved tab. Use **Save** to choose a new destination. The copy can resolve relative attachments from the source folder if it has already been authorized.
-
-Desktop windows have independent tabs and sidebars. **Recent edits** is shared while Folio is running. **Save** checks the source file before writing back in its original format. **Save as…** creates and binds a file in a writable directory. **Export copy…** creates a separate JSON or Markdown copy. Closing a tab or window prompts for unsaved changes.
-
-Choose **File actions** → **Load sample**, then enter Chinese text with an IME and select across paragraphs. Apply underline and bold in separate actions, undo bold, and check that the underline and committed text remain. Choose **Save as…** with JSON, then reopen the saved file with **Open file…**. Export a Markdown copy to see the underline diagnostic. Confirm **Export with loss…** to continue.
-
-Open the text style menu to switch between paragraph, heading levels 1 through 6, and code block. Select text to insert a link, or place the caret inside an existing link to edit, copy, or remove its address.
-
-Place the caret in the sample's ordered list and open **List numbering** to set a starting number, restart at one, or change the indent. Undo restores the previous numbering, and the new start can be saved in JSON and Markdown.
-
-Toggle a sample task by clicking or tapping its checkbox. Use **Task list** in the desktop toolbar or under **More formatting** → **Lists and quote** on a compact screen to add a checkbox at the caret. Enter creates an unchecked item. Undo and redo restore task changes, and reopening JSON or Markdown restores their completion states.
-
-To exercise tables, select a cell in the sample. The compact toolbar shows **+ Row** and **+ Column**. Open **Table actions** → **Column alignment** to change the selected column. Enter Chinese text in one cell, save, and reopen JSON. A Markdown copy preserves the table and its alignments while it has a header and representable styles. Turn off **Header row** to verify the diagnostic, then export with loss to save a table with a synthesized header. Use **More formatting** → **Insert** → **Insert divider** to add a thematic break.
-
-To exercise images, place the caret in a top-level paragraph and choose **Insert image** to select a PNG or JPEG. On compact screens, find it under **More formatting** → **Insert**. Selecting an image dismisses the software keyboard and shows **Size**, **Replace**, and **+ Image** on the compact toolbar. Drag a corner or open the size dialog to set the width or height and watch the other dimension update. Size the pair to fit on the same line and undo a resize. Choose **Save as…**, move the resulting subfolder, and open its document from the folder sidebar. A Markdown copy includes the referenced local attachments.
-
-Enter starts a new paragraph without carrying over pending inline formats. At the start of a list item's text, Enter creates an empty sibling above it and puts the caret in the new item. At the end of a parent item's leading text, Enter adds the next sibling after its sublist. With content still following an empty subitem in the parent, Enter leaves an unmarked continuation when it can preserve the parent's marker. Otherwise it removes the empty item and moves the caret to the next block, as Backspace does. Enter or Backspace on a trailing empty list item or quote paragraph exits that structure at the caret. In code and table cells, the keyboard's Enter key inserts a newline inside the block. On mobile, **Continue below** in the toolbar moves the caret to the following paragraph. Shift+Enter keeps the format on a break within a paragraph.
+See the [example application README](examples/preview/README.md) for build and usage instructions.
