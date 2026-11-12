@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <set>
 #include <utility>
 #include <variant>
 
@@ -77,7 +78,7 @@ struct AttachmentLocation {
       : directories(std::move(directories)), resolver(AttachmentResolver(working_directory, this->directories)) {}
 };
 
-enum class Operation { Idle, PickImage, LocateAttachments, Save, Export };
+enum class Operation { Idle, PickImage, LocateAttachments, Save, Export, Delete };
 
 struct FolderEntry;
 using Entry = std::shared_ptr<FolderEntry>;
@@ -126,6 +127,14 @@ struct DocumentTab {
   }
 
   bool Busy() const { return operation.Get() != Operation::Idle; }
+
+  std::string_view LibraryId() const {
+    if (const auto& pending = unresolved.Get()) {
+      return pending->library_document;
+    }
+    const auto& original = saved.Get();
+    return original ? std::string_view(original->target->library_id) : std::string_view{};
+  }
 
   void SetAttachmentDirectory(FileSource directory) {
     unavailable_attachments.reset();
@@ -248,6 +257,32 @@ struct Workspace {
   }
 };
 
+using LibraryIds = std::set<std::string, std::less<>>;
+
+LibraryIds EntryIds(const std::vector<LibraryEntry>& entries) {
+  LibraryIds ids;
+  for (const auto& entry : entries) {
+    ids.insert(entry.id);
+  }
+  return ids;
+}
+
+template <class Removed>
+void PruneLibraryReferences(WorkspaceRecord& record, const Removed& removed) {
+  std::erase_if(record.recent, [&](const WorkspaceRecentRecord& item) {
+    return !item.library_document.empty() && removed(item.library_document);
+  });
+  for (auto& window : record.windows) {
+    std::erase_if(window.tabs, [&](const WorkspaceTabRecord& tab) {
+      return !tab.library_document.empty() && removed(tab.library_document);
+    });
+    std::erase_if(window.library_expanded, [&](const std::string& id) { return !id.empty() && removed(id); });
+    if (std::ranges::find(window.tabs, window.selected, &WorkspaceTabRecord::id) == window.tabs.end()) {
+      window.selected = window.tabs.empty() ? 0 : window.tabs.front().id;
+    }
+  }
+}
+
 struct FolioState {
   std::shared_ptr<WorkspaceStore> store;
   std::shared_ptr<DocumentLibrary> library;
@@ -255,6 +290,7 @@ struct FolioState {
   std::vector<WorkspaceWindowRecord> restore_windows;
   std::optional<WorkspaceWindowRecord> installing;
   State<std::size_t> restoring{0};
+  State<bool> deleting_library_entries{false};
   State<std::vector<Recent>> recent{std::vector<Recent>{}};
   State<std::vector<Target>> pending_files{std::vector<Target>{}};
   std::vector<std::weak_ptr<Workspace>> windows;
@@ -446,6 +482,88 @@ struct FolioState {
     });
     PersistRecent();
   }
+
+  std::vector<Tab> LibraryTabs(const LibraryIds& ids) const {
+    std::vector<Tab> result;
+    for (const auto& weak : windows) {
+      if (const auto owner = weak.lock()) {
+        for (const auto& tab : owner->tabs.Get()) {
+          if (ids.contains(tab->LibraryId())) {
+            result.push_back(tab);
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  bool LibraryDeleteBusy(const LibraryIds& ids) const {
+    if (deleting_library_entries.Get() || restoring.Get() != 0) {
+      return true;
+    }
+    for (const auto& weak : windows) {
+      if (const auto owner = weak.lock()) {
+        if (owner->picking.Get() || owner->closing.Get()) {
+          return true;
+        }
+        if (std::ranges::any_of(owner->tabs.Get(), [&](const Tab& tab) {
+              return tab->Busy() && (ids.contains(tab->LibraryId()) ||
+                  (tab->library_folder && ids.contains(*tab->library_folder)));
+            })) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  std::vector<File> ForgetLibraryEntries(const LibraryIds& ids) const {
+    std::vector<File> temporary;
+    auto saved = store->Get();
+    PruneLibraryReferences(saved, [&](std::string_view id) { return ids.contains(id); });
+    for (const auto& weak : windows) {
+      const auto owner = weak.lock();
+      if (!owner) {
+        continue;
+      }
+      auto open = owner->tabs.Get();
+      const auto active = owner->Selected();
+      const bool removing_active = active && ids.contains(active->LibraryId());
+      const auto replacement = removing_active ? static_cast<std::size_t>(std::count_if(
+          open.begin(), std::ranges::find(open, active), [&](const Tab& tab) { return !ids.contains(tab->LibraryId()); }))
+          : 0;
+      std::erase_if(open, [&](const Tab& tab) {
+        if (tab->library_folder && ids.contains(*tab->library_folder)) {
+          tab->library_folder.reset();
+        }
+        if (!ids.contains(tab->LibraryId())) {
+          return false;
+        }
+        if (tab->working_directory) {
+          temporary.push_back(*tab->working_directory);
+        }
+        return true;
+      });
+      if (removing_active) {
+        const auto selected = open.empty() ? 0 : open[std::min(replacement, open.size() - 1)]->id;
+        owner->selected = selected;
+        const auto window = std::ranges::find(saved.windows, owner->id, &WorkspaceWindowRecord::id);
+        if (window != saved.windows.end() &&
+            std::ranges::find(window->tabs, selected, &WorkspaceTabRecord::id) != window->tabs.end()) {
+          window->selected = selected;
+        }
+      }
+      owner->tabs = std::move(open);
+      owner->library_expanded.Update([&](auto& expanded) {
+        std::erase_if(expanded, [&](const std::string& id) { return ids.contains(id); });
+      });
+    }
+    recent.Update([&](auto& entries) {
+      std::erase_if(entries, [&](const Recent& item) { return ids.contains(item->record.library_document); });
+    });
+    store->Set(std::move(saved));
+    return temporary;
+  }
 };
 
 enum class OpenKind { File, Folder, Package, Import };
@@ -509,6 +627,7 @@ public:
   std::shared_ptr<FilePicker> picker;
   std::shared_ptr<Resources> resources;
   TaskScope tasks;
+  TaskScope application_tasks;
   DialogHandle dialog;
   ViewHandle file_menu_focus;
   ViewHandle palette_focus;
@@ -516,7 +635,8 @@ public:
   bool modal_sidebar;
 
   bool Available() const {
-    return !workspace->picking.Get() && !workspace->closing.Get() && !workspace->showing_open_issues.Get();
+    return !folio->deleting_library_entries.Get() && !workspace->picking.Get() && !workspace->closing.Get() &&
+        !workspace->showing_open_issues.Get();
   }
   bool CanExecute(FolioCommand command) const;
   void Execute(FolioCommand command, bool keyboard = false) const;
@@ -527,6 +647,7 @@ public:
   void NewLibraryFolder(std::string parent) const;
   void ChooseLibraryDestination(std::string id) const;
   void MoveLibraryEntry(std::string id, std::string parent) const;
+  void ConfirmLibraryDelete(std::string id) const;
   void JumpToHeading(const Tab& tab, const Block& block, TextOffset length) const;
   void NewWindow() const;
   void PickOpen(OpenKind kind) const { PickOpen(OpenRequest{kind}); }
@@ -557,7 +678,8 @@ private:
              Entry source_folder = {}, std::optional<FileSource> attachment_directory = {},
              std::optional<std::string> library_folder = {}) const;
   void EditLibraryName(LibraryEntry entry, bool creating) const;
-  void UpdateLibraryEntry(LibraryEntry entry) const;
+  void ReportLibraryDeleteFailure(StringVariant reason) const;
+  void DeleteLibraryEntries(std::vector<LibraryEntry> expected, std::set<DocumentId> confirmed_dirty) const;
   std::shared_ptr<Workspace> ActivateExisting(const Target& target, const Entry& source_folder) const;
   Task<OpenResult> OpenTarget(Target target, const Entry& source_folder) const;
   Task<void> OpenTargets(std::vector<Target> targets, Entry source_folder = {}, RecentKind kind = RecentKind::File,
@@ -589,7 +711,8 @@ private:
                                SavePayload payload) const;
   void OfferSaveAs(Save request, std::string message) const;
 
-  void ShowChoices(StringVariant title, StringVariant message, std::vector<Choice> choices) const;
+  void ShowChoices(StringVariant title, StringVariant message, std::vector<Choice> choices,
+                   bool dismiss_on_cancel = false) const;
   void ContinueClose() const;
   void SaveBeforeClose(std::shared_ptr<const std::vector<Tab>> dirty, std::size_t index) const;
   void FinishClose() const;
@@ -1615,11 +1738,12 @@ View ChoiceDialog(DialogContext context, const StringVariant& title, const Strin
     theme, 440.0F);
 }
 
-void WorkbenchActions::ShowChoices(StringVariant title, StringVariant message, std::vector<Choice> choices) const {
+void WorkbenchActions::ShowChoices(StringVariant title, StringVariant message, std::vector<Choice> choices,
+                                   bool dismiss_on_cancel) const {
   dialog.Show(DialogFactory{[title = std::move(title), message = std::move(message),
                             choices = std::move(choices)](DialogContext context) {
     return ChoiceDialog(context, title, message, choices);
-  }}, {.dismiss_on_outside_press = false, .dismiss_on_cancel = false});
+  }}, {.dismiss_on_outside_press = false, .dismiss_on_cancel = dismiss_on_cancel});
 }
 
 void WorkbenchActions::ShowOpenFailures(std::vector<OpenFailure> failures) const {
@@ -1685,6 +1809,7 @@ StringVariant LibraryWriteMessage(LibraryWriteResult result) {
   case LibraryWriteResult::NameInUse: return l10n::name_already_used;
   case LibraryWriteResult::Busy: return l10n::library_write_busy;
   case LibraryWriteResult::Unavailable: return l10n::library_entry_unavailable;
+  case LibraryWriteResult::Changed: return l10n::library_delete_changed;
   case LibraryWriteResult::WriteFailed: return l10n::library_change_failed;
   }
   return {};
@@ -1800,24 +1925,129 @@ void WorkbenchActions::RenameLibraryEntry(std::string id) const {
   }
 }
 
-void WorkbenchActions::UpdateLibraryEntry(LibraryEntry entry) const {
-  Launch(false, [self = *this, entry = std::move(entry)]() -> Task<void> {
-    const auto result = co_await self.folio->library->Put(entry);
-    if (result != LibraryWriteResult::Saved) {
-      self.Status({}, LibraryWriteMessage(result));
+void WorkbenchActions::MoveLibraryEntry(std::string id, std::string parent) const {
+  const auto library = folio->library;
+  if (!Available() || !library || !library->CanPlace(id, parent)) {
+    return;
+  }
+  Launch(false, [self = *this, library, id = std::move(id), parent = std::move(parent)]() -> Task<void> {
+    auto entry = library->Find(id);
+    if (!entry) {
+      self.Status({}, l10n::library_entry_unavailable);
       co_return;
     }
-    self.SetLibraryExpanded(entry.parent, true);
+    if (entry->parent == parent) {
+      co_return;
+    }
+    entry->parent = parent;
+    const auto result = co_await library->Put(std::move(*entry));
+    if (result == LibraryWriteResult::Saved) {
+      self.SetLibraryExpanded(parent, true);
+    } else {
+      self.Status({}, LibraryWriteMessage(result));
+    }
   });
 }
 
-void WorkbenchActions::MoveLibraryEntry(std::string id, std::string parent) const {
-  if (Available()) {
-    if (auto entry = folio->library->Find(id); entry && entry->parent != parent && folio->library->CanPlace(id, parent)) {
-      entry->parent = std::move(parent);
-      UpdateLibraryEntry(std::move(*entry));
+void WorkbenchActions::ConfirmLibraryDelete(std::string id) const {
+  if (!Available() || !folio->library) {
+    return;
+  }
+  auto expected = folio->library->Subtree(id);
+  if (expected.empty()) {
+    return;
+  }
+  const auto ids = EntryIds(expected);
+  if (folio->LibraryDeleteBusy(ids)) {
+    ReportLibraryDeleteFailure(l10n::library_write_busy);
+    return;
+  }
+  const auto& root = expected.front();
+  auto title = StringVariant::Format(l10n::library_delete_title, root.name);
+  std::string message;
+  if (!root.folder) {
+    message = resources->GetString(l10n::library_delete_document);
+  } else if (expected.size() == 1) {
+    message = resources->GetString(l10n::library_delete_empty_folder);
+  } else {
+    const auto documents = std::ranges::count(expected, false, &LibraryEntry::folder);
+    const auto folders = expected.size() - static_cast<std::size_t>(documents) - 1;
+    message = resources->GetString(StringVariant::Format(l10n::library_delete_folder, documents, folders));
+  }
+  std::set<DocumentId> confirmed_dirty;
+  std::string dirty_names;
+  for (const auto& tab : folio->LibraryTabs(ids)) {
+    if (tab->Dirty()) {
+      confirmed_dirty.insert(tab->id);
+      if (root.folder) {
+        dirty_names += "\n• " + tab->Name();
+      }
     }
   }
+  if (!confirmed_dirty.empty()) {
+    message += "\n\n" + resources->GetString(l10n::library_delete_unsaved) + dirty_names;
+  }
+  ShowChoices(std::move(title), std::move(message), {
+      {l10n::cancel, [] {}},
+      {l10n::library_delete, [self = *this, expected = std::move(expected),
+                             confirmed_dirty = std::move(confirmed_dirty)]() mutable {
+        self.DeleteLibraryEntries(std::move(expected), std::move(confirmed_dirty));
+      }, ChoiceTone::Destructive},
+  }, true);
+}
+
+void WorkbenchActions::ReportLibraryDeleteFailure(StringVariant reason) const {
+  ShowChoices(l10n::library_delete_failed, std::move(reason), {{l10n::close, [] {}}}, true);
+}
+
+void WorkbenchActions::DeleteLibraryEntries(std::vector<LibraryEntry> expected,
+                                            std::set<DocumentId> confirmed_dirty) const {
+  const auto ids = EntryIds(expected);
+  if (!Available() || folio->LibraryDeleteBusy(ids)) {
+    ReportLibraryDeleteFailure(l10n::library_write_busy);
+    return;
+  }
+  auto tabs = folio->LibraryTabs(ids);
+  if (std::ranges::any_of(tabs, [&](const Tab& tab) { return tab->Dirty() && !confirmed_dirty.contains(tab->id); })) {
+    ReportLibraryDeleteFailure(l10n::library_delete_changed);
+    return;
+  }
+  auto name = expected.front().name;
+  folio->deleting_library_entries = true;
+  for (const auto& tab : tabs) {
+    tab->operation = Operation::Delete;
+  }
+  application_tasks.Launch([self = *this, expected = std::move(expected), ids, tabs = std::move(tabs),
+                            name = std::move(name)]() mutable -> Task<void> {
+    auto result = LibraryWriteResult::WriteFailed;
+    std::string failure;
+    try {
+      result = co_await self.folio->library->Remove(std::move(expected));
+    } catch (const std::exception& error) {
+      failure = error.what();
+    }
+    if (result != LibraryWriteResult::Saved) {
+      for (const auto& tab : tabs) {
+        tab->operation = Operation::Idle;
+      }
+      self.folio->deleting_library_entries = false;
+      self.ReportLibraryDeleteFailure(failure.empty() ? LibraryWriteMessage(result) : StringVariant(std::move(failure)));
+      co_return;
+    }
+    const auto temporary = self.folio->ForgetLibraryEntries(ids);
+    self.folio->deleting_library_entries = false;
+    bool cleaned = false;
+    try {
+      cleaned = co_await self.folio->library->CollectDeletedPackages();
+    } catch (const std::exception&) {
+      // The catalog retains the pending packages for the next launch.
+    }
+    self.Status({}, cleaned ? StringVariant::Format(l10n::library_deleted, name)
+                            : StringVariant(l10n::library_delete_cleanup_pending));
+    for (const auto& directory : temporary) {
+      (void)co_await directory.DeleteRecursivelyAsync();
+    }
+  });
 }
 
 [[huxerui::composable]]
@@ -2389,7 +2619,7 @@ void WorkbenchActions::OfferSaveAs(Save request, std::string message) const {
 }
 
 void WorkbenchActions::RequestClose(Tab tab) const {
-  if (workspace->closing.Get()) {
+  if (folio->deleting_library_entries.Get() || workspace->closing.Get()) {
     return;
   }
   if (!tab || workspace->selected.Get() == tab->id) {
@@ -2507,7 +2737,9 @@ View DocumentPage(WorkbenchActions actions, Tab tab, bool active) {
     tab->editor_focus = focus;
   }, editor, focus);
   const auto& attachments = tab->attachments.Get();
-  const bool available = active && !actions.workspace->closing.Get() && tab->operation.Get() != Operation::PickImage;
+  const auto operation = tab->operation.Get();
+  const bool available = active && !actions.workspace->closing.Get() && operation != Operation::PickImage &&
+      operation != Operation::Delete;
   const bool needs_attachments = active && tab->opened_with_attachments && attachments.directories.empty();
   View notice;
   if (needs_attachments) {
@@ -2651,7 +2883,9 @@ View DocumentArea(WorkbenchActions actions) {
     content = IndexedPages(std::move(pages), index).With(Grow());
   }
   auto status = actions.workspace->status.Get();
-  if (actions.workspace->picking.Get()) {
+  if (actions.folio->deleting_library_entries.Get()) {
+    status = UseString(l10n::library_deleting);
+  } else if (actions.workspace->picking.Get()) {
     status = UseString(l10n::working);
   } else if (active) {
     switch (active->operation.Get()) {
@@ -2796,6 +3030,10 @@ std::vector<MenuEntry> LibraryMenu(WorkbenchActions actions, const LibraryEntry&
     menu.emplace_back(MenuItem(l10n::library_move_menu, [actions, id = entry.id] {
       actions.ChooseLibraryDestination(id);
     }).Enabled(can_move));
+    menu.emplace_back(MenuSection{});
+    menu.emplace_back(MenuItem(l10n::library_delete_menu, [actions, id = entry.id] {
+      actions.ConfirmLibraryDelete(id);
+    }));
   }
   return menu;
 }
@@ -3498,6 +3736,12 @@ void InstallFolioWithWorkspace(ApplicationContext& context, std::shared_ptr<Work
     folio->library = std::make_shared<DocumentLibrary>(data_directory->Child("library"));
   }
   folio->store = store ? std::move(store) : std::make_shared<WorkspaceStore>(data_directory);
+  if (const auto& library = folio->library; library && library->HasSavedCatalog()) {
+    auto record = folio->store->Get();
+    PruneLibraryReferences(record, [&](std::string_view id) { return !library->Find(id); });
+    folio->store->Set(std::move(record));
+    UseApplicationTaskScope().Launch([library]() -> Task<void> { (void)co_await library->CollectDeletedPackages(); });
+  }
   const auto& saved = folio->store->Get();
   std::vector<Recent> recent;
   for (const auto& item : saved.recent) {
@@ -3586,7 +3830,7 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
   const auto sidebar_open = modal_sidebar ? workspace->drawer_open : workspace->sidebar_visible;
   const WorkbenchActions actions{
       folio, workspace, application, window, UseService<FilePicker>(), UseService<Resources>(),
-      UseTaskScope(), UseDialog(), UseViewHandle(),
+      UseTaskScope(), application_tasks, UseDialog(), UseViewHandle(),
       UseViewHandle(), sidebar_open, modal_sidebar,
   };
   Lifecycle([folio, workspace, window, application_tasks] {

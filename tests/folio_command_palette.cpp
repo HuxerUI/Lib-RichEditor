@@ -224,7 +224,10 @@ void LibraryStorageFlow(const File& directory, const char* package_path) {
       const LibraryEntry moved{"library-doc", "Planning", "archive", false};
       Check((co_await library->Put(parent)) == LibraryWriteResult::Saved, "The library creates a top-level folder");
       Check((co_await library->Put(nested)) == LibraryWriteResult::Saved, "The library creates a nested folder");
+      const auto confirmed = library->Subtree(parent.id);
       Check((co_await library->Put(reserved)) == LibraryWriteResult::Saved, "The library creates a sibling name fixture");
+      Check((co_await library->Remove(confirmed)) == LibraryWriteResult::Changed && library->Find(reserved.id),
+            "Deletion refuses a confirmation that predates an added descendant");
       Check(!library->CanPlace("project", "archive"), "A folder cannot move into its own descendants");
       Check((co_await library->Put(initial)) == LibraryWriteResult::Saved &&
                 (co_await library->Put(moved)) == LibraryWriteResult::Saved,
@@ -322,6 +325,139 @@ void LibraryStorageFlow(const File& directory, const char* package_path) {
       return !entry.at("folder").template get<bool>() && entry.at("id") != "library-doc" && entry.at("parent") == "archive";
     });
   });
+}
+
+void LibraryDeleteFlow(const File& directory, const char* package_path) {
+  using namespace folio;
+  using Json = nlohmann::json;
+  const auto library = directory.Child("library");
+  const auto catalog = library.Child("catalog.json");
+  const auto documents = library.Child("documents");
+  const auto external = directory.Child("External.md");
+  const auto managed = documents.Child("article");
+  const auto attachment = managed.Child("attachments").Child("sample.png");
+  const auto orphan = documents.Child("already-deleted");
+  const Json entries = Json::array({
+      {{"id", "project"}, {"name", "Project"}, {"parent", ""}, {"folder", true}},
+      {{"id", "nested"}, {"name", "Nested"}, {"parent", "project"}, {"folder", true}},
+      {{"id", "article"}, {"name", "Article"}, {"parent", "nested"}, {"folder", false}},
+      {{"id", "keep"}, {"name", "Keep"}, {"parent", ""}, {"folder", true}},
+  });
+  const auto input = Codec(DocumentFormat::Markdown).Import("# Managed body");
+  Check(input.document.has_value(), "Create the managed document fixture");
+  const auto encoded = Codec(DocumentFormat::Json).Export(*input.document);
+  Check(encoded.text && attachment.Parent()->CreateDirectories() && attachment.WriteString("image bytes") &&
+            managed.Child("article.json").WriteString(*encoded.text) &&
+            orphan.CreateDirectories() && orphan.Child("article.json").WriteString(*encoded.text) &&
+            external.WriteString("# External body") &&
+            catalog.WriteString(Json{{"version", 1}, {"entries", entries}, {"pending_deletions", {"already-deleted"}}}.dump()),
+        "Write the workspace and a pending package cleanup from a previous launch");
+  const WorkspaceLocation external_location{external.Path(), false};
+  bool seed = true;
+  const Application app(App, {.show_debug_overlay = false,
+      .application_hooks = {[&](ApplicationContext& context) {
+        auto store = std::make_shared<WorkspaceStore>(directory);
+        if (std::exchange(seed, false)) {
+          store->Set({.active_window = "workbench", .windows = {{.id = "workbench",
+              .tabs = {{.id = 1, .name = "Article", .library_document = "article"},
+                       {.id = 2, .name = "External.md", .location = external_location},
+                       {.id = 3, .name = "Stale", .library_document = "already-deleted"}},
+              .selected = 1, .library_expanded = {"project", "nested", "keep"}}},
+              .recent = {{"article", "Article", {}, RecentKind::File, "article"},
+                         {"external", "External.md", external_location},
+                         {"stale", "Stale", {}, RecentKind::File, "already-deleted"}}});
+        }
+        InstallFolioWithWorkspace(context, std::move(store), directory);
+      }},
+      .window_hooks = {InstallWorkbench}});
+  const auto options = UiTestOptions{.viewport = {360, 640},
+      .resource_provider = std::make_shared<PackageResources>(package_path)};
+  {
+    UiTest ui(app, options);
+    const auto read_catalog = [&] { return Json::parse(catalog.ReadString().Value()); };
+    const auto read_workspace = [&] { return Json::parse(directory.Child("workspace.json").ReadString().Value()); };
+    const auto by_label = [&](std::string label) { return ui.FindSemantics(UiSemanticSelector::Label(std::move(label))); };
+    const auto tap = [&](const UiSemanticQuery& target) {
+      const auto bounds = target.One().bounds;
+      ui.TapAt({bounds.x + bounds.width / 2, bounds.y + bounds.height / 2});
+    };
+    const auto editor = ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
+    WaitForFixture(ui, [&] { return editor.Exists() && !read_catalog().contains("pending_deletions"); });
+    const auto restored = read_workspace();
+    Check(!orphan.Stat().Succeeded() && restored.at("recent").size() == 2 &&
+              restored.at("windows").front().at("tabs").size() == 2,
+          "Restart removes stale deleted tabs and history and finishes queued package cleanup");
+    tap(editor);
+    Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = " Unsaved"}});
+    tap(ui.FindSemantics(UiSemanticSelector::Identifier("show-sidebar")));
+    ui.Pump(400ms);
+    const auto delete_menu = ui.Find(UiSelector::Text("Delete…"));
+    tap(by_label("Actions for External.md"));
+    Check(ui.Find(UiSelector::Text("Remove from recently opened")).Exists() && !delete_menu.Exists(),
+          "External history offers removal without a delete command");
+    ui.PressKey(Key::Escape);
+    const auto confirm = ui.Find(UiSelector::Text("Delete"));
+    const auto article_actions = by_label("Actions for Article").All();
+    Check(article_actions.size() == 2, "The managed article is present in the workspace and recent history");
+    const auto article_bounds = article_actions.front().bounds;
+    ui.TapAt({article_bounds.x + article_bounds.width / 2, article_bounds.y + article_bounds.height / 2});
+    delete_menu.Tap();
+    WaitForFixture(ui, [&] { return confirm.Exists(); });
+    Check(ui.Find(UiSelector::Text("Delete “Article”?")).Exists() &&
+              ui.Find(UiSelector::Text("This permanently deletes the document and its attachments\n\n"
+                                       "Unsaved changes in open documents will also be discarded")).Exists(),
+          "A single document confirmation names the document and warns about its attachment and unsaved changes");
+    ui.PressKey(Key::Escape);
+    WaitForFixture(ui, [&] { return !confirm.Exists(); });
+    const auto open_delete = [&] {
+      tap(by_label("Actions for Project"));
+      delete_menu.Tap();
+      WaitForFixture(ui, [&] { return confirm.Exists(); });
+    };
+    open_delete();
+    const auto cancel = by_label("Cancel");
+    Check(cancel.One().focused, "The destructive dialog initially focuses Cancel");
+    Check(ui.Find(UiSelector::Text("This permanently deletes the folder and its contents, including attachments\n"
+                                   "Documents: 1 · Subfolders: 1\n\n"
+                                   "Unsaved changes in open documents will also be discarded\n• Article")).Exists(),
+          "The confirmation counts descendants and names the document with unsaved changes");
+    ui.PressKey(Key::Enter);
+    WaitForFixture(ui, [&] { return !confirm.Exists(); });
+    Check(read_catalog().at("entries") == entries && attachment.Stat().Succeeded(),
+          "Activating the default Cancel leaves the catalog and attachments intact");
+
+    const auto blocked = library.Child("catalog.json.tmp");
+    Check(blocked.CreateDirectories() && blocked.Child("fixture").WriteString(""), "Block the catalog write");
+    open_delete();
+    confirm.Tap();
+    const auto failure = ui.Find(UiSelector::Text("Could not delete"));
+    WaitForFixture(ui, [&] { return failure.Exists(); });
+    Check(attachment.Stat().Succeeded() && read_workspace().at("windows").front().at("tabs").size() == 2 &&
+              read_catalog().at("entries") == entries,
+          "A failed catalog write keeps the original file, workspace entry and tab");
+    ui.Find(UiSelector::Text("Close")).Tap();
+    WaitForFixture(ui, [&] { return !failure.Exists(); });
+    Check(blocked.DeleteRecursively(), "Allow the catalog write to be retried");
+
+    open_delete();
+    confirm.Tap();
+    WaitForFixture(ui, [&] { return !managed.Stat().Succeeded() && !read_catalog().contains("pending_deletions"); });
+    const auto saved = read_workspace();
+    const auto& window = saved.at("windows").front();
+    const auto& recent = saved.at("recent");
+    Check(read_catalog().at("entries") == Json::array({entries.back()}) && external.Stat().Succeeded(),
+          "Confirming removes the subtree and its attachment while keeping unrelated entries and external files");
+    Check(window.at("tabs").size() == 1 && window.at("selected") == 2 &&
+              window.at("library_expanded") == Json::array({"keep"}) &&
+              recent.size() == 1 && recent.front().at("id") == "external",
+          "The workspace clears deleted tabs, history and expansion state and selects the surviving tab");
+  }
+  {
+    UiTest ui(app, options);
+    const auto editor = ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
+    WaitForFixture(ui, [&] { return editor.Exists(); });
+    Check(editor.One().value == "External body", "Restart opens the surviving tab");
+  }
 }
 
 void ExternalHistoryFlow(const File& directory, const char* package_path) {
@@ -818,6 +954,7 @@ int main(int argc, char** argv) {
     }
     WorkspaceRestoreFlow(directory.Child("flow"), argv[1]);
     LibraryStorageFlow(directory.Child("library-flow"), argv[1]);
+    LibraryDeleteFlow(directory.Child("library-delete"), argv[1]);
     ExternalHistoryFlow(directory.Child("external-history"), argv[1]);
     CompactCodeTools(argv[1]);
     PaletteFlow(argv[1]);
