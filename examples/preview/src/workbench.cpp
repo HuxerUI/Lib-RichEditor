@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <set>
@@ -21,6 +22,7 @@
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
+using namespace std::chrono_literals;
 
 View App();
 
@@ -99,6 +101,8 @@ struct DocumentTab {
   State<std::string> status{std::string{}};
   State<std::optional<std::string>> pending_anchor{std::nullopt};
   State<std::optional<WorkspaceTabRecord>> unresolved{std::nullopt};
+  std::optional<ReadingPosition> reading_position;
+  State<bool> restore_reading_position{false};
   std::vector<std::string> source_relative;
   std::optional<std::string> library_folder;
   std::optional<WorkspaceLocation> unavailable_attachments;
@@ -257,6 +261,7 @@ struct Workspace {
   bool allow_close = false;
   bool palette_open = false;
   State<bool> restoring{false};
+  std::optional<TaskHandle> reading_position_save;
   std::uint64_t next_entry = 0;
 
   Tab Selected() const {
@@ -372,10 +377,12 @@ struct FolioState {
       }
       const auto& target = *original->target;
       if (target.library) {
-        window.tabs.push_back({.id = tab->id, .name = tab->Name(), .library_document = target.library_id});
+        window.tabs.push_back({.id = tab->id, .name = tab->Name(), .library_document = target.library_id,
+                               .reading_position = tab->reading_position});
         continue;
       }
-      WorkspaceTabRecord record{.id = tab->id, .name = tab->Name(), .location = Location(target.reference)};
+      WorkspaceTabRecord record{.id = tab->id, .name = tab->Name(), .location = Location(target.reference),
+                                .reading_position = tab->reading_position};
       const auto& attachments = tab->attachments->directories;
       if (!attachments.empty()) {
         record.attachments = Location(attachments.front());
@@ -410,6 +417,20 @@ struct FolioState {
       record.active_window = workspace.id;
     }
     store->Set(std::move(record));
+  }
+
+  void FlushReadingPositions(Workspace& workspace) const {
+    if (!workspace.reading_position_save) {
+      return;
+    }
+    workspace.reading_position_save->Cancel();
+    workspace.reading_position_save.reset();
+    // An explicitly closed window has already been removed from the store.
+    const auto& windows = store->Get().windows;
+    if (!workspace.restoring.Get() &&
+        std::ranges::find(windows, workspace.id, &WorkspaceWindowRecord::id) != windows.end()) {
+      Persist(workspace);
+    }
   }
 
   void Forget(const Workspace& workspace) const {
@@ -672,6 +693,7 @@ public:
   void ConfirmLibraryDelete(std::string id) const;
   void JumpToHeading(const Tab& tab, const Block& block, TextOffset length) const;
   void RevealLinkedHeading(const Tab& tab, const RichEditorController& editor, const std::string& anchor) const;
+  void RecordReadingPosition(const Tab& tab, std::optional<ReadingPosition> position) const;
   void FollowDocumentLink(Tab tab, DocumentLink link) const;
   void NewWindow() const;
   void PickOpen(OpenKind kind) const { PickOpen(OpenRequest{kind}); }
@@ -901,6 +923,7 @@ void WorkbenchActions::JumpToHeading(const Tab& tab, const Block& block, TextOff
     Status(tab, l10n::outline_jump_unavailable);
     return;
   }
+  tab->restore_reading_position = false;
   if (modal_sidebar) {
     sidebar_open = false;
   }
@@ -918,9 +941,28 @@ void WorkbenchActions::RevealLinkedHeading(const Tab& tab, const RichEditorContr
   } else if (!editor.RevealTextRange(heading->block, {0, heading->length}, ScrollAlignment::Start)) {
     Status(tab, l10n::outline_jump_unavailable);
   } else {
+    tab->restore_reading_position = false;
     Status(tab, {});
   }
   tab->pending_anchor = std::nullopt;
+}
+
+void WorkbenchActions::RecordReadingPosition(const Tab& tab, std::optional<ReadingPosition> position) const {
+  if (workspace->Selected() != tab || tab->pending_anchor.Get() || tab->restore_reading_position.Get() ||
+      workspace->closing.Get() || tab->reading_position == position) {
+    return;
+  }
+  tab->reading_position = position;
+  // Coalesce changes while scrolling and keep the latest position in memory between writes.
+  if (tab->saved.Get() && !workspace->reading_position_save) {
+    workspace->reading_position_save = tasks.Launch([folio = folio, workspace = workspace]() -> Task<void> {
+      co_await Delay(750ms);
+      workspace->reading_position_save.reset();
+      if (!workspace->restoring.Get()) {
+        folio->Persist(*workspace);
+      }
+    });
+  }
 }
 
 void WorkbenchActions::Launch(bool uses_picker, std::function<Task<void>()> action,
@@ -2951,6 +2993,39 @@ void WorkbenchActions::FinishClose() const {
 
 void WorkbenchActions::CancelClose() const { workspace->closing = nullptr; }
 
+void TrackReadingPosition(const WorkbenchActions& actions, const Tab& tab, const RichEditorController& editor, bool active) {
+  constexpr float reading_line = 24.0F;
+  const auto location = active ? editor.ViewportLocation(reading_line) : std::nullopt;
+  const auto anchor = tab->pending_anchor.Get();
+  const bool restore = tab->restore_reading_position.Get();
+  const bool ready = location.has_value();
+  const bool restoring_workspace = actions.workspace->restoring.Get();
+  Lifecycle([actions, tab, editor, anchor, restore, ready, restoring_workspace, reading_line] {
+    if (ready && !restoring_workspace && (anchor || restore)) {
+      actions.tasks.Post([actions, tab, editor, anchor, reading_line] {
+        if (actions.workspace->Selected() != tab || tab->pending_anchor.Get() != anchor ||
+            !editor.ViewportLocation(reading_line)) {
+          return;
+        }
+        if (anchor) {
+          actions.RevealLinkedHeading(tab, editor, *anchor);
+        } else if (tab->restore_reading_position.Get()) {
+          RestoreReadingPosition(editor, *tab->reading_position);
+          tab->restore_reading_position = false;
+        }
+      });
+    }
+  }, anchor, restore, ready, restoring_workspace);
+
+  const bool capture = ready && !restoring_workspace && !anchor && !restore;
+  const auto position = capture ? CaptureReadingPosition(editor.Document(), location->root_block_index) : std::nullopt;
+  Lifecycle([actions, tab, capture, position] {
+    if (capture) {
+      actions.tasks.Post([actions, tab, position] { actions.RecordReadingPosition(tab, position); });
+    }
+  }, capture, position);
+}
+
 [[huxerui::composable]]
 View DocumentPage(WorkbenchActions actions, Tab tab, bool active) {
   const auto editor = UseRichEditor(tab->initial);
@@ -2959,13 +3034,7 @@ View DocumentPage(WorkbenchActions actions, Tab tab, bool active) {
     tab->editor = editor;
     tab->editor_focus = focus;
   }, editor, focus);
-  const auto anchor = tab->pending_anchor.Get();
-  const bool ready_to_reveal = active && anchor && editor.ViewportLocation(0.0F).has_value();
-  Lifecycle([actions, tab, editor, anchor, ready_to_reveal] {
-    if (ready_to_reveal) {
-      actions.tasks.Post([actions, tab, editor, anchor] { actions.RevealLinkedHeading(tab, editor, *anchor); });
-    }
-  }, anchor, ready_to_reveal);
+  TrackReadingPosition(actions, tab, editor, active);
   const auto& attachments = tab->attachments.Get();
   const auto operation = tab->operation.Get();
   const bool available = active && !actions.workspace->closing.Get() && operation != Operation::PickImage &&
@@ -4028,6 +4097,8 @@ void InstallWorkbench(WindowContext& context) {
     for (auto& item : record->tabs) {
       auto tab = std::make_shared<DocumentTab>(item.id, item.name, NewWorkingDirectory(UseApplication()),
                                                RichDocument{}, nullptr, std::nullopt);
+      tab->reading_position = item.reading_position;
+      tab->restore_reading_position = item.reading_position.has_value();
       tab->unresolved = std::move(item);
       tabs.push_back(std::move(tab));
     }
@@ -4071,6 +4142,7 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
       folio->Persist(*workspace);
     }
     return [folio, workspace, application_tasks] {
+      folio->FlushReadingPositions(*workspace);
       if (workspace->restoring.Get()) {
         workspace->restoring = false;
         folio->restoring = folio->restoring.Get() - 1;
@@ -4106,6 +4178,8 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
   Lifecycle([folio, workspace, window_state] {
     if (window_state == WindowLifecycleState::Active && folio->restoring.Get() == 0) {
       folio->Persist(*workspace, true);
+    } else if (window_state == WindowLifecycleState::Background) {
+      folio->FlushReadingPositions(*workspace);
     }
   }, window_state);
   const bool can_open_activated = !folio->pending_files->empty() && folio->restoring.Get() == 0 && actions.Available();

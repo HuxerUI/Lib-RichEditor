@@ -5,6 +5,8 @@
 #include <huxerui/file.h>
 #include <huxerui/state.h>
 
+#include "reading_position.h"
+
 namespace folio {
 
 /// A local path with the access mode of the original selection. An empty path requires a picker grant.
@@ -34,6 +36,8 @@ struct WorkspaceTabRecord {
   std::string package;
   /// An app-owned document can be reopened by ID under the current application directory.
   std::string library_document;
+  /// Last reading position in this tab, if captured in a committed layout.
+  std::optional<ReadingPosition> reading_position;
   bool operator==(const WorkspaceTabRecord&) const = default;
 };
 

@@ -15,8 +15,30 @@ namespace folio {
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(WorkspaceLocation, path, writable)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(WorkspaceFolderRecord, id, name, location, recent_id)
+
+void to_json(nlohmann::json& json, const std::optional<ReadingPosition>& position) {
+  if (position) {
+    json = {{"block_index", position->block_index}, {"text_fingerprint", position->text_fingerprint}};
+  } else {
+    json = nullptr;
+  }
+}
+
+void from_json(const nlohmann::json& json, std::optional<ReadingPosition>& position) {
+  position.reset();
+  if (!json.is_object()) {
+    return;
+  }
+  const auto index = json.find("block_index");
+  const auto fingerprint = json.find("text_fingerprint");
+  if (index != json.end() && index->is_number_unsigned() &&
+      fingerprint != json.end() && fingerprint->is_number_unsigned()) {
+    position = ReadingPosition{index->get<std::uint64_t>(), fingerprint->get<std::uint64_t>()};
+  }
+}
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(WorkspaceTabRecord, id, name, location, attachments, folder, relative,
-                                               package, library_document)
+                                               package, library_document, reading_position)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(WorkspaceWindowRecord, id, folders, tabs, selected, sidebar_width,
                                                sidebar_visible, showing_outline, files_open, recents_open, library_expanded)
 NLOHMANN_JSON_SERIALIZE_ENUM(RecentKind, {{RecentKind::File, "file"}, {RecentKind::Folder, "folder"},

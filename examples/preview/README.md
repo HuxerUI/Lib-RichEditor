@@ -39,6 +39,8 @@ On hosts with app storage, the first **Save** of a new document creates a RichEd
 
 At startup, Draftspan restores the recorded active window with its saved tabs, selected tab, and sidebar settings. On hosts that support multiple windows, it also reopens the other recorded windows. Tabs reopen with their last saved contents. If an external source is unavailable or needs authorization, use **Locate again** in its tab to select the file or folder. Closing prompts you to handle any unsaved changes. Closed tabs and windows are removed from the restore record.
 
+Each restored tab returns to its last reading position without moving the caret or opening the software keyboard. Draftspan tries to find the same paragraph after nearby edits and falls back to the preceding heading when it cannot. Following a document link goes to its heading even if the destination tab has a saved reading position.
+
 ## Opening and saving files
 
 Draftspan accepts `.md` and `.markdown` files opened from Windows File Explorer, macOS Finder, and Files on iOS. The Windows installer adds Draftspan to **Open with**. On Android, file managers can open a Markdown document in Draftspan by sending it as `text/markdown`. Opening a file starts Draftspan or opens it in the running app. If Draftspan can identify an already open file, it switches to its tab.

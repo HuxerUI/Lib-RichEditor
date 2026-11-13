@@ -54,6 +54,17 @@ void Send(UiTest& ui, std::initializer_list<TextInputCommand> commands) {
   ui.Pump();
 }
 
+void FollowLink(UiTest& ui, TextSelection selection) {
+  const auto article = ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
+  article.PerformSemanticAction({SemanticActionKind::Focus, {}});
+  Send(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
+  ui.FindSemantics(UiSemanticSelector::Label("Link actions")).PerformSemanticAction({SemanticActionKind::Activate, {}});
+  const auto open = ui.FindSemantics(UiSemanticSelector::Label("Open link"));
+  const auto failure = "The link menu opens for selection " + std::to_string(selection.active);
+  WaitForFixtureWithMessage(ui, [&] { return open.Exists(); }, failure.c_str());
+  open.PerformSemanticAction({SemanticActionKind::Activate, {}});
+}
+
 void WebUrls() {
   for (const std::string_view source : {"HTTP://example.test/photo.png", "https://example.test/a%20b#details"}) {
     const auto url = folio::ParseWebUrl(source);
@@ -135,10 +146,13 @@ void WorkspaceStorage(const File& directory) {
   auto text = file.ReadString().Value();
   auto legacy = nlohmann::json::parse(text);
   legacy.erase("recent");
+  legacy["windows"][0]["tabs"][0].erase("reading_position");
   Check(file.WriteString(legacy.dump()), "Write a workspace saved before recent locations existed");
   const auto migrated = WorkspaceStore(directory).Get().recent;
   Check(migrated.size() == 1 && migrated.front().kind == RecentKind::Folder && migrated.front().name == "Project",
         "A previously mounted folder is migrated into the recent list");
+  Check(!WorkspaceStore(directory).Get().windows.front().tabs.front().reading_position,
+        "A workspace written before reading positions starts at the document top");
   const auto relative = text.find("\"Meeting\"");
   Check(relative != std::string::npos, "The nested folder path is stored as components");
   text.replace(relative, std::string_view("\"Meeting\"").size(), "\"..\"");
@@ -1099,12 +1113,6 @@ void DocumentLinkFlow(const File& directory, const char* package_path) {
   const auto article = ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
   const auto scroll = article.Find(UiSemanticSelector::Role(SemanticRole::ScrollView));
   const auto by_label = [&](const char* label) { return ui.FindSemantics(UiSemanticSelector::Label(label)); };
-  const auto open_link = [&](TextSelection selection) {
-    article.PerformSemanticAction({SemanticActionKind::Focus, {}});
-    Send(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
-    by_label("Link actions").PerformSemanticAction({SemanticActionKind::Activate, {}});
-    by_label("Open link").PerformSemanticAction({SemanticActionKind::Activate, {}});
-  };
   WaitForFixtureWithMessage(ui, [&] {
     return article.Exists() && article.One().value.starts_with("Local\n") && !by_label("Restoring document…").Exists();
   }, "The workspace fixture is restored");
@@ -1112,6 +1120,13 @@ void DocumentLinkFlow(const File& directory, const char* package_path) {
   const auto source_bounds = scroll.One().bounds;
   ui.TapAt({source_bounds.x + 28, source_bounds.y + 30}, {.device_kind = PointerDeviceKind::Mouse});
   Check(ui.ActiveTextInput().has_value(), "The source editor can receive input before following the first link");
+  const auto open_link = [&](TextSelection selection) {
+    const auto bounds = scroll.One().bounds;
+    ui.SendScroll({.position = {bounds.x + bounds.width / 2, bounds.y + bounds.height / 2}, .delta_y = -10000});
+    ui.Pump(300ms);
+    FollowLink(ui, selection);
+    ui.Pump(450ms);
+  };
   open_link(reverse);
   WaitForFixtureWithMessage(ui, [&] { return scroll.One().scroll->offset > 500; }, "The duplicate heading is revealed");
   Check(article.One().text_selection == reverse.Range(), "The local jump keeps the selected text");
@@ -1133,6 +1148,128 @@ void DocumentLinkFlow(const File& directory, const char* package_path) {
   }, "A relative link reveals the heading from the already open document");
 }
 
+void ReadingPositionFlow(const File& directory, const char* package_path) {
+  using namespace folio;
+  const auto first = directory.Child("First.md");
+  const auto second = directory.Child("Second.md");
+  const auto fixture = [](std::string_view name) {
+    std::string text;
+    for (int i = 0; i < 100; ++i) {
+      if (i % 10 == 0) {
+        text += "## Section " + std::to_string(i) + "\n\n";
+      }
+      text += std::string(name) + " 段落 " + std::to_string(i) + "\n\n";
+    }
+    return text;
+  };
+  const std::string first_body = "[Go to Second](Second.md#section-10)\n\n" + fixture("First");
+  const std::string second_body = fixture("Second");
+  Check(directory.CreateDirectories() && first.WriteString(first_body) && second.WriteString(second_body),
+        "Write long documents for reading position restoration");
+  bool seed = true;
+  const Application app(App, {.show_debug_overlay = false,
+      .application_hooks = {[&](ApplicationContext& context) {
+        auto store = std::make_shared<WorkspaceStore>(directory);
+        if (std::exchange(seed, false)) {
+          store->Set({.active_window = "reading", .windows = {{.id = "reading",
+              .tabs = {{.id = 1, .name = first.Name(), .location = {first.Path(), false}},
+                       {.id = 2, .name = second.Name(), .location = {second.Path(), false}}},
+              .selected = 1, .sidebar_visible = false, .showing_outline = true}}});
+        }
+        InstallFolioWithWorkspace(context, std::move(store), directory);
+      }},
+      .window_hooks = {InstallWorkbench}});
+
+  const auto options = UiTestOptions{.viewport = {420, 640},
+      .resource_provider = std::make_shared<PackageResources>(package_path)};
+  const auto reading = [&](std::size_t tab) -> std::optional<ReadingPosition> {
+    const auto json = nlohmann::json::parse(directory.Child("workspace.json").ReadString().Value());
+    const auto& position = json["windows"][0]["tabs"][tab]["reading_position"];
+    return position.is_object() ? std::optional(ReadingPosition{position["block_index"].get<std::uint64_t>(),
+        position["text_fingerprint"].get<std::uint64_t>()}) : std::nullopt;
+  };
+  const auto article_for = [](UiTest& ui) {
+    return ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
+  };
+  const auto scroll_for = [&](UiTest& ui) { return article_for(ui).Find(UiSemanticSelector::Role(SemanticRole::ScrollView)); };
+  const auto scroll_by = [](UiTest& ui, float delta) {
+    const auto scroller = ui.Find(UiSelector::AllOf(UiSelector::Key("editor"), UiSelector::Enabled(true)));
+    (void)scroller.ScrollBy({0.0F, delta});
+    ui.Pump(32ms);
+  };
+  const auto select = [&](UiTest& ui, std::string name, std::string_view prefix) {
+    const auto switcher = ui.FindSemantics(UiSemanticSelector::Identifier("document-switcher"));
+    switcher.PerformSemanticAction({SemanticActionKind::Activate, {}});
+    const auto tab = ui.FindSemantics(UiSemanticSelector::Label(std::move(name)));
+    WaitForFixtureWithMessage(ui, [&] { return tab.Exists(); }, "The document switcher lists the requested tab");
+    tab.PerformSemanticAction({SemanticActionKind::Activate, {}});
+    WaitForFixtureWithMessage(ui, [&] { return article_for(ui).One().value.starts_with(prefix); },
+                              "The selected reading tab becomes active");
+    ui.Pump(400ms);
+  };
+  const auto wait_for_first = [&](UiTest& ui) {
+    const auto restoring = ui.FindSemantics(UiSemanticSelector::Label("Restoring document…"));
+    const auto article = article_for(ui);
+    WaitForFixtureWithMessage(ui, [&] { return article.Exists() && !restoring.Exists(); }, "The reading workspace opens");
+  };
+
+  float first_offset;
+  {
+    UiTest ui(app, options);
+    wait_for_first(ui);
+    ui.UpdateWindowLifecycleState(WindowLifecycleState::Active);
+    ui.Pump();
+    scroll_by(ui, 1300);
+    const auto scroll = scroll_for(ui);
+    first_offset = scroll.One().scroll->offset;
+    Check(first_offset > 800, "The first tab has scrolled into its document");
+    ui.Pump(800ms);
+    WaitForFixtureWithMessage(ui, [&] { return reading(0).has_value(); }, "Save the first tab's reading position");
+    select(ui, second.Name(), "Section 0");
+    const auto second_scroll = scroll.One().scroll;
+    Check(second_scroll && second_scroll->offset < 10.0F, "A new tab starts at its own position");
+    select(ui, first.Name(), "Go to Second");
+    Check(std::abs(scroll.One().scroll->offset - first_offset) < 2.0F, "Switching tabs preserves the first viewport");
+    Check(!ui.ActiveTextInput(), "Reading and tab switching do not start a text-input session");
+  }
+  const auto saved_first = reading(0);
+  Check(saved_first && !reading(1), "Only the scrolled tab has a saved reading position");
+  auto workspace = nlohmann::json::parse(directory.Child("workspace.json").ReadString().Value());
+  const auto second_document = Codec(DocumentFormat::Markdown).Import(second_body).document;
+  Check(second_document.has_value(), "The second document can be loaded");
+  const auto saved_second = CaptureReadingPosition(*second_document, 76);
+  Check(saved_second.has_value(), "Capture a later paragraph for the linked tab");
+  workspace["windows"][0]["tabs"][1]["reading_position"] = {
+      {"block_index", saved_second->block_index}, {"text_fingerprint", saved_second->text_fingerprint}};
+  Check(directory.Child("workspace.json").WriteString(workspace.dump()), "Save a different position for the linked tab");
+  const std::string prefix = "A new paragraph\n\nAnother new paragraph\n\n";
+  Check(first.WriteString(prefix + first_body), "Insert text before the saved position while the app is closed");
+
+  {
+    UiTest ui(app, options);
+    wait_for_first(ui);
+    const auto scroll = scroll_for(ui);
+    WaitForFixtureWithMessage(ui, [&] { return scroll.One().scroll->offset > 800; },
+                              "Reopening restores the active tab near its previous paragraph");
+    WaitForFixtureWithMessage(ui, [&] {
+      const auto current = reading(0);
+      return current && current->block_index == saved_first->block_index + 2 &&
+          current->text_fingerprint == saved_first->text_fingerprint;
+    }, "Restoration finds the same paragraph after blocks were inserted");
+    Check(!ui.ActiveTextInput(), "Restoring a reading position leaves the editor unfocused");
+
+    // The destination remains unopened in the viewport until this explicit link is activated.
+    scroll_by(ui, -10000);
+    const auto article = article_for(ui);
+    const TextOffset link_start = AttributedText("A new paragraph\nAnother new paragraph\n").Length();
+    FollowLink(ui, {link_start + 2, link_start + 2});
+    WaitForFixtureWithMessage(ui, [&] {
+      const auto offset = scroll.One().scroll->offset;
+      return article.One().value.starts_with("Section 0") && offset > 180 && offset < 1200;
+    }, "The linked heading takes priority over the destination's saved reading position");
+  }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1149,6 +1286,7 @@ int main(int argc, char** argv) {
       UiTest ui(storage);
     }
     WorkspaceRestoreFlow(directory.Child("flow"), argv[1]);
+    ReadingPositionFlow(directory.Child("reading-flow"), argv[1]);
     LibraryStorageFlow(directory.Child("library-flow"), argv[1]);
     LibraryDeleteFlow(directory.Child("library-delete"), argv[1]);
     ExternalHistoryFlow(directory.Child("external-history"), argv[1]);
