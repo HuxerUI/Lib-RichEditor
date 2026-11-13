@@ -41,6 +41,8 @@ At startup, Draftspan restores the recorded active window with its saved tabs, s
 
 Each restored tab returns to its last reading position without moving the caret or opening the software keyboard. Draftspan tries to find the same paragraph after nearby edits and falls back to the preceding heading when it cannot. Following a document link goes to its heading even if the destination tab has a saved reading position.
 
+Use the title bar to switch between **Reading** and **Editing**. Reading mode keeps text selection, copying, find, outline navigation, and links available. Each tab remembers its mode across workspace restoration. On Android and iOS, a newly opened external document starts in reading mode. New documents and documents opened from the app workspace start in editing mode.
+
 ## Opening and saving files
 
 Draftspan accepts `.md` and `.markdown` files opened from Windows File Explorer, macOS Finder, and Files on iOS. The Windows installer adds Draftspan to **Open with**. On Android, file managers can open a Markdown document in Draftspan by sending it as `text/markdown`. Opening a file starts Draftspan or opens it in the running app. If Draftspan can identify an already open file, it switches to its tab.

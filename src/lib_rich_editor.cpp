@@ -16,6 +16,10 @@ RichDocument RichEditorController::Document() const { return session_->Document(
 
 void RichEditorController::ReplaceDocument(RichDocument document) const { session_->ReplaceDocument(std::move(document)); }
 
+void RichEditorController::SetReadOnly(bool read_only) const { session_->SetReadOnly(read_only); }
+
+bool RichEditorController::IsReadOnly() const { return session_->IsReadOnly(); }
+
 bool RichEditorController::IsComposing() const {
   (void)session_->Observe();
   return session_->CompositionRange().has_value();

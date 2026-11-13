@@ -38,6 +38,8 @@ public:
   const RichDocument& VisibleDocument() const { return draft_.edit.document; }
   RichDocument Document() const;
   void ReplaceDocument(RichDocument document);
+  void SetReadOnly(bool read_only);
+  bool IsReadOnly() const { return read_only_.Get(); }
   bool ReplaceTextRanges(std::span<const BlockTextRange> ranges, std::string_view text);
 
   TextSelection SelectionOffsets() const;
@@ -103,6 +105,7 @@ private:
   std::deque<std::vector<BlockId>> block_changes_;
   State<std::uint64_t> changed_{0};
   State<std::uint64_t> committed_{0};
+  State<bool> read_only_{false};
   std::uint64_t revision_ = 0;
   std::uint64_t content_revision_ = 0;
   std::uint64_t generation_ = 0;

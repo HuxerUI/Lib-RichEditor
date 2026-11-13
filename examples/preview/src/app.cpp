@@ -531,7 +531,7 @@ void SetFindFieldFocus(State<FindPanelState> find, FindField field, bool focused
 
 [[huxerui::composable]]
 View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelState> find, FindNavigation navigation,
-             FindReplacement replacement, std::function<void()> close) {
+             FindReplacement replacement, bool read_only, std::function<void()> close) {
   const auto& theme = UseTheme();
   const auto& colors = theme.colors;
   const bool compact = UseViewportClass() == ViewportClass::Compact;
@@ -608,7 +608,7 @@ View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelSta
   }.With(Grow(), CrossAlign(CrossAxisAlignment::Center), Background(colors.surface),
          Border{find->focused == FindField::Query ? colors.primary : colors.outline, 1.0F},
          CornerRadius(theme.shapes.medium));
-  const auto replace_open = find->replace_open;
+  const auto replace_open = !read_only && find->replace_open;
   const auto toggle_label = replace_open ? l10n::hide_replacement : l10n::find_and_replace;
   View replace_controls;
   if (replace_open) {
@@ -639,7 +639,8 @@ View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelSta
   }
   return Column {
     Row {
-      IconButton(replace_open ? app::images::chevron_down : app::images::chevron_right, toggle_label)
+      read_only ? View{} : View(IconButton(replace_open ? app::images::chevron_down : app::images::chevron_right,
+                                          toggle_label)
           .OnClick([find, focus, touch] {
             const bool restore_query = find->replace_open && find->focused == FindField::Replacement && !touch;
             find.Update([](FindPanelState& state) {
@@ -652,7 +653,7 @@ View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelSta
               focus.RequestFocus();
             }
           }).With(toggle_size, Focusable(!touch), Tooltip(toggle_label),
-                  Semantics{.identifier = "toggle-replace", .expanded = replace_open}),
+                  Semantics{.identifier = "toggle-replace", .expanded = replace_open})),
       group,
       IconButton(app::images::close, l10n::close_find).OnClick(close).With(button_size, Tooltip(l10n::close_find)),
     }.With(Spacing(compact ? 3.0F : 5.0F), CrossAlign(CrossAxisAlignment::Center)).Key("query-row"),
@@ -1071,6 +1072,7 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
   const auto& preferences = settings->Get().editor;
   const auto viewport = UseViewportClass();
   const bool compact = viewport == ViewportClass::Compact;
+  const bool read_only = editor.IsReadOnly();
   const auto find = options.find;
   const bool search_open = find->open;
   const bool finding = options.active && search_open;
@@ -1183,11 +1185,11 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
         active_match = next;
       }
     };
-    const bool can_replace = options.available && count != 0 && !find_query->composition &&
+    const bool can_replace = !read_only && options.available && count != 0 && !find_query->composition &&
         !replacement_text->composition && !editor_composing && query != replacement_text->text;
     const auto replace = [editor, results, count, active_match, resume_match, find_query, replacement_text, find,
                           find_results, toast, can_replace](bool all) {
-      if (!can_replace || !find->open || !find->replace_open || find_results.Get() != results ||
+      if (!can_replace || editor.IsReadOnly() || !find->open || !find->replace_open || find_results.Get() != results ||
           find_query->composition || replacement_text->composition ||
           find_query->text != results->query || find_query->text == replacement_text->text ||
           editor.Document() != results->document) {
@@ -1218,7 +1220,7 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
     };
     const bool desktop = UseApplication().SupportsMultipleWindows();
     find_bar = FindBar(find_query, find_focus, find, {count, selected, ready, navigate},
-        {replacement_text, can_replace, replace}, [find, focus, desktop] {
+        {replacement_text, can_replace, replace}, read_only, [find, focus, desktop] {
           find.Update([](FindPanelState& state) {
             state.open = false;
             state.focused = FindField::None;
@@ -1240,7 +1242,7 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
   }).On<RichEditorEvents::LinkActivated>([toast, open_document = options.open_document_link](const LinkRange& link) {
     return OpenLink(link.target, open_document, toast);
   }).On<RichEditorEvents::InlineObjectActivated>([=](const InlineObjectSelection& object) {
-    if (object.data.type == latex_type && object.data.version == 1) {
+    if (!editor.IsReadOnly() && object.data.type == latex_type && object.data.version == 1) {
       dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true, .object = object});
     }
   }).With(focus, Grow(), Enabled(options.available),
@@ -1252,12 +1254,26 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
       Background(theme.colors.surface), Grow(), CrossAlign(CrossAxisAlignment::Stretch));
   const float margin = viewport == ViewportClass::Expanded ? 24.0F : 12.0F;
   const auto page_insets = compact ? EdgeInsets{} : EdgeInsets{.top = margin, .right = margin, .left = margin};
+  View toolbar;
+  if (read_only) {
+    if (IsMobilePlatform()) {
+      if (const auto link = editor.CurrentLink(); link && CanOpenLink(link->target, options.open_document_link)) {
+        toolbar = Row {Button(l10n::open_link)
+            .OnClick([toast, target = link->target, open_document = options.open_document_link] {
+              OpenLink(target, open_document, toast);
+            }).With(Enabled(options.available), Frame{.min_height = 44.0F})}
+            .With(Padding(EdgeInsets::Symmetric(8.0F, 2.0F)));
+      }
+    }
+  } else {
+    toolbar = FormattingBar(editor, focus, options.available, options.can_pick_images,
+                            [focus, pick = std::move(options.pick_image)](bool replace, bool inline_image) {
+                              pick(focus, replace, inline_image);
+                            }, std::move(options.open_document_link));
+  }
   return Column {
-    FormattingBar(editor, focus, options.available, options.can_pick_images,
-                  [focus, pick = std::move(options.pick_image)](bool replace, bool inline_image) {
-                    pick(focus, replace, inline_image);
-                  }, std::move(options.open_document_link)).Key("formatting"),
-    Divider(),
+    toolbar ? std::move(toolbar).Key("formatting") : View{},
+    Divider().Key("editor-divider"),
     find_bar ? std::move(find_bar).Key("find-bar") : View{},
     Column {paper}.With(Grow(), Padding(page_insets),
                        CrossAlign(compact ? CrossAxisAlignment::Stretch : CrossAxisAlignment::Center)).Key("paper"),

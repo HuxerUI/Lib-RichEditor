@@ -38,7 +38,7 @@ void from_json(const nlohmann::json& json, std::optional<ReadingPosition>& posit
 }
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(WorkspaceTabRecord, id, name, location, attachments, folder, relative,
-                                               package, library_document, reading_position)
+                                               package, library_document, reading_position, read_only)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(WorkspaceWindowRecord, id, folders, tabs, selected, sidebar_width,
                                                sidebar_visible, showing_outline, files_open, recents_open, library_expanded)
 NLOHMANN_JSON_SERIALIZE_ENUM(RecentKind, {{RecentKind::File, "file"}, {RecentKind::Folder, "folder"},

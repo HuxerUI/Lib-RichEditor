@@ -1270,6 +1270,87 @@ void ReadingPositionFlow(const File& directory, const char* package_path) {
   }
 }
 
+void ReadingModeFlow(const File& directory, const char* package_path) {
+  using namespace folio;
+  const auto document = directory.Child("Reading.md");
+  Check(directory.CreateDirectories() && document.WriteString("# Title\n\n中文 [link](#title)\n\n- [ ] Task\n"),
+        "Write the reading mode document");
+  bool seed = true;
+  const Application app(App, {.show_debug_overlay = false,
+      .application_hooks = {[&](ApplicationContext& context) {
+        auto store = std::make_shared<WorkspaceStore>(directory);
+        if (std::exchange(seed, false)) {
+          store->Set({.active_window = "mode", .windows = {{.id = "mode",
+              .tabs = {{.id = 1, .name = document.Name(), .location = {document.Path(), false}}},
+              .selected = 1, .sidebar_visible = false}}});
+        }
+        InstallFolioWithWorkspace(context, std::move(store), directory);
+      }},
+      .window_hooks = {InstallWorkbench}});
+  auto options = UiTestOptions{.viewport = {920, 640},
+      .resource_provider = std::make_shared<PackageResources>(package_path)};
+  const auto by_id = [](UiTest& ui, const char* id) { return ui.FindSemantics(UiSemanticSelector::Identifier(id)); };
+  const auto mode_icon = UiSelector::AllOf(UiSelector::Key("reading-mode"), UiSelector::Type<IconButton>());
+  const auto tap_mode = [&](UiTest& ui, PointerDeviceKind device) {
+    const auto bounds = by_id(ui, "toggle-reading-mode").One().bounds;
+    ui.TapAt({bounds.x + bounds.width / 2, bounds.y + bounds.height / 2}, {.device_kind = device});
+  };
+  {
+    UiTest ui(app, options);
+    const auto article = by_id(ui, "article-editor");
+    const auto mode = by_id(ui, "toggle-reading-mode");
+    WaitForFixtureWithMessage(ui, [&] { return article.Exists() && mode.Exists() && mode.One().enabled; },
+                              "The reading mode switch is available");
+    Check(article.One().read_only == false && ui.Find(mode_icon).Exists() && mode.One().state_description == "Editing" &&
+              mode.One().label == "Switch to reading mode",
+          "A wide title bar shows the editing icon with an accessible switch action");
+    const auto mode_bounds = mode.One().bounds;
+    ui.SendPointer({.type = PointerEventType::Move,
+                    .position = {mode_bounds.x + mode_bounds.width / 2, mode_bounds.y + mode_bounds.height / 2}});
+    ui.Pump();
+    ui.Pump(750ms);
+    ui.Pump();
+    Check(ui.Find(UiSelector::Text("Switch to reading mode")).Exists(), "Hover explains the icon's action");
+    article.PerformSemanticAction({SemanticActionKind::Focus, {}});
+    const auto committed = article.One().value;
+    Send(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "nihao"}});
+    tap_mode(ui, PointerDeviceKind::Mouse);
+    Check(article.One().read_only == true && article.One().value == committed && !ui.ActiveTextInput(),
+          "Clicking the mode control cancels preedit before its focus change can commit it");
+    Check(mode.One().state_description == "Reading" && mode.One().label == "Switch to editing mode" &&
+              !ui.Find(UiSelector::Key("formatting")).Exists(),
+          "Reading mode is visible and hides the formatting controls");
+    ui.FindSemantics(UiSemanticSelector::Label("Find in document")).PerformSemanticAction({SemanticActionKind::Activate, {}});
+    const auto query = by_id(ui, "find-query");
+    WaitForFixtureWithMessage(ui, [&] { return query.Exists(); }, "The find bar is shown in reading mode");
+    query.PerformSemanticAction({SemanticActionKind::Focus, {}});
+    Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "中文"}});
+    const auto next = ui.FindSemantics(UiSemanticSelector::Label("Next match"));
+    WaitForFixtureWithMessage(ui, [&] { return next.Exists() && next.One().enabled; },
+                              "Reading mode finds the committed Chinese text");
+    Check(!by_id(ui, "toggle-replace").Exists() && !by_id(ui, "replace-text").Exists(),
+          "Reading mode keeps search and hides replacement controls");
+    next.PerformSemanticAction({SemanticActionKind::Activate, {}});
+    Check(article.One().value == committed, "Navigating a match does not edit the document");
+  }
+  options.viewport = {420, 640};
+  {
+    UiTest ui(app, options);
+    const auto article = by_id(ui, "article-editor");
+    const auto mode = by_id(ui, "toggle-reading-mode");
+    WaitForFixtureWithMessage(ui, [&] { return article.Exists() && mode.Exists() && mode.One().enabled; },
+                              "The restored reading tab has a mode switch");
+    Check(article.One().read_only == true && ui.Find(mode_icon).Exists() && mode.One().state_description == "Reading" &&
+              !ui.ActiveTextInput(),
+          "Reading mode persists and uses the same icon control in a compact title bar");
+    tap_mode(ui, PointerDeviceKind::Touch);
+    Check(article.One().read_only == false && ui.Find(UiSelector::Key("formatting")).Exists() && !ui.ActiveTextInput(),
+          "Switching back restores formatting without focusing the document");
+    ui.Find(UiSelector::Key("editor")).Tap();
+    Check(ui.ActiveTextInput().has_value(), "A tap on the document starts input in edit mode");
+  }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1287,6 +1368,7 @@ int main(int argc, char** argv) {
     }
     WorkspaceRestoreFlow(directory.Child("flow"), argv[1]);
     ReadingPositionFlow(directory.Child("reading-flow"), argv[1]);
+    ReadingModeFlow(directory.Child("mode-flow"), argv[1]);
     LibraryStorageFlow(directory.Child("library-flow"), argv[1]);
     LibraryDeleteFlow(directory.Child("library-delete"), argv[1]);
     ExternalHistoryFlow(directory.Child("external-history"), argv[1]);

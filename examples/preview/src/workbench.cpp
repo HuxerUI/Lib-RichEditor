@@ -101,6 +101,7 @@ struct DocumentTab {
   State<std::string> status{std::string{}};
   State<std::optional<std::string>> pending_anchor{std::nullopt};
   State<std::optional<WorkspaceTabRecord>> unresolved{std::nullopt};
+  bool initial_read_only = false;
   std::optional<ReadingPosition> reading_position;
   State<bool> restore_reading_position{false};
   std::vector<std::string> source_relative;
@@ -133,6 +134,11 @@ struct DocumentTab {
   }
 
   bool Busy() const { return operation.Get() != Operation::Idle; }
+
+  bool IsReadOnly() const {
+    const auto& controller = editor.Get();
+    return controller ? controller->IsReadOnly() : initial_read_only;
+  }
 
   std::string_view LibraryId() const {
     if (const auto& pending = unresolved.Get()) {
@@ -378,11 +384,11 @@ struct FolioState {
       const auto& target = *original->target;
       if (target.library) {
         window.tabs.push_back({.id = tab->id, .name = tab->Name(), .library_document = target.library_id,
-                               .reading_position = tab->reading_position});
+                               .reading_position = tab->reading_position, .read_only = tab->IsReadOnly()});
         continue;
       }
       WorkspaceTabRecord record{.id = tab->id, .name = tab->Name(), .location = Location(target.reference),
-                                .reading_position = tab->reading_position};
+                                .reading_position = tab->reading_position, .read_only = tab->IsReadOnly()};
       const auto& attachments = tab->attachments->directories;
       if (!attachments.empty()) {
         record.attachments = Location(attachments.front());
@@ -709,6 +715,7 @@ public:
   void SetExpanded(const Entry& entry, bool expanded) const;
   void RequestNewChild(Entry folder, ChildKind kind) const;
   void Select(const Tab& tab) const;
+  void ToggleReadingMode(const Tab& tab) const;
   void PickImage(Tab tab, RichEditorController editor, ViewHandle focus, bool replace, bool inline_image) const;
   void LocateAttachments(Tab tab) const;
 
@@ -789,8 +796,9 @@ bool WorkbenchActions::CanExecute(FolioCommand command) const {
     return picker->CanOpenDirectories(true) || (exports && picker->CanSaveFiles());
   }
   case FolioCommand::Find:
-  case FolioCommand::FindReplace:
     return tab && !tab->unresolved.Get();
+  case FolioCommand::FindReplace:
+    return tab && !tab->unresolved.Get() && !tab->IsReadOnly();
   case FolioCommand::OpenCommandPalette:
     return !workspace->palette_open;
   case FolioCommand::NewDocument:
@@ -1005,8 +1013,10 @@ Tab WorkbenchActions::AddTab(std::string name, RichDocument snapshot, std::share
   if (saved) {
     attachment_directory = saved->target->directory;
   }
+  const bool read_only = IsMobilePlatform() && saved && !saved->target->library;
   auto tab = std::make_shared<DocumentTab>(++folio->next_document, std::move(name), NewWorkingDirectory(application),
                                            std::move(snapshot), std::move(saved), std::move(attachment_directory));
+  tab->initial_read_only = read_only;
   tab->source_folder = std::move(source_folder);
   tab->source_relative = std::move(relative);
   tab->library_folder = std::move(library_folder);
@@ -1071,6 +1081,24 @@ void WorkbenchActions::Select(const Tab& tab) const {
   workspace->selected = tab->id;
   workspace->drawer_open = false;
   folio->Persist(*workspace, !workspace->restoring.Get() && folio->restoring.Get() == 0);
+}
+
+void WorkbenchActions::ToggleReadingMode(const Tab& tab) const {
+  const auto controller = tab->editor.Get();
+  if (!Available() || workspace->Selected() != tab || !controller || tab->Busy()) {
+    return;
+  }
+  const bool read_only = !controller->IsReadOnly();
+  controller->SetReadOnly(read_only);
+  if (read_only && tab->find->replace_open) {
+    tab->find.Update([](FindPanelState& find) {
+      find.replace_open = false;
+      if (find.focused == FindField::Replacement) {
+        find.focused = FindField::None;
+      }
+    });
+  }
+  folio->Persist(*workspace);
 }
 
 std::optional<OpenedDocument> WorkbenchActions::ActivateExisting(
@@ -1833,7 +1861,7 @@ void WorkbenchActions::LoadFolder(Entry entry) const {
 
 void WorkbenchActions::PickImage(Tab tab, RichEditorController editor, ViewHandle focus, bool replace,
                                 bool inline_image) const {
-  if (!Available() || tab->Busy() || !tab->working_directory) {
+  if (!Available() || tab->Busy() || editor.IsReadOnly() || !tab->working_directory) {
     return;
   }
   tab->operation = Operation::PickImage;
@@ -3031,6 +3059,7 @@ View DocumentPage(WorkbenchActions actions, Tab tab, bool active) {
   const auto editor = UseRichEditor(tab->initial);
   const auto focus = UseViewHandle();
   Lifecycle([tab, editor, focus] {
+    editor.SetReadOnly(tab->initial_read_only);
     tab->editor = editor;
     tab->editor_focus = focus;
   }, editor, focus);
@@ -3883,6 +3912,32 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
   const float control_size = desktop ? 32.0F : 44.0F;
   const auto icon_frame = Frame{.min_width = control_size, .min_height = control_size};
   const auto& colors = theme.colors;
+  const bool read_only = active && active->IsReadOnly();
+  const auto mode = read_only ? l10n::reading_mode : l10n::editing_mode;
+  const auto switch_mode = read_only ? l10n::switch_to_editing : l10n::switch_to_reading;
+  View mode_button;
+  if (active && !active->unresolved.Get()) {
+    const float radius = control_size / 2.0F;
+    auto indication = theme.interactions.indication;
+    indication.geometry = {.layer_size = Size{control_size, control_size}, .clip_corner_radii = CornerRadii{radius}};
+    mode_button = IconButton(read_only ? app::images::file_text : app::images::file_pen, switch_mode)
+        .OnClick([actions, active] { actions.ToggleReadingMode(active); })
+        .With(Frame{.width = control_size, .height = control_size}, CornerRadius(radius), indication,
+              Enabled(document_actions && active->editor.Get().has_value()), Tooltip(switch_mode),
+              Foreground(read_only ? colors.on_primary_container : colors.on_surface_variant),
+              Background(read_only ? colors.primary_container : Color::Transparent()),
+              Semantics{.state_description = mode, .identifier = "toggle-reading-mode"})
+        .On<ViewEvents::PointerIntercept>([active](const PointerEvent& event) {
+          // A mouse press can move focus before Click, which would otherwise commit the preedit.
+          if (event.type == PointerEventType::Down && event.changed_button == PointerButton::Primary) {
+            if (const auto editor = active->editor.Get(); editor && editor->IsComposing()) {
+              editor->Execute(Undo{});
+            }
+          }
+          return false;
+        })
+        .Key("reading-mode");
+  }
   View title;
   if (desktop) {
     const auto count = workspace->tabs->size();
@@ -3980,6 +4035,7 @@ View WorkbenchBar(WorkbenchActions actions, bool desktop) {
               Semantics{.identifier = "show-sidebar", .expanded = sidebar_visible})
         : View{},
     std::move(title).Key("title"),
+    std::move(mode_button),
     active && !narrow_desktop ? IconButton(app::images::search, l10n::find_in_document)
         .OnClick([actions] { actions.Execute(FolioCommand::Find); })
         .With(icon_frame, Tooltip(l10n::find_in_document), Enabled(actions.CanExecute(FolioCommand::Find)))
@@ -4099,6 +4155,7 @@ void InstallWorkbench(WindowContext& context) {
                                                RichDocument{}, nullptr, std::nullopt);
       tab->reading_position = item.reading_position;
       tab->restore_reading_position = item.reading_position.has_value();
+      tab->initial_read_only = item.read_only;
       tab->unresolved = std::move(item);
       tabs.push_back(std::move(tab));
     }

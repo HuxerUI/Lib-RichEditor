@@ -67,6 +67,10 @@ Use `SetTableColumnAlignment{TableColumnAlignment::Center}` to align the header 
 
 Tab and Shift+Tab navigate within a table. Tab from the last cell adds a row and moves the caret into its first cell. Enter adds a line break within a cell. Ctrl+Enter, Command+Enter, or `ExitTable` continues in a paragraph after the table. Cross-cell selections can be copied. Text and formatting edits stay inside a single cell. Each grid change is one undoable edit. A table wider than the editor's content area scrolls horizontally with a touch drag, horizontal wheel, or Shift+wheel.
 
+## Read-only sessions
+
+Call `RichEditorController::SetReadOnly(true)` to pause editing while keeping the same document, selection, and undo history. Entering read-only mode cancels unfinished IME composition. The editor remains scrollable and selectable, and users can copy text, follow links, and navigate with the keyboard. Editing commands and text-range replacements are unavailable until editing is enabled again. Use `IsReadOnly()` to reflect the mode in application controls. `ReplaceDocument()` remains available to load another snapshot into the session.
+
 ## Thematic breaks
 
 Use `InsertThematicBreak{}` at a paragraph caret to insert a divider in the current document, quote, or list item. Inserting within text preserves the inline content on both sides. Select the divider to delete it, or move past it to continue typing. Markdown exports it as `***`.

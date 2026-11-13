@@ -38,6 +38,8 @@ struct WorkspaceTabRecord {
   std::string library_document;
   /// Last reading position in this tab, if captured in a committed layout.
   std::optional<ReadingPosition> reading_position;
+  /// True when the tab was last used in reading mode.
+  bool read_only = false;
   bool operator==(const WorkspaceTabRecord&) const = default;
 };
 

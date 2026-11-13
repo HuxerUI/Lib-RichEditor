@@ -730,6 +730,108 @@ void TaskListEditing() {
         "Creating a task list joins only the neighboring compatible list");
 }
 
+void ReadOnlyEditing() {
+  const auto copied = std::make_shared<std::optional<std::string>>();
+  const Application app([]() -> View {
+    const auto copied = UseService<std::optional<std::string>>();
+    const auto application = UseApplication();
+    return Column {App().With(Grow()), Button("Read clipboard").OnClick([copied, application] {
+      *copied = application.Clipboard()->ReadText();
+    })}.With(CrossAlign(CrossAxisAlignment::Stretch));
+  }, {.show_debug_overlay = false, .application_hooks = {[copied](ApplicationContext& context) {
+    context.Provide(copied);
+  }}});
+  UiTest ui(app);
+  std::string markdown = "中文 [link](#section)\n\n- [ ] Task\n\n```cpp\nx\n```\n";
+  for (int i = 0; i < 40; ++i) {
+    markdown += "\nReading paragraph\n";
+  }
+  const auto baseline = *MarkdownCodec().Import(markdown).document;
+  controller->ReplaceDocument(baseline);
+  ui.Pump();
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  Accept(ui, {{.kind = TextInputCommandKind::CommitText, .text = "你好"}});
+  const TextSelection reverse{4, 1};
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = reverse}});
+  Check(controller->Execute(ToggleMark{Mark::Bold}), "Make one undoable formatting edit before reading");
+  const auto edited = controller->Document();
+  Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "nihao"}});
+  const auto input = *ui.ActiveTextInput();
+  const auto article = ui.FindSemantics(UiSemanticSelector::Identifier("editor"));
+  controller->SetReadOnly(true);
+  ui.Pump();
+  Check(controller->IsReadOnly() && !controller->IsComposing() && !ui.ActiveTextInput() &&
+            article.One().read_only == true && article.One().text_selection == reverse.Range() &&
+            controller->Document() == edited,
+        "Reading mode cancels preedit and retains committed text and the original selection");
+  Check((article.One().actions & SemanticActionMask(SemanticActionKind::SetText)) == 0,
+        "The read-only document does not expose an accessibility write action");
+  Check(ui.SendTextInput({input.session_id, {{.kind = TextInputCommandKind::CommitText, .text = "你好"}}}).result_code ==
+            TextInputResultCode::SessionMismatch,
+        "Late input from the previous session cannot change the document");
+  for (const EditorCommand& command : {EditorCommand{Undo{}}, EditorCommand{Redo{}}, EditorCommand{SetLink{"new"}},
+                                       EditorCommand{ToggleMark{Mark::Bold}}, EditorCommand{ContinueInParagraph{}}}) {
+    Check(!controller->GetCommandState(command).enabled && !controller->Execute(command),
+          "Editing commands are unavailable in reading mode");
+  }
+  const BlockTextRange range{edited.Blocks().front(), {0, 2}};
+  Check(!controller->ReplaceTextRanges(std::span(&range, 1), "edited") && controller->SelectedFragment(),
+        "Read-only selections can be copied but cannot be replaced");
+  ui.PressKey(Key::C, {.control = true});
+  ui.Find(UiSelector::Text("Read clipboard")).Tap();
+  Check(*copied == "好中文", "Copy publishes the selected Chinese text from the read-only editor");
+  article.PerformSemanticAction({SemanticActionKind::Focus, {}});
+  ui.PressKey(Key::Delete);
+  ui.PressKey(Key::Enter);
+  ui.PressKey(Key::V, {.control = true});
+  Check(controller->Document() == edited, "Editing keys cannot change the read-only document");
+  ui.PressKey(Key::ArrowRight);
+  Check(article.One().text_selection == TextRange{4, 4}, "Keyboard navigation still moves the selection");
+  ui.PressKey(Key::A, {.control = true});
+  Check(article.One().text_selection->end > 4 && controller->SelectedFragment(),
+        "Select all remains available with the keyboard");
+  ui.PressKey(Key::Home, {.control = true});
+
+  const auto task = ui.FindSemantics(UiSemanticSelector::Label("Task"));
+  const auto language = ui.FindSemantics(UiSemanticSelector::Label("Code language, C++"));
+  Check(task.Exists() && task.One().checked == SemanticCheckedState::Unchecked && !task.One().enabled &&
+            language.Exists() && (language.One().actions & SemanticActionMask(SemanticActionKind::Activate)) == 0,
+        "Task and code language controls expose their values without editing actions");
+  const auto tap = [&](Rect bounds) {
+    ui.TapAt({bounds.x + bounds.width / 2, bounds.y + bounds.height / 2});
+  };
+  tap(task.One().bounds);
+  tap(language.One().bounds);
+  Check(controller->Document() == edited && !ui.ActiveTextInput() && !ui.Find(UiSelector::Text("Plain text")).Exists(),
+        "Task and code label taps do not edit or open an input session");
+
+  controller->SetReadOnly(false);
+  ui.Pump();
+  Check(controller->Execute(Undo{}) && controller->Document() != edited && controller->Execute(Redo{}) &&
+            controller->Document() == edited,
+        "Leaving reading mode preserves the undo and redo history");
+  ui.Pump();
+  const auto scroll = article.Find(UiSemanticSelector::Role(SemanticRole::ScrollView));
+  const auto viewport = scroll.One().bounds;
+  ui.SendScroll({.position = {viewport.x + viewport.width / 2, viewport.y + viewport.height / 2}, .delta_y = 420});
+  ui.Pump();
+  const auto offset = scroll.One().scroll->offset;
+  const auto selection = article.One().text_selection;
+  controller->SetReadOnly(true);
+  ui.Pump();
+  Check(offset > 0 && scroll.One().scroll->offset == offset && article.One().text_selection == selection,
+        "Entering reading mode keeps the viewport and offscreen selection in place");
+  controller->SetReadOnly(false);
+  ui.Pump();
+  Check(scroll.One().scroll->offset == offset && article.One().text_selection == selection,
+        "Leaving reading mode does not scroll back to the selection");
+  controller->SetReadOnly(true);
+  controller->ReplaceDocument(baseline);
+  ui.Pump();
+  Check(controller->IsReadOnly() && controller->Document() == baseline && !ui.ActiveTextInput(),
+        "The host can load another document while keeping read-only mode");
+}
+
 void TaskCheckboxInteraction() {
   const Application app(App, {.show_debug_overlay = false});
   UiTest ui(app, {.viewport = {340.0F, 380.0F}});
@@ -2631,6 +2733,8 @@ int main() {
   try {
     IncrementalDocumentIndex();
     Workflow();
+    controller.reset();
+    ReadOnlyEditing();
     controller.reset();
     ReplaceTextRanges();
     controller.reset();

@@ -108,9 +108,18 @@ public:
 
   TextInputConfiguration Configuration() const override {
     return {.multiline = true,
-            .keyboard_policy = block_control_ || editor_->SelectedAtomicBlock()
+            .read_only = editor_->IsReadOnly(),
+            .keyboard_policy = wait_for_body_press_ || block_control_ || editor_->SelectedAtomicBlock()
                 ? SoftwareKeyboardPolicy::Manual : SoftwareKeyboardPolicy::Automatic};
   }
+
+  void WaitForBodyPress() { wait_for_body_press_ = true; }
+  void OnBodyPress() {
+    if (!editor_->IsReadOnly()) {
+      wait_for_body_press_ = false;
+    }
+  }
+  bool WaitingForBodyPress() const { return wait_for_body_press_; }
 
   TextInputState State() const override {
     return {session_, editor_->Revision() + geometry_revision_, editor_->ContentRevision(), editor_->SelectionOffsets(),
@@ -271,7 +280,7 @@ public:
     if (action == TextEditingAction::Copy) {
       return !range.IsCollapsed();
     }
-    if (!CanEditTextRange(editor_->VisibleDocument(), range)) {
+    if (editor_->IsReadOnly() || !CanEditTextRange(editor_->VisibleDocument(), range)) {
       return false;
     }
     return action == TextEditingAction::Paste || !range.IsCollapsed();
@@ -350,6 +359,9 @@ public:
     const auto& document = editor_->VisibleDocument();
     const auto selection = editor_->SelectionOffsets();
     const auto range = selection.Range();
+    if (editor_->IsReadOnly() && range.IsCollapsed()) {
+      return std::nullopt;
+    }
     const auto metrics = scroll_.Metrics();
     const auto visible = [&](Rect rect) -> std::optional<Rect> {
       if (rect.y + rect.height >= metrics.offset && rect.y <= metrics.offset + metrics.viewport_extent) {
@@ -418,6 +430,7 @@ private:
   std::uint64_t geometry_revision_ = 0;
   TextInputSessionId session_ = 0;
   std::optional<float> preferred_x_;
+  bool wait_for_body_press_ = false;
   Point viewport_origin_{};
   std::optional<BlockControl> block_control_;
   EditorLayout layout_;
@@ -503,6 +516,9 @@ TextPosition EditorClient::Vertical(TextPosition position, bool down, bool page)
 TextInputKeyResult EditorClient::EditKey(const KeyEvent& event, TextSelection selection, bool word) {
   constexpr auto handled = TextInputKeyResult::Handled;
   constexpr auto unhandled = TextInputKeyResult::Unhandled;
+  if (editor_->IsReadOnly()) {
+    return unhandled;
+  }
   TextInputCommand command{.kind = TextInputCommandKind::CommitText};
   if (event.key == Key::Escape && editor_->CompositionRange()) {
     command.kind = TextInputCommandKind::CancelComposition;
@@ -684,6 +700,15 @@ public:
     client_->SetViewportOrigin({bounds.x, bounds.y});
     const auto revision = editor_->Revision();
     const bool edited = revision != observed_revision_;
+    const bool read_only = editor_->IsReadOnly();
+    const bool mode_changed = read_only != std::exchange(observed_read_only_, read_only);
+    if (mode_changed) {
+      if (read_only) {
+        resize_.reset();
+        client_->WaitForBodyPress();
+      }
+      InvalidateSemantics();
+    }
     if (edited) {
       if (resize_ && resize_->revision != revision) {
         resize_.reset();
@@ -729,9 +754,15 @@ public:
     const bool decorations_changed = UpdateDecorations();
     const TextPosition caret{selection.active, selection.affinity};
     const bool follow_focused_caret = client_->CanRevealCaret(selection) && node.IsFocused();
-    const bool revealed = !task_press_ && (edited || laid_out) && follow_focused_caret &&
+    if (mode_changed) {
+      focused_ = follow_focused_caret;
+      follow_caret_ = false;
+    }
+    const bool follow_caret = follow_focused_caret &&
+        (read_only || !client_->WaitingForBodyPress() || edited);
+    const bool revealed = !mode_changed && !task_press_ && (edited || laid_out) && follow_caret &&
         layout.RevealCaret(editor_->VisibleDocument(), caret);
-    const bool scrolled = UpdateScroll(follow_focused_caret, caret, edited, laid_out);
+    const bool scrolled = UpdateScroll(follow_caret, caret, edited && !mode_changed, laid_out);
     PublishViewportGeometry(observed_scroll_, laid_out);
     const bool hover_changed = UpdateHoveredLink();
     if (laid_out || revealed || scrolled) {
@@ -743,7 +774,7 @@ public:
     if (appearance_changed) {
       return PaintInvalidation::Both;
     }
-    return edited || laid_out || revealed || scrolled || decorations_changed || hover_changed
+    return mode_changed || edited || laid_out || revealed || scrolled || decorations_changed || hover_changed
         ? PaintInvalidation::Foreground : PaintInvalidation::None;
   }
 
@@ -763,9 +794,11 @@ public:
   bool OnKey(ViewNode&, const KeyEvent& event) override {
     const bool modified = LinkActivationModifier(event.modifiers);
     SetLinkHover(hover_pointer_, modified);
-    return event.type == KeyEventType::Down && event.key == Key::Enter &&
-        modified &&
-        editor_->SelectedInlineObject() && ActivateInline(editor_->SelectionOffsets().Range().start);
+    if (event.type == KeyEventType::Down && event.key == Key::Enter && modified &&
+        editor_->SelectedInlineObject() && ActivateInline(editor_->SelectionOffsets().Range().start)) {
+      return true;
+    }
+    return editor_->IsReadOnly() && client_->HandleTextKey(event) == TextInputKeyResult::Handled;
   }
   FrameResult OnFrame(ViewNode& node, const FrameInfo& frame) override;
 
@@ -842,6 +875,7 @@ private:
   std::shared_ptr<EditorViewport::RevealTextHandler> reveal_text_;
   std::shared_ptr<EditorViewport::ViewportLocationHandler> viewport_location_;
   std::uint64_t observed_revision_ = 0;
+  bool observed_read_only_ = false;
   std::shared_ptr<const DecorationAnalysis> decoration_analysis_;
   std::uint64_t observed_decoration_revision_ = 0;
   std::uint64_t observed_inline_revision_ = 0;
@@ -917,6 +951,9 @@ void EditorExtension::ResetClient() {
     client_->Detach();
   }
   client_ = std::make_shared<EditorClient>(editor_, viewport_->scroll, keymap_);
+  if (observed_read_only_ || editor_->IsReadOnly()) {
+    client_->WaitForBodyPress();
+  }
   touch_.reset();
   touch_table_.reset();
   drag_id_.reset();
@@ -1110,7 +1147,7 @@ std::optional<std::size_t> EditorExtension::CodeHeaderAt(Point point) const {
 }
 
 bool EditorExtension::OpenCodeLanguage(std::size_t index) {
-  if (!node_.IsEnabled() || !viewport_->code_language_popup || !viewport_->code_language_anchor) {
+  if (editor_->IsReadOnly() || !node_.IsEnabled() || !viewport_->code_language_popup || !viewport_->code_language_anchor) {
     return false;
   }
   const auto& header = client_->Layout().Rows()[index].code_header;
@@ -1293,7 +1330,8 @@ NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const Po
       (event.changed_button == PointerButton::Primary || event.changed_button == PointerButton::None);
   if (primary_down) {
     SetLinkHover(std::nullopt, false);
-    if (!task_press_ && !event.modifiers.shift) {
+    client_->OnBodyPress();
+    if (!editor_->IsReadOnly() && !task_press_ && !event.modifiers.shift) {
       if (const auto item = client_->TaskAt(event.position)) {
         task_press_ = TaskPress{event.pointer_id, event.position, *item, editor_->Revision()};
         return PointerResult::Observe;
@@ -1305,7 +1343,7 @@ NodeExtension::PointerResult EditorExtension::OnPointer(ViewNode& node, const Po
     client_->SetBlockControlActive(CodeHeaderAt(event.position).has_value() ||
         (!event.modifiers.shift && client_->HitsAtomicBlock(event.position)));
   }
-  if (primary_down && client_->HasGeometry() && !event.modifiers.shift) {
+  if (primary_down && !editor_->IsReadOnly() && client_->HasGeometry() && !event.modifiers.shift) {
     if (const auto selected = editor_->SelectedImage()) {
       const auto& box = *client_->Layout().Rows()[*selected].image;
       const auto corner = ResizeCorner(box.bounds);
@@ -1412,7 +1450,7 @@ NodeExtension::FrameResult EditorExtension::OnFrame(ViewNode& node, const FrameI
       client_->Select(drag_in_viewport_, true);
     }
   }
-  if (!node.IsFocused() || frame.reduced_motion || editor_->CompositionRange() ||
+  if (editor_->IsReadOnly() || !node.IsFocused() || frame.reduced_motion || editor_->CompositionRange() ||
       !editor_->SelectionOffsets().IsCollapsed()) {
     return {.needs_frame = scrolling};
   }
@@ -1587,9 +1625,11 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
                      colors.surface_container_highest, CornerRadii{layout.Theme().shapes.small});
       paint.DrawText({box.x + 8.0F, box.y, box.width - 30.0F, box.height}, header.label, header.style,
                      {.vertical_align = TextVerticalAlign::Center, .wrap = TextWrap::NoWrap});
-      const Point tip{box.x + box.width - 12.0F, box.y + box.height / 2.0F + 2.0F};
-      paint.DrawLine({tip.x - 3.0F, tip.y - 3.0F}, tip, header.style.foreground, StrokeStyle{.width = 1.25F});
-      paint.DrawLine(tip, {tip.x + 3.0F, tip.y - 3.0F}, header.style.foreground, StrokeStyle{.width = 1.25F});
+      if (!editor_->IsReadOnly()) {
+        const Point tip{box.x + box.width - 12.0F, box.y + box.height / 2.0F + 2.0F};
+        paint.DrawLine({tip.x - 3.0F, tip.y - 3.0F}, tip, header.style.foreground, StrokeStyle{.width = 1.25F});
+        paint.DrawLine(tip, {tip.x + 3.0F, tip.y - 3.0F}, header.style.foreground, StrokeStyle{.width = 1.25F});
+      }
     }
     for (const auto& marker : row.markers) {
       if (!marker.text.empty()) {
@@ -1655,7 +1695,7 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
     paint.DrawLine(top_right, corner, accent, stroke);
     paint.DrawLine(corner, bottom_left, accent, stroke);
     paint.DrawLine(bottom_left, top_left, accent, stroke);
-    if (image.asset.HasValue()) {
+    if (image.asset.HasValue() && !editor_->IsReadOnly()) {
       paint.DrawRect({corner.x - 6.0F, corner.y - 6.0F, 12.0F, 12.0F}, colors.surface, CornerRadii{3.0F});
       paint.DrawRect({corner.x - 4.5F, corner.y - 4.5F, 9.0F, 9.0F}, accent, CornerRadii{2.0F});
     }
@@ -1671,7 +1711,8 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
       paint.DrawRect({rect.x, rect.y + rect.height - 1.5F, rect.width, 1.5F}, accent);
     }
   }
-  if (node.IsFocused() && selection.IsCollapsed() && (caret_visible_ || editor_->CompositionRange())) {
+  if (!editor_->IsReadOnly() && node.IsFocused() && selection.IsCollapsed() &&
+      (caret_visible_ || editor_->CompositionRange())) {
     auto caret = layout.Caret(document, {selection.active, selection.affinity});
     caret.width = 1.5F;
     const auto& row = layout.Rows()[LeafIndex(document, selection.active)];
@@ -1688,15 +1729,19 @@ void EditorExtension::PaintAboveContent(const ViewNode& node, PaintContext& pain
 
 void EditorExtension::BuildSemantics(SemanticBuilder& builder) const {
   const auto& document = editor_->VisibleDocument();
+  const bool read_only = editor_->IsReadOnly();
   builder.SetOwner({.role = SemanticRole::TextField, .label = "Document",
                     .value = TextSlice(document, {0, DocumentAccess::Get(document).index.Length()}),
+                    .read_only = read_only,
                     .text_selection = editor_->SelectionOffsets().Range()});
-  builder.AddAction(0, SemanticActionKind::SetText);
+  if (!read_only) {
+    builder.AddAction(0, SemanticActionKind::SetText);
+  }
   builder.AddAction(0, SemanticActionKind::SetSelection);
   if (client_->HasGeometry()) {
     const auto& leaves = DocumentAccess::Get(document).index;
     const auto& rows = client_->Layout().Rows();
-    const bool task_enabled = !editor_->CompositionRange();
+    const bool task_enabled = !read_only && !editor_->CompositionRange();
     for (std::size_t i = 0; i < leaves.LeafCount(); ++i) {
       const auto& row = rows[i];
       for (const auto& marker : row.markers) {
@@ -1733,8 +1778,11 @@ void EditorExtension::BuildSemantics(SemanticBuilder& builder) const {
       } else if (const auto& header = rows[i].code_header) {
         const auto id = DocumentAccess::Id(leaves.At(i).block);
         builder.AddChild(id, client_->ToNode(header->bounds),
-                         {.role = SemanticRole::Button, .label = "Code language, " + header->label}, true);
-        builder.AddAction(id, SemanticActionKind::Activate);
+                         {.role = read_only ? SemanticRole::Text : SemanticRole::Button,
+                          .label = "Code language, " + header->label}, true);
+        if (!read_only) {
+          builder.AddAction(id, SemanticActionKind::Activate);
+        }
       }
     }
   }
@@ -1767,7 +1815,7 @@ bool EditorExtension::OnSemanticAction(std::uint64_t local_id, const SemanticAct
       return editor_->Select({range->start, range->end});
     }
   }
-  if (action.kind == SemanticActionKind::SetText) {
+  if (action.kind == SemanticActionKind::SetText && !editor_->IsReadOnly()) {
     if (const auto* text = std::get_if<std::string>(&action.value)) {
       editor_->FinishComposition();
       const auto length = DocumentAccess::Get(editor_->VisibleDocument()).index.Length();

@@ -316,8 +316,19 @@ void EditorSession::ReplaceDocument(RichDocument document) {
   }
 }
 
+void EditorSession::SetReadOnly(bool read_only) {
+  if (read_only == IsReadOnly()) {
+    return;
+  }
+  if (read_only && draft_.composition) {
+    const TextInputCommand cancel{.kind = TextInputCommandKind::CancelComposition};
+    Apply(std::span(&cancel, 1));
+  }
+  read_only_ = read_only;
+}
+
 bool EditorSession::ReplaceTextRanges(std::span<const BlockTextRange> ranges, std::string_view text) {
-  if (draft_.composition || ranges.empty()) {
+  if (IsReadOnly() || draft_.composition || ranges.empty()) {
     return false;
   }
   auto next = draft_;
@@ -410,7 +421,7 @@ bool EditorSession::Publish(Draft next, bool remember, bool reset_block_changes)
 }
 
 bool EditorSession::Apply(std::span<const TextInputCommand> commands) {
-  if (commands.empty()) {
+  if (commands.empty() || IsReadOnly()) {
     return false;
   }
   auto next = draft_;
@@ -437,6 +448,9 @@ bool EditorSession::Select(TextSelection selection) {
 }
 
 bool EditorSession::BreakLine(bool hard_break) {
+  if (IsReadOnly()) {
+    return false;
+  }
   auto next = draft_;
   next.composition.reset();
   try {
@@ -448,6 +462,9 @@ bool EditorSession::BreakLine(bool hard_break) {
 }
 
 bool EditorSession::BackspaceAtStart() {
+  if (IsReadOnly()) {
+    return false;
+  }
   auto next = draft_;
   try {
     if (!ExitBlockAtCaret(next, false)) {
@@ -480,6 +497,9 @@ void EditorSession::FinishComposition() {
 }
 
 bool EditorSession::SetCodeLanguage(BlockId block, std::string_view language) {
+  if (IsReadOnly()) {
+    return false;
+  }
   const auto& storage = DocumentAccess::Get(VisibleDocument());
   const auto found = storage.index.IndexOf(block);
   if (!found) {
@@ -507,7 +527,7 @@ bool EditorSession::SetCodeLanguage(BlockId block, std::string_view language) {
 }
 
 bool EditorSession::ToggleTaskChecked(BlockId item) {
-  if (draft_.composition) {
+  if (IsReadOnly() || draft_.composition) {
     return false;
   }
   auto next = draft_;
@@ -576,6 +596,9 @@ std::optional<EditorSession::InlineLocation> EditorSession::LocateInlineObject(c
 }
 
 CommandState EditorSession::CommandStatus(const EditorCommand& command) const {
+  if (IsReadOnly() && !std::holds_alternative<SelectAll>(command)) {
+    return {};
+  }
   const auto range = SelectionOffsets().Range();
   const auto& document = draft_.edit.document;
   if (const auto* toggle = std::get_if<ToggleMark>(&command)) {

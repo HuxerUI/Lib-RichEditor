@@ -415,6 +415,17 @@ public:
   /// @param document Validated snapshot to open.
   void ReplaceDocument(RichDocument document) const;
 
+  /// @brief Controls whether the session accepts edits. New sessions are editable.
+  ///
+  /// Entering read-only mode cancels provisional IME text and restores its committed selection.
+  /// Scrolling, selection, copying, link activation, and programmatic reveals remain available.
+  /// Edit commands, including Undo and Redo, are unavailable until editing is enabled again.
+  /// The committed document and history are retained. ReplaceDocument() can still load another snapshot.
+  void SetReadOnly(bool read_only) const;
+
+  /// @brief Reports the session's editing policy and observes changes when called in composition.
+  bool IsReadOnly() const;
+
   /// @brief Reports whether the editor currently holds provisional text from an input method.
   /// Calls in composition observe changes so application controls can update their availability.
   bool IsComposing() const;
