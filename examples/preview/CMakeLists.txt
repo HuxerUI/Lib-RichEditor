@@ -60,6 +60,7 @@ huxerui_use_library(${PROJECT_NAME}
 )
 
 if(NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+    target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/bigobj>)
     target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json)
     if (APPLE)
         set_property(TARGET ${PROJECT_NAME} PROPERTY OBJCXX_STANDARD 20)
