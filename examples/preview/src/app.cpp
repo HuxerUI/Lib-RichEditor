@@ -352,8 +352,29 @@ View LinkDialog(DialogContext context, RichEditorController editor, ViewHandle f
   }, theme, 360.0F);
 }
 
+using OpenDocumentLink = std::function<void(folio::DocumentLink)>;
+
+bool CanOpenLink(std::string_view target, const OpenDocumentLink& open_document) {
+  return folio::ParseWebUrl(target).has_value() || (open_document && folio::ParseDocumentLink(target).has_value());
+}
+
+bool OpenLink(std::string_view target, const OpenDocumentLink& open_document, const ToastHandle& toast) {
+  if (const auto url = folio::ParseWebUrl(target)) {
+    folio::OpenBrowser(*url, toast);
+    return true;
+  }
+  if (open_document) {
+    if (auto link = folio::ParseDocumentLink(target)) {
+      open_document(std::move(*link));
+      return true;
+    }
+  }
+  return false;
+}
+
 [[huxerui::composable]]
-View LinkTool(RichEditorController editor, ViewHandle focus, bool available, bool compact) {
+View LinkTool(RichEditorController editor, ViewHandle focus, bool available, bool compact,
+              OpenDocumentLink open_document) {
   const auto& theme = UseTheme();
   const auto menu = UseMenu();
   const auto anchor = UseViewHandle();
@@ -371,7 +392,6 @@ View LinkTool(RichEditorController editor, ViewHandle focus, bool available, boo
           dialog.Show(LinkDialog, editor, focus, std::optional<LinkRange>{});
           return;
         }
-        const auto url = folio::ParseWebUrl(current->target);
         std::vector<MenuEntry> items{
             MenuItem(l10n::edit_link_menu, [=] { dialog.Show(LinkDialog, editor, focus, current); }),
             MenuItem(l10n::copy_link, [clipboard, toast, target = current->target] {
@@ -384,8 +404,10 @@ View LinkTool(RichEditorController editor, ViewHandle focus, bool available, boo
               }
             }),
         };
-        if (url) {
-          items.insert(items.begin(), MenuItem(l10n::open_link, [toast, url = *url] { folio::OpenBrowser(url, toast); }));
+        if (CanOpenLink(current->target, open_document)) {
+          items.insert(items.begin(), MenuItem(l10n::open_link, [toast, open_document, target = current->target] {
+            OpenLink(target, open_document, toast);
+          }));
         }
         menu.Show(anchor, std::move(items));
       })
@@ -649,7 +671,7 @@ View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelSta
 
 [[huxerui::composable]]
 View FormattingBar(RichEditorController editor, ViewHandle focus, bool available, bool can_pick_images,
-                   std::function<void(bool, bool)> pick_image) {
+                   std::function<void(bool, bool)> pick_image, OpenDocumentLink open_document) {
   using namespace app::images;
   const auto& theme = UseTheme();
   const auto menu = UseMenu();
@@ -666,9 +688,8 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const float tool_size = compact ? 44.0F : 30.0F;
   const auto tool_frame = Frame{.min_width = tool_size, .min_height = tool_size};
   const auto selected_link = folio::IsMobilePlatform() ? editor.CurrentLink() : std::nullopt;
-  const auto selected_url = selected_link ? folio::ParseWebUrl(selected_link->target) : std::nullopt;
-  const View open_link = selected_url ? View(Button(l10n::open_link)
-      .OnClick([toast, url = *selected_url] { folio::OpenBrowser(url, toast); })
+  const View open_link = selected_link && CanOpenLink(selected_link->target, open_document) ? View(Button(l10n::open_link)
+      .OnClick([toast, open_document, target = selected_link->target] { OpenLink(target, open_document, toast); })
       .With(tool_frame, Enabled(available), Background(theme.colors.primary_container),
             Foreground(theme.colors.on_primary_container))) : View{};
   const auto header_state = editor.GetCommandState(ToggleTableHeader{});
@@ -931,7 +952,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         actions.Add(tool(quote, l10n::block_quote, ToggleQuote{}));
       } else if (can_link) {
         context = "link";
-        actions.Add(LinkTool(editor, focus, available, compact));
+        actions.Add(LinkTool(editor, focus, available, compact, open_document));
       }
       const View text_style = in_table ? View{} : TextStylePicker(editor, focus, available, compact);
       const bool style_first = in_code || (!show_list && !in_quote && !can_link);
@@ -944,7 +965,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
         actions.Add(tool(underline, l10n::underline, ToggleMark{Mark::Underline}));
       }
       if (can_link && (in_table || show_list || in_quote)) {
-        actions.Add(LinkTool(editor, focus, available, compact));
+        actions.Add(LinkTool(editor, focus, available, compact, open_document));
       }
       if (text_style && !style_first) {
         actions.Add(text_style);
@@ -1005,7 +1026,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
       tool(bold, l10n::bold, ToggleMark{Mark::Bold}),
       tool(italic, l10n::italic, ToggleMark{Mark::Italic}),
       tool(underline, l10n::underline, ToggleMark{Mark::Underline}),
-      LinkTool(editor, focus, available, compact),
+      LinkTool(editor, focus, available, compact, open_document),
       tool(strikethrough, l10n::strikethrough, ToggleMark{Mark::Strike}),
       tool(inline_code, l10n::inline_code, ToggleMark{Mark::Code}),
       tool(highlight, l10n::highlight, ToggleMark{Mark::Highlight}),
@@ -1216,12 +1237,8 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
                      .custom_blocks = {{std::string(latex_type), FormulaRenderer()}},
                      .inline_objects = {InlineFormulaExtension()}},
       .keymap = settings->Bindings()->editor,
-  }).On<RichEditorEvents::LinkActivated>([toast](const LinkRange& link) {
-    if (const auto url = folio::ParseWebUrl(link.target)) {
-      OpenBrowser(*url, toast);
-      return true;
-    }
-    return false;
+  }).On<RichEditorEvents::LinkActivated>([toast, open_document = options.open_document_link](const LinkRange& link) {
+    return OpenLink(link.target, open_document, toast);
   }).On<RichEditorEvents::InlineObjectActivated>([=](const InlineObjectSelection& object) {
     if (object.data.type == latex_type && object.data.version == 1) {
       dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true, .object = object});
@@ -1239,7 +1256,7 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
     FormattingBar(editor, focus, options.available, options.can_pick_images,
                   [focus, pick = std::move(options.pick_image)](bool replace, bool inline_image) {
                     pick(focus, replace, inline_image);
-                  }).Key("formatting"),
+                  }, std::move(options.open_document_link)).Key("formatting"),
     Divider(),
     find_bar ? std::move(find_bar).Key("find-bar") : View{},
     Column {paper}.With(Grow(), Padding(page_insets),

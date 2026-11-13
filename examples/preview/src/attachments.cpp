@@ -97,22 +97,6 @@ bool WithinDirectory(const File& directory, const File& child) {
   return !relative.empty() && !relative.is_absolute() && *relative.begin() != "..";
 }
 
-Task<IoResult<FileSource>> FindAttachment(FileSource directory, std::vector<std::string> path) {
-  const auto root = directory.AsFile();
-  for (std::size_t i = 0; i < path.size(); ++i) {
-    auto child = co_await FindChild(directory, path[i], i + 1 == path.size() ? FileType::File : FileType::Directory);
-    if (!child.Succeeded()) {
-      co_return child;
-    }
-    directory = std::move(child.Value());
-    if (const auto local = directory.AsFile(); root && local &&
-        !(co_await RunWorker(WithinDirectory, *root, *local))) {
-      co_return IoResult<FileSource>::Failure({IoErrorCode::PermissionDenied, "Attachment is outside its folder"});
-    }
-  }
-  co_return IoResult<FileSource>::Success(std::move(directory));
-}
-
 std::set<std::string> LocalReferences(const RichDocument& document) {
   std::set<std::string> sources;
   const auto add = [&](const std::string& source) {
@@ -155,9 +139,9 @@ Task<IoResult<FileSource>> ResolveAttachment(std::optional<File> working_directo
     }
   }
   for (const auto& directory : directories) {
-    auto child = co_await FindAttachment(directory, path);
+    auto child = co_await FindFolderFile(directory, path);
     if (child.Succeeded()) {
-      co_return IoResult<FileSource>::Success(std::move(child.Value()));
+      co_return IoResult<FileSource>::Success(std::move(child.Value().file));
     }
     if (child.Error().code != IoErrorCode::NotFound) {
       co_return IoResult<FileSource>::Failure(child.Error());
@@ -283,13 +267,13 @@ Task<IoResult<void>> CopyAttachments(FileSource destination, std::vector<Attachm
     }
     const auto name = copy.path.back();
     if (in_place) {
-      auto existing = co_await FindAttachment(folder, {name});
+      auto existing = co_await FindFolderFile(folder, {name});
       if (!existing.Succeeded() && existing.Error().code != IoErrorCode::NotFound) {
         co_return IoResult<void>::Failure(existing.Error());
       }
       if (existing.Succeeded()) {
         const auto from = copy.source.AsFile();
-        if (from && from == existing.Value().AsFile()) {
+        if (from && from == existing.Value().file.AsFile()) {
           continue;
         }
       }
@@ -298,7 +282,7 @@ Task<IoResult<void>> CopyAttachments(FileSource destination, std::vector<Attachm
         co_return IoResult<void>::Failure(bytes.Error());
       }
       if (existing.Succeeded()) {
-        const auto current = co_await existing.Value().ReadBytesAsync();
+        const auto current = co_await existing.Value().file.ReadBytesAsync();
         if (!current.Succeeded() || current.Value() != bytes.Value()) {
           co_return IoResult<void>::Failure(
               {IoErrorCode::AlreadyExists, "An attachment already exists at " + copy.reference});
@@ -473,6 +457,26 @@ Task<IoResult<FileSource>> FindChild(FileSource directory, std::string name, Fil
     }
   }
   co_return IoResult<FileSource>::Failure({IoErrorCode::NotFound, "Missing " + name});
+}
+
+Task<IoResult<FolderFile>> FindFolderFile(FileSource directory, std::vector<std::string> path) {
+  const auto root = directory.AsFile();
+  for (std::size_t index = 0; index < path.size(); ++index) {
+    const bool last = index + 1 == path.size();
+    auto child = co_await FindChild(directory, path[index], last ? FileType::File : FileType::Directory);
+    if (!child.Succeeded()) {
+      co_return IoResult<FolderFile>::Failure(child.Error());
+    }
+    if (const auto local = child.Value().AsFile(); root && local &&
+        !(co_await RunWorker(WithinDirectory, *root, *local))) {
+      co_return IoResult<FolderFile>::Failure({IoErrorCode::Unsupported, "The path leaves its folder"});
+    }
+    if (last) {
+      co_return IoResult<FolderFile>::Success({std::move(child.Value()), std::move(directory)});
+    }
+    directory = std::move(child.Value());
+  }
+  co_return IoResult<FolderFile>::Failure({IoErrorCode::NotFound, "No file was specified"});
 }
 
 Task<IoResult<FileSource>> FindPackageDocument(FileSource directory) {

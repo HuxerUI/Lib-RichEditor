@@ -30,7 +30,7 @@ void Check(bool condition, const char* message) {
   }
 }
 
-void WaitForFixture(UiTest& ui, const std::function<bool()>& check) {
+void WaitForFixtureWithMessage(UiTest& ui, const std::function<bool()>& check, const char* failure) {
   const auto deadline = std::chrono::steady_clock::now() + 3s;
   do {
     ui.Pump(16ms);
@@ -39,7 +39,11 @@ void WaitForFixture(UiTest& ui, const std::function<bool()>& check) {
     }
     std::this_thread::sleep_for(1ms);
   } while (std::chrono::steady_clock::now() < deadline);
-  Check(false, "The fixture operation completed before the timeout");
+  Check(false, failure);
+}
+
+void WaitForFixture(UiTest& ui, const std::function<bool()>& check) {
+  WaitForFixtureWithMessage(ui, check, "The fixture operation completed before the timeout");
 }
 
 void Send(UiTest& ui, std::initializer_list<TextInputCommand> commands) {
@@ -64,6 +68,36 @@ void WebUrls() {
   Check(remote.document && !folio::HasLocalAttachments(*remote.document) &&
             local.document && folio::HasLocalAttachments(*local.document),
         "Attachment discovery uses the same HTTP and HTTPS policy as browser links");
+}
+
+void DocumentLinks() {
+  using namespace folio;
+  const auto link = ParseDocumentLink("../%E6%8C%87%E5%8D%97/Deploy%20%231.md#%E5%AE%89%E8%A3%85-1");
+  const std::vector<std::string> source{"notes", "Index.md"};
+  Check(link && link->anchor == "安装-1" &&
+            ResolveDocumentLinkPath(source, *link) == std::vector<std::string>{"指南", "Deploy #1.md"},
+        "Relative links decode each URL component exactly once");
+  Check(!ResolveDocumentLinkPath(std::span(source).last(1), *link), "A link cannot walk above its source folder");
+  for (const std::string_view target : {"//example.test/Notes.md", "/Notes.md", "file:Notes.md",
+                                       "x%2FNotes.md", "%5cNotes.md", "Notes.md?mode=read", "Notes.md#%FF",
+                                       "Image.png", "#"}) {
+    Check(!ParseDocumentLink(target), "Unsupported or malformed targets are not document links");
+  }
+  const auto document = Codec(DocumentFormat::Markdown).Import(
+      "# **安装**！ Guide\n\n> ## 安装 Guide\n\n# 安装 Guide-1\n\n# 安装 Guide\n").document;
+  Check(document.has_value(), "The anchor fixture imports with strict Markdown");
+  const auto headings = DocumentHeadings(*document);
+  Check(headings.size() == 4 && headings[0].anchor == "安装-guide" && headings[1].anchor == "安装-guide-1" &&
+            headings[2].anchor == "安装-guide-1-1" && headings[3].anchor == "安装-guide-2",
+        "Anchors use visible text, include nested headings, and avoid collisions");
+  const auto linked = Codec(DocumentFormat::Markdown).Import(
+      "[Local](#安装) and [Deploy](<../指南/Deploy%20Guide.md#安装-1>)").document;
+  Check(linked.has_value(), "Markdown imports both kinds of document link");
+  for (const auto format : {DocumentFormat::Markdown, DocumentFormat::Json}) {
+    const auto& codec = Codec(format);
+    const auto saved = codec.Export(*linked);
+    Check(saved.text && codec.Import(*saved.text).document == linked, "Both codecs preserve link targets exactly");
+  }
 }
 
 void WorkspaceStorage(const File& directory) {
@@ -1033,6 +1067,72 @@ void OutlineFlow(const char* package_path) {
         "Switching back follows the restored document position");
 }
 
+void DocumentLinkFlow(const File& directory, const char* package_path) {
+  using namespace folio;
+  const auto project = directory.Child("Project");
+  const auto notes = project.Child("notes");
+  const auto source = notes.Child("Index.md");
+  const auto target = project.Child("Deploy.md");
+  std::string filler;
+  for (int i = 0; i < 48; ++i) {
+    filler += "A body paragraph\n\n";
+  }
+  const std::string intro = "[Local](#安装-1)\n\n[Remote](../Deploy.md#original)\n\n"
+      "[Missing](../Missing.md)\n\n[Unknown](#missing)\n\n";
+  Check(notes.CreateDirectories() && source.WriteString(intro + "# 安装\n\n" + filler + "# 安装\n") &&
+            target.WriteString("# Deploy\n\n" + filler + "# Original\n"),
+        "Create the Markdown link fixtures");
+  const Application app(App, {.show_debug_overlay = false,
+      .application_hooks = {[&](ApplicationContext& context) {
+        auto store = std::make_shared<WorkspaceStore>(directory);
+        store->Set({.active_window = "links", .windows = {{.id = "links",
+            .folders = {{1, "Project", {project.Path(), false}}},
+            .tabs = {{.id = 1, .name = "Index.md", .location = {source.Path(), false}, .folder = 1,
+                      .relative = {"notes", "Index.md"}},
+                     {.id = 2, .name = "Deploy.md", .location = {target.Path(), false}, .folder = 1,
+                      .relative = {"Deploy.md"}}},
+            .selected = 1, .sidebar_visible = false, .showing_outline = true}}});
+        InstallFolioWithWorkspace(context, std::move(store), directory);
+      }},
+      .window_hooks = {InstallWorkbench}});
+  UiTest ui(app, {.viewport = {880, 640}, .resource_provider = std::make_shared<PackageResources>(package_path)});
+  const auto article = ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
+  const auto scroll = article.Find(UiSemanticSelector::Role(SemanticRole::ScrollView));
+  const auto by_label = [&](const char* label) { return ui.FindSemantics(UiSemanticSelector::Label(label)); };
+  const auto open_link = [&](TextSelection selection) {
+    article.PerformSemanticAction({SemanticActionKind::Focus, {}});
+    Send(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = selection}});
+    by_label("Link actions").PerformSemanticAction({SemanticActionKind::Activate, {}});
+    by_label("Open link").PerformSemanticAction({SemanticActionKind::Activate, {}});
+  };
+  WaitForFixtureWithMessage(ui, [&] {
+    return article.Exists() && article.One().value.starts_with("Local\n") && !by_label("Restoring document…").Exists();
+  }, "The workspace fixture is restored");
+  const TextSelection reverse{4, 1};
+  const auto source_bounds = scroll.One().bounds;
+  ui.TapAt({source_bounds.x + 28, source_bounds.y + 30}, {.device_kind = PointerDeviceKind::Mouse});
+  Check(ui.ActiveTextInput().has_value(), "The source editor can receive input before following the first link");
+  open_link(reverse);
+  WaitForFixtureWithMessage(ui, [&] { return scroll.One().scroll->offset > 500; }, "The duplicate heading is revealed");
+  Check(article.One().text_selection == reverse.Range(), "The local jump keeps the selected text");
+  article.PerformSemanticAction({SemanticActionKind::Focus, {}});
+  Check(ui.ActiveTextInput() && ui.ActiveTextInput()->selection == reverse,
+        "The local jump preserves the selection direction");
+
+  open_link({23, 23});
+  WaitForFixtureWithMessage(ui, [&] { return by_label("The linked heading is no longer available").Exists(); },
+                            "An unknown anchor reports a status");
+  open_link({15, 15});
+  WaitForFixtureWithMessage(ui, [&] { return by_label("Could not find the linked document").Exists(); },
+                 "The missing document reports a status");
+  Check(article.One().value.starts_with("Local\n"), "A missing document leaves the source tab active");
+  Check(target.WriteString("# Deploy\n\n# Updated on disk\n"), "Change the target on disk after it has opened");
+  open_link({7, 7});
+  WaitForFixtureWithMessage(ui, [&] {
+    return article.One().value.ends_with("Original") && scroll.One().scroll->offset > 500;
+  }, "A relative link reveals the heading from the already open document");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1040,6 +1140,8 @@ int main(int argc, char** argv) {
   try {
     Check(argc == 2, "The Folio resource package path is required");
     WebUrls();
+    DocumentLinks();
+    DocumentLinkFlow(directory.Child("document-links"), argv[1]);
     {
       const Application storage([] { return View{}; }, {
           .application_hooks = {[&](ApplicationContext&) { WorkspaceStorage(directory.Child("store")); }},

@@ -6,6 +6,8 @@
 #include <huxerui/richeditor.h>
 #include <huxerui/richeditor/format.h>
 
+#include "document_links.h"
+
 namespace folio {
 
 class WorkspaceStore;
@@ -29,6 +31,7 @@ struct EditorPaneOptions {
   bool available;
   bool can_pick_images;
   std::function<void(huxerui::ViewHandle, bool replace, bool inline_image)> pick_image;
+  std::function<void(DocumentLink)> open_document_link;
 };
 
 huxerui::View EditorPane(huxerui::richeditor::RichEditorController editor, EditorPaneOptions options);

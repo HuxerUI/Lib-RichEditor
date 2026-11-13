@@ -14,6 +14,7 @@
 #include "browser.h"
 #include "command_palette.h"
 #include "document_library.h"
+#include "document_links.h"
 #include "labels.h"
 #include "settings.h"
 #include "workspace_store.h"
@@ -96,8 +97,9 @@ struct DocumentTab {
   State<Operation> operation{Operation::Idle};
   State<FindPanelState> find{FindPanelState{}};
   State<std::string> status{std::string{}};
+  State<std::optional<std::string>> pending_anchor{std::nullopt};
   State<std::optional<WorkspaceTabRecord>> unresolved{std::nullopt};
-  std::vector<std::string> restored_relative;
+  std::vector<std::string> source_relative;
   std::optional<std::string> library_folder;
   std::optional<WorkspaceLocation> unavailable_attachments;
   bool opened_with_attachments;
@@ -176,6 +178,31 @@ struct FolderEntry {
   State<bool> mounted{true};
   std::string recent_id;
 };
+
+struct FolderDocumentLocation {
+  Entry root;
+  std::vector<std::string> path;
+};
+
+FolderDocumentLocation FolderLocation(Entry folder, std::string name) {
+  std::vector<std::string> path{std::move(name)};
+  if (folder) {
+    while (auto parent = folder->parent.lock()) {
+      path.push_back(folder->name);
+      folder = std::move(parent);
+    }
+    std::ranges::reverse(path);
+  }
+  return {std::move(folder), std::move(path)};
+}
+
+FolderDocumentLocation TabFolderLocation(const Tab& tab, const Target& target) {
+  auto location = FolderLocation(tab->source_folder.Get(), target->reference.Name());
+  if (location.root && !tab->source_relative.empty()) {
+    location.path = tab->source_relative;
+  }
+  return location;
+}
 
 struct RecentItem {
   WorkspaceRecentRecord record;
@@ -355,26 +382,11 @@ struct FolioState {
       } else if (tab->unavailable_attachments) {
         record.attachments = *tab->unavailable_attachments;
       }
-      auto folder = tab->source_folder.Get();
-      if (folder) {
-        if (tab->restored_relative.empty()) {
-          record.relative.push_back(record.name);
-        }
-        while (auto parent = folder->parent.lock()) {
-          if (tab->restored_relative.empty()) {
-            record.relative.push_back(folder->name);
-          }
-          folder = std::move(parent);
-        }
-        if (std::ranges::find(window.folders, folder->id, &WorkspaceFolderRecord::id) != window.folders.end()) {
-          record.folder = folder->id;
-          if (tab->restored_relative.empty()) {
-            std::ranges::reverse(record.relative);
-          } else {
-            record.relative = tab->restored_relative;
-          }
-        } else {
-          record.relative.clear();
+      auto location = TabFolderLocation(tab, original->target);
+      if (location.root) {
+        if (std::ranges::find(window.folders, location.root->id, &WorkspaceFolderRecord::id) != window.folders.end()) {
+          record.folder = location.root->id;
+          record.relative = std::move(location.path);
         }
       } else if (target.directory && !target.directory->AsFile()) {
         record.package = target.directory->Name();
@@ -604,7 +616,17 @@ struct OpenFailure {
   std::optional<std::string> import_parent;
 };
 
-using OpenResult = std::variant<std::shared_ptr<Workspace>, OpenFailure>;
+struct OpenedDocument {
+  std::shared_ptr<Workspace> owner;
+  Tab tab;
+};
+
+struct LinkDestination {
+  std::vector<std::string> path;
+  std::optional<std::string> anchor;
+};
+
+using OpenResult = std::variant<OpenedDocument, OpenFailure>;
 using LoadedDocument = std::variant<std::shared_ptr<const SavedDocument>, OpenFailure>;
 
 std::string IssueMessage(const std::vector<ConversionIssue>& issues) {
@@ -649,6 +671,8 @@ public:
   void MoveLibraryEntry(std::string id, std::string parent) const;
   void ConfirmLibraryDelete(std::string id) const;
   void JumpToHeading(const Tab& tab, const Block& block, TextOffset length) const;
+  void RevealLinkedHeading(const Tab& tab, const RichEditorController& editor, const std::string& anchor) const;
+  void FollowDocumentLink(Tab tab, DocumentLink link) const;
   void NewWindow() const;
   void PickOpen(OpenKind kind) const { PickOpen(OpenRequest{kind}); }
   void PickOpen(OpenRequest request) const;
@@ -676,14 +700,19 @@ private:
   void Launch(bool uses_picker, std::function<Task<void>()> action, std::function<void(std::string)> failed = {}) const;
   Tab AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved = {},
              Entry source_folder = {}, std::optional<FileSource> attachment_directory = {},
-             std::optional<std::string> library_folder = {}) const;
+             std::optional<std::string> library_folder = {}, std::vector<std::string> relative = {}) const;
   void EditLibraryName(LibraryEntry entry, bool creating) const;
   void ReportLibraryDeleteFailure(StringVariant reason) const;
   void DeleteLibraryEntries(std::vector<LibraryEntry> expected, std::set<DocumentId> confirmed_dirty) const;
-  std::shared_ptr<Workspace> ActivateExisting(const Target& target, const Entry& source_folder) const;
-  Task<OpenResult> OpenTarget(Target target, const Entry& source_folder) const;
+  std::optional<OpenedDocument> ActivateExisting(const Target& target, const Entry& source_folder,
+                                                  const std::vector<std::string>& relative) const;
+  Task<OpenResult> OpenTarget(Target target, const Entry& source_folder,
+                             const std::vector<std::string>& relative) const;
   Task<void> OpenTargets(std::vector<Target> targets, Entry source_folder = {}, RecentKind kind = RecentKind::File,
-                         std::string recent_id = {}) const;
+                         std::string recent_id = {}, std::optional<LinkDestination> link = {}) const;
+  Task<void> OpenLinkedDocument(Tab tab, LinkDestination destination, FolderDocumentLocation source,
+                               FileSource directory, bool offer_folder) const;
+  void ChooseLinkFolder(Tab tab, LinkDestination destination, FolderDocumentLocation source) const;
   Task<void> OpenPicked(OpenRequest request) const;
   Task<void> OpenDirectory(FileSource directory, OpenKind kind, std::string recent_id) const;
   Task<void> RestoreTab(Tab tab, std::optional<FileSource> directory = {}) const;
@@ -877,6 +906,23 @@ void WorkbenchActions::JumpToHeading(const Tab& tab, const Block& block, TextOff
   }
 }
 
+void WorkbenchActions::RevealLinkedHeading(const Tab& tab, const RichEditorController& editor,
+                                            const std::string& anchor) const {
+  if (workspace->Selected() != tab || tab->pending_anchor.Get() != anchor) {
+    return;
+  }
+  const auto headings = DocumentHeadings(editor.Document());
+  const auto heading = std::ranges::find(headings, anchor, &DocumentHeading::anchor);
+  if (heading == headings.end()) {
+    Status(tab, l10n::linked_heading_missing);
+  } else if (!editor.RevealTextRange(heading->block, {0, heading->length}, ScrollAlignment::Start)) {
+    Status(tab, l10n::outline_jump_unavailable);
+  } else {
+    Status(tab, {});
+  }
+  tab->pending_anchor = std::nullopt;
+}
+
 void WorkbenchActions::Launch(bool uses_picker, std::function<Task<void>()> action,
                               std::function<void(std::string)> failed) const {
   if (uses_picker) {
@@ -913,13 +959,14 @@ std::optional<File> NewWorkingDirectory(const ApplicationHandle& application) {
 
 Tab WorkbenchActions::AddTab(std::string name, RichDocument snapshot, std::shared_ptr<const SavedDocument> saved,
                              Entry source_folder, std::optional<FileSource> attachment_directory,
-                             std::optional<std::string> library_folder) const {
+                             std::optional<std::string> library_folder, std::vector<std::string> relative) const {
   if (saved) {
     attachment_directory = saved->target->directory;
   }
   auto tab = std::make_shared<DocumentTab>(++folio->next_document, std::move(name), NewWorkingDirectory(application),
                                            std::move(snapshot), std::move(saved), std::move(attachment_directory));
   tab->source_folder = std::move(source_folder);
+  tab->source_relative = std::move(relative);
   tab->library_folder = std::move(library_folder);
   workspace->tabs.Update([&](auto& open) { open.push_back(tab); });
   Select(tab);
@@ -984,7 +1031,10 @@ void WorkbenchActions::Select(const Tab& tab) const {
   folio->Persist(*workspace, !workspace->restoring.Get() && folio->restoring.Get() == 0);
 }
 
-std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& target, const Entry& source_folder) const {
+std::optional<OpenedDocument> WorkbenchActions::ActivateExisting(
+    const Target& target, const Entry& source_folder, const std::vector<std::string>& relative) const {
+  const auto location = relative.empty() ? FolderLocation(source_folder, target->reference.Name())
+                                         : FolderDocumentLocation{source_folder, relative};
   for (const auto& weak : folio->windows) {
     const auto owner = weak.lock();
     if (!owner) {
@@ -992,16 +1042,24 @@ std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& targ
     }
     for (const auto& tab : owner->tabs.Get()) {
       const auto& original = tab->saved.Get();
-      if (original && SameFile(original->target, target)) {
+      if (!original) {
+        continue;
+      }
+      const auto same_location = [&] {
+        if (!location.root) {
+          return false;
+        }
+        const auto existing = TabFolderLocation(tab, original->target);
+        return existing.root == location.root && existing.path == location.path;
+      };
+      if (SameFile(original->target, target) || same_location()) {
         if (target->directory && tab->attachments->directories.empty()) {
           tab->SetAttachmentDirectory(*target->directory);
         }
         if (owner == workspace) {
           if (source_folder) {
-            if (source_folder != tab->source_folder.Get()) {
-              tab->restored_relative.clear();
-            }
             tab->source_folder = source_folder;
+            tab->source_relative = relative;
           }
           Select(tab);
         } else if (owner->window && owner->window->IsOpen()) {
@@ -1013,7 +1071,7 @@ std::shared_ptr<Workspace> WorkbenchActions::ActivateExisting(const Target& targ
         } else {
           continue;
         }
-        return owner;
+        return OpenedDocument{owner, tab};
       }
     }
   }
@@ -1056,25 +1114,26 @@ void SetRestoredDocument(const Tab& tab, std::shared_ptr<const SavedDocument> or
   }
   tab->source_folder = folder;
   if (folder) {
-    tab->restored_relative = tab->unresolved.Get()->relative;
+    tab->source_relative = tab->unresolved.Get()->relative;
   }
   tab->status = std::string{};
   tab->unresolved = std::nullopt;
 }
 
-Task<OpenResult> WorkbenchActions::OpenTarget(Target target, const Entry& source_folder) const {
+Task<OpenResult> WorkbenchActions::OpenTarget(Target target, const Entry& source_folder,
+                                             const std::vector<std::string>& relative) const {
   if (!target->identity) {
     target->identity = co_await LocalIdentity(target->reference);
   }
-  if (auto owner = ActivateExisting(target, source_folder)) {
-    co_return owner;
+  if (auto opened = ActivateExisting(target, source_folder, relative)) {
+    co_return *opened;
   }
   auto loaded = co_await LoadDocument(target, true);
   if (auto* failure = std::get_if<OpenFailure>(&loaded)) {
     co_return std::move(*failure);
   }
-  if (auto owner = ActivateExisting(target, source_folder)) {
-    co_return owner;
+  if (auto opened = ActivateExisting(target, source_folder, relative)) {
+    co_return *opened;
   }
   const auto original = std::get<std::shared_ptr<const SavedDocument>>(std::move(loaded));
   if (const auto path = target->reference.AsFile()) {
@@ -1090,33 +1149,43 @@ Task<OpenResult> WorkbenchActions::OpenTarget(Target target, const Entry& source
             (target->identity && pending->location.path == target->identity->Path()));
       });
       if (match != tabs.end()) {
-        SetRestoredDocument(*match, original, source_folder);
+        const auto folder = owner == workspace ? source_folder : Entry{};
+        SetRestoredDocument(*match, original, folder);
+        if (folder && !relative.empty()) {
+          (*match)->source_relative = relative;
+        }
         owner->selected = (*match)->id;
         owner->drawer_open = false;
         owner->window->Activate();
         folio->Persist(*owner, true);
-        co_return owner;
+        co_return OpenedDocument{owner, *match};
       }
     }
   }
-  AddTab(target->Name(), original->snapshot, original, source_folder);
-  co_return workspace;
+  co_return OpenedDocument{workspace, AddTab(target->Name(), original->snapshot, original, source_folder,
+                                             {}, {}, relative)};
 }
 
 Task<void> WorkbenchActions::OpenTargets(std::vector<Target> targets, Entry source_folder, RecentKind kind,
-                                          std::string recent_id) const {
+                                          std::string recent_id, std::optional<LinkDestination> link) const {
+  static const std::vector<std::string> no_relative_path;
   std::shared_ptr<Workspace> last_owner;
   std::vector<OpenFailure> failures;
   for (const auto& target : targets) {
     try {
-      auto result = co_await OpenTarget(target, source_folder);
-      if (auto* owner = std::get_if<std::shared_ptr<Workspace>>(&result)) {
-        last_owner = std::move(*owner);
-        const bool package = kind == RecentKind::Package && target->directory;
-        const auto& source = package ? *target->directory : target->reference;
-        folio->Remember({{recent_id, package ? source.Name() : target->Name(),
-                          target->library ? WorkspaceLocation{} : folio->Location(source), kind, target->library_id},
-                         target, {}});
+      auto result = co_await OpenTarget(target, source_folder, link ? link->path : no_relative_path);
+      if (auto* opened = std::get_if<OpenedDocument>(&result)) {
+        last_owner = std::move(opened->owner);
+        if (link) {
+          opened->tab->pending_anchor = link->anchor;
+          opened->tab->status = std::string{};
+        }
+        const auto& recent_target = link ? opened->tab->saved.Get()->target : target;
+        const bool package = kind == RecentKind::Package && recent_target->directory;
+        const auto& source = package ? *recent_target->directory : recent_target->reference;
+        folio->Remember({{recent_id, package ? source.Name() : recent_target->Name(),
+                          recent_target->library ? WorkspaceLocation{} : folio->Location(source),
+                          kind, recent_target->library_id}, recent_target, {}});
       } else {
         failures.push_back(std::get<OpenFailure>(std::move(result)));
       }
@@ -1130,6 +1199,161 @@ Task<void> WorkbenchActions::OpenTargets(std::vector<Target> targets, Entry sour
   } else if (last_owner && last_owner->window && last_owner->window->IsOpen()) {
     last_owner->window->Activate();
   }
+}
+
+void WorkbenchActions::FollowDocumentLink(Tab tab, DocumentLink link) const {
+  if (!Available() || workspace->Selected() != tab) {
+    return;
+  }
+  if (link.path.empty()) {
+    tab->pending_anchor = std::move(link.anchor);
+    return;
+  }
+  const auto& original = tab->saved.Get();
+  if (!original || original->target->library) {
+    Status(tab, l10n::relative_link_needs_source);
+    return;
+  }
+  auto source = TabFolderLocation(tab, original->target);
+  if (!source.root && original->target->identity) {
+    // A separately opened local file can already be inside a mounted directory.
+    for (const auto& root : workspace->folders.Get()) {
+      if (!root->mounted.Get() || !root->identity) {
+        continue;
+      }
+      auto file = original->target->identity;
+      std::vector<std::string> path;
+      while (file && file != root->identity) {
+        path.push_back(file->Name());
+        file = file->Parent();
+      }
+      if (file && !path.empty() && (!source.root || path.size() < source.path.size())) {
+        std::ranges::reverse(path);
+        source = {root, std::move(path)};
+      }
+    }
+  }
+  auto directory = source.root ? source.root->directory : original->target->directory;
+  if (!directory && !source.root) {
+    if (const auto local = original->target->reference.AsFile(); local && local->Parent()) {
+      directory = FileSource(*local->Parent(), FileType::Directory, false);
+    }
+  }
+  auto path = ResolveDocumentLinkPath(source.path, link);
+  if (!path) {
+    Status(tab, l10n::relative_link_outside_folder);
+    return;
+  }
+  LinkDestination destination{std::move(*path), std::move(link.anchor)};
+  if (!directory) {
+    ChooseLinkFolder(tab, std::move(destination), std::move(source));
+    return;
+  }
+  Launch(false, [self = *this, tab, destination = std::move(destination), source = std::move(source),
+                 directory = std::move(*directory)] {
+    return self.OpenLinkedDocument(tab, destination, source, directory, true);
+  });
+}
+
+Task<void> WorkbenchActions::OpenLinkedDocument(Tab tab, LinkDestination destination, FolderDocumentLocation source,
+                                                FileSource directory, bool offer_folder) const {
+  const auto original = tab->saved.Get();
+  auto entry = co_await FindFolderFile(directory, destination.path);
+  if (workspace->Selected() != tab || tab->saved.Get() != original) {
+    co_return;
+  }
+  if (!entry.Succeeded()) {
+    if (offer_folder && entry.Error().code == IoErrorCode::PermissionDenied) {
+      ChooseLinkFolder(tab, std::move(destination), std::move(source));
+    } else {
+      Status(tab, entry.Error().code == IoErrorCode::NotFound ? l10n::linked_document_missing : l10n::open_link_failed);
+    }
+    co_return;
+  }
+  if (!source.root) {
+    const auto identity = co_await LocalIdentity(directory);
+    if (workspace->Selected() != tab || tab->saved.Get() != original) {
+      co_return;
+    }
+    const auto& roots = workspace->folders.Get();
+    const auto existing = std::ranges::find_if(roots, [&](const Entry& root) {
+      return identity && root->identity == identity;
+    });
+    if (existing != roots.end() && (*existing)->directory) {
+      source.root = *existing;
+    } else {
+      // Retain the link's directory without mounting it in the file sidebar.
+      source.root = std::make_shared<FolderEntry>(
+          FolderEntry{++workspace->next_entry, directory.Name(), directory, {}, identity});
+      source.root->mounted = false;
+      workspace->folders.Update([&](auto& roots) { roots.push_back(source.root); });
+    }
+  }
+  if (!tab->source_folder.Get()) {
+    tab->source_relative = source.path;
+    tab->source_folder = source.root;
+    folio->Persist(*workspace);
+  }
+  auto file = std::move(entry.Value());
+  auto target = std::make_shared<DocumentFile>(DocumentFile{std::move(file.file), std::move(file.parent), {}});
+  std::vector<Target> targets{std::move(target)};
+  co_await OpenTargets(std::move(targets), source.root, RecentKind::File, {}, std::move(destination));
+}
+
+void WorkbenchActions::ChooseLinkFolder(Tab tab, LinkDestination destination, FolderDocumentLocation source) const {
+  if (!Available()) {
+    return;
+  }
+  if (!picker->CanOpenDirectories()) {
+    Status(tab, l10n::linked_document_needs_folder);
+    return;
+  }
+  const auto label = source.root ? source.root->name : tab->Name();
+  const auto hint = source.root ? l10n::link_grant_hint : l10n::link_folder_hint;
+  ShowChoices(l10n::linked_document_needs_folder, StringVariant::Format(hint, label), {
+      {l10n::cancel, [] {}},
+      {l10n::choose_folder, [self = *this, tab, destination = std::move(destination), source = std::move(source)] {
+        self.Launch(true, [self, tab, destination, source]() -> Task<void> {
+          const auto original = tab->saved.Get();
+          const auto selected = co_await self.picker->OpenDirectoryAsync();
+          if (!selected || !original || self.workspace->Selected() != tab || tab->saved.Get() != original) {
+            co_return;
+          }
+          FileSource directory(*selected);
+          auto file = co_await FindFolderFile(directory, source.path);
+          bool matches = false;
+          if (file.Succeeded()) {
+            const auto identity = co_await LocalIdentity(file.Value().file);
+            if (original->target->identity && identity) {
+              matches = original->target->identity == identity;
+            } else {
+              // Opaque picker references expose no comparable identity. Check the saved source bytes.
+              const auto bytes = co_await file.Value().file.ReadBytesAsync();
+              matches = bytes.Succeeded() && bytes.Value() == original->bytes;
+            }
+          }
+          if (self.workspace->Selected() != tab || tab->saved.Get() != original) {
+            co_return;
+          }
+          if (!matches) {
+            self.Status(tab, l10n::link_folder_mismatch);
+            co_return;
+          }
+          if (source.root) {
+            const auto identity = co_await LocalIdentity(directory);
+            source.root->directory = directory;
+            source.root->identity = identity;
+            source.root->unresolved = std::nullopt;
+            source.root->load = FolderLoad::Unloaded;
+            if (source.root->expanded.Get()) {
+              self.SetExpanded(source.root, true);
+            }
+            self.folio->Persist(*self.workspace);
+          }
+          co_await self.OpenLinkedDocument(tab, destination, source, directory, false);
+        });
+      }, ChoiceTone::Primary},
+  }, true);
 }
 
 void WorkbenchActions::OpenKnown(Target target, Entry source_folder) const {
@@ -1213,20 +1437,14 @@ Task<void> WorkbenchActions::RestoreTab(Tab tab, std::optional<FileSource> direc
   if (!directory || pending->relative.empty()) {
     co_return;
   }
-  for (std::size_t index = 0; index < pending->relative.size(); ++index) {
-    const bool last = index + 1 == pending->relative.size();
-    auto entry = co_await FindChild(*directory, pending->relative[index], last ? FileType::File : FileType::Directory);
-    if (!entry.Succeeded()) {
-      Status(tab, entry.Error().message);
-      co_return;
-    }
-    if (last) {
-      co_await FillRestoredTab(tab, std::make_shared<DocumentFile>(
-          DocumentFile{std::move(entry.Value()), directory, {}}), folder);
-    } else {
-      directory = std::move(entry.Value());
-    }
+  auto entry = co_await FindFolderFile(*directory, pending->relative);
+  if (!entry.Succeeded()) {
+    Status(tab, entry.Error().message);
+    co_return;
   }
+  auto file = std::move(entry.Value());
+  co_await FillRestoredTab(tab, std::make_shared<DocumentFile>(
+      DocumentFile{std::move(file.file), std::move(file.parent), {}}), folder);
 }
 
 void WorkbenchActions::FinishRestore() const {
@@ -2294,7 +2512,7 @@ void WorkbenchActions::MarkSaved(const Save& request, Target target, SavePayload
   const auto& original = request->tab->saved.Get();
   if (original && !SameFile(original->target, target)) {
     request->tab->source_folder = nullptr;
-    request->tab->restored_relative.clear();
+    request->tab->source_relative.clear();
   }
   request->tab->saved = std::make_shared<const SavedDocument>(SavedDocument{
       target, payload.format, std::move(payload.snapshot), Bytes(bytes.begin(), bytes.end()),
@@ -2741,6 +2959,13 @@ View DocumentPage(WorkbenchActions actions, Tab tab, bool active) {
     tab->editor = editor;
     tab->editor_focus = focus;
   }, editor, focus);
+  const auto anchor = tab->pending_anchor.Get();
+  const bool ready_to_reveal = active && anchor && editor.ViewportLocation(0.0F).has_value();
+  Lifecycle([actions, tab, editor, anchor, ready_to_reveal] {
+    if (ready_to_reveal) {
+      actions.tasks.Post([actions, tab, editor, anchor] { actions.RevealLinkedHeading(tab, editor, *anchor); });
+    }
+  }, anchor, ready_to_reveal);
   const auto& attachments = tab->attachments.Get();
   const auto operation = tab->operation.Get();
   const bool available = active && !actions.workspace->closing.Get() && operation != Operation::PickImage &&
@@ -2769,6 +2994,7 @@ View DocumentPage(WorkbenchActions actions, Tab tab, bool active) {
         .pick_image = [actions, tab, editor](ViewHandle focus, bool replace, bool inline_image) {
           actions.PickImage(tab, editor, focus, replace, inline_image);
         },
+        .open_document_link = [actions, tab](DocumentLink link) { actions.FollowDocumentLink(tab, std::move(link)); },
     }).Key("editor-pane").With(Grow()),
   }.With(CrossAlign(CrossAxisAlignment::Stretch));
 }
@@ -3263,12 +3489,8 @@ View FilesSidebar(WorkbenchActions actions, bool desktop, float row_height) {
       .With(Grow(), ScrollBar());
 }
 
-struct OutlineHeading {
-  Block block;
-  std::size_t index;
+struct OutlineHeading : DocumentHeading {
   std::size_t depth;
-  TextOffset length;
-  std::string title;
 };
 
 struct Outline {
@@ -3281,31 +3503,17 @@ std::vector<OutlineHeading> DocumentOutline(const RichDocument& document) {
   std::array<unsigned, 6> ancestors{};
   std::size_t depth = 0;
   const auto blocks = document.Blocks();
-  for (std::size_t index = 0; index < blocks.size(); ++index) {
-    const auto& block = blocks[index];
-    const auto& data = block.Data();
-    if (data.kind != BlockKind::Heading || data.text.find_first_not_of(" \t") == std::string::npos) {
+  for (auto& heading : DocumentHeadings(document)) {
+    if (&heading.block.Data() != &blocks[heading.root_index].Data()) {
       continue;
     }
-    const AttributedText text(data.text);
-    std::string title;
-    if (data.inline_objects.empty()) {
-      title = data.text;
-    } else {
-      TextOffset start = 0;
-      for (const auto& object : data.inline_objects) {
-        title += text.TextInRange({start, object.offset});
-        title += object.data.fallback_text.empty() ? object.data.type : object.data.fallback_text;
-        start = object.offset + 1;
-      }
-      title += text.TextInRange({start, text.Length()});
-    }
+    const auto level = heading.block.Data().heading_level;
     // Skipped levels still nest one row beneath the closest preceding ancestor.
-    while (depth > 0 && ancestors[depth - 1] >= data.heading_level) {
+    while (depth > 0 && ancestors[depth - 1] >= level) {
       --depth;
     }
-    headings.push_back({block, index, depth, text.Length(), std::move(title)});
-    ancestors[depth++] = data.heading_level;
+    headings.push_back({std::move(heading), depth});
+    ancestors[depth++] = level;
   }
   return headings;
 }
@@ -3338,14 +3546,17 @@ View OutlineList(WorkbenchActions actions, Tab tab, bool desktop, float row_heig
                  std::shared_ptr<Outline> outline) {
   const auto theme = UseTheme();
   const auto scroll = UseScrollController();
+  const auto menu = UseMenu();
+  const auto toast = UseToast();
+  const auto clipboard = UseApplication().Clipboard();
   const auto& editor = tab->editor.Get();
   constexpr float reading_line = 32.0F;
   const auto location = editor ? editor->ViewportLocation(reading_line) : std::nullopt;
   if (location) {
     const auto& headings = outline->headings;
     const auto root = location->revealed_root_block_index.value_or(
-        location->at_end ? headings.back().index : location->root_block_index);
-    const auto next = std::ranges::upper_bound(headings, root, {}, &OutlineHeading::index);
+        location->at_end ? headings.back().root_index : location->root_block_index);
+    const auto next = std::ranges::upper_bound(headings, root, {}, &OutlineHeading::root_index);
     outline->active = next == headings.begin() ? std::nullopt
         : std::optional(static_cast<std::size_t>(next - headings.begin() - 1));
   }
@@ -3365,7 +3576,8 @@ View OutlineList(WorkbenchActions actions, Tab tab, bool desktop, float row_heig
     }
   }, active, row_height, visible);
 
-  return VirtualList(outline->headings.size(), [actions, tab, desktop, row_height, theme, outline, active](std::size_t row) {
+  return VirtualList(outline->headings.size(),
+      [actions, tab, desktop, row_height, theme, outline, active, menu, toast, clipboard](std::size_t row) {
     const auto& headings = outline->headings;
     const auto& heading = headings[row];
     const bool selected = active == row;
@@ -3381,8 +3593,8 @@ View OutlineList(WorkbenchActions actions, Tab tab, bool desktop, float row_heig
       label = std::move(label).With(Tooltip(heading.title));
     }
     const auto next_depth = row + 1 < headings.size() ? headings[row + 1].depth : 0;
-    const auto id = "outline-heading-" + std::to_string(heading.index);
-    return ClickableRow(Row {
+    const auto id = "outline-heading-" + std::to_string(heading.root_index);
+    auto item = ClickableRow(Row {
       root ? View{} : OutlineGuides(heading.depth, next_depth, row_height, colors.outline,
                                     selected ? colors.primary : colors.outline),
       Row {
@@ -3397,7 +3609,20 @@ View OutlineList(WorkbenchActions actions, Tab tab, bool desktop, float row_heig
                 .selected = selected, .heading_level = heading.block.Data().heading_level},
         [actions, tab, block = heading.block, length = heading.length] {
           actions.JumpToHeading(tab, block, length);
-        }).Key(reinterpret_cast<std::uintptr_t>(&heading.block.Data()));
+        });
+    if (!heading.anchor.empty() && clipboard && clipboard->IsAvailable()) {
+      const auto show_menu = [menu, clipboard, toast, link = "#" + heading.anchor](Point point) {
+        menu.ShowAt(point, {MenuItem(l10n::copy_heading_link, [clipboard, toast, link] {
+          toast.Show(clipboard->WriteText(link) ? l10n::link_copied : l10n::link_copy_failed);
+        })});
+      };
+      item = std::move(item).On<ViewEvents::ContextMenuRequested>(show_menu);
+      if (!desktop) {
+        item = std::move(item).With(LongPressGesture{}).On<LongPressEvents::Ended>(
+            [show_menu](const LongPressEvent& event) { show_menu(event.window_position); });
+      }
+    }
+    return std::move(item).Key(reinterpret_cast<std::uintptr_t>(&heading.block.Data()));
   }).ItemExtent(row_height).Controller(scroll).With(Grow(), ScrollBar(), Semantics{.label = l10n::outline});
 }
 

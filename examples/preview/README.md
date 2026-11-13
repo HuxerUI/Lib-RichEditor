@@ -81,7 +81,11 @@ Choose **File actions** → **Load sample**, then enter Chinese text with an IME
 
 Open the text style menu to switch between paragraph, heading levels 1 through 6, and code block. Select text to insert a link, or place the caret inside an existing link to edit, copy, or remove its address.
 
-Draftspan opens absolute HTTP and HTTPS links in the system browser. The link menu offers **Open link**, and on Android and iOS the editing toolbar also shows it while the caret or selection is inside a web link.
+Use **Open link** in the link menu or the mobile editing toolbar. On desktop, Command-click on macOS or Ctrl-click on Windows and Linux follows the link. HTTP and HTTPS links open in the system browser.
+
+In the outline, use the heading's context menu or long-press it to **Copy heading link**. A link such as `#安装-1` jumps to the second matching heading in the current document. Links use the visible title and document order, so renaming or reordering headings can change their addresses.
+
+Relative links such as `./Guide.md#setup` and `../Guide/Deploy.md` open external Markdown or RichEditor JSON documents from the source file's folder. Open a parent folder to follow links between subfolders inside it. If you opened a single file and the platform requires directory access, Draftspan asks for its containing folder. A missing file keeps the current tab open. A missing heading opens the target document and shows a status message.
 
 Draftspan centers search matches as the viewport resizes, including when the software keyboard is dismissed.
 

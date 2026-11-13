@@ -37,6 +37,14 @@ bool NeedsAttachmentWrite(const FileSource& target,
 huxerui::Task<huxerui::IoResult<DocumentSource>> ReadDocument(FileSource source);
 huxerui::Task<huxerui::IoResult<FileSource>> FindChild(
     FileSource directory, std::string name, huxerui::FileType type);
+
+struct FolderFile {
+  FileSource file;
+  FileSource parent;
+};
+
+/// Finds a relative file through the directory grant, rejecting local symlinks that leave the root.
+huxerui::Task<huxerui::IoResult<FolderFile>> FindFolderFile(FileSource directory, std::vector<std::string> path);
 huxerui::Task<huxerui::IoResult<FileSource>> FindPackageDocument(FileSource directory);
 huxerui::Task<std::optional<huxerui::File>> LocalIdentity(FileSource reference);
 bool ValidDocumentName(std::string_view name, DocumentFormat format);
