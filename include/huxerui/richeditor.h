@@ -386,6 +386,14 @@ struct EditorViewportLocation {
   bool at_end;
 };
 
+/// @brief A nonempty range in a specific version of a text block.
+struct BlockTextRange {
+  /// Retain the block from the snapshot that supplied the range.
+  Block block;
+  /// Half-open UTF-16 offsets within the block, with both endpoints at scalar boundaries.
+  TextRange range;
+};
+
 namespace detail {
 class EditorSession;
 struct EditorViewport;
@@ -406,6 +414,23 @@ public:
   /// A focused editor starts a fresh text input session on its next update.
   /// @param document Validated snapshot to open.
   void ReplaceDocument(RichDocument document) const;
+
+  /// @brief Reports whether the editor currently holds provisional text from an input method.
+  /// Calls in composition observe changes so application controls can update their availability.
+  bool IsComposing() const;
+
+  /// @brief Replaces disjoint text ranges with the same text in one undoable edit.
+  ///
+  /// Each range must lie in one paragraph, heading, or code block and may not cover an inline object.
+  /// The inserted text takes the first character's marks and retains a link if it covers the entire range.
+  /// The edit remaps both selection endpoints and keeps their direction. An endpoint inside a replaced
+  /// range moves to the end of its replacement. Undo restores the prior selection.
+  /// A batch is applied only when every target block is still present and unchanged and no IME composition
+  /// is active. Edits to other blocks can move a target without invalidating its range.
+  /// @param ranges Block-local ranges, in any order. Adjacent ranges are allowed.
+  /// @param text Single-line UTF-8 replacement without NUL. An empty string deletes the ranges.
+  /// @return True if the document changed. A stale target, invalid batch, or no-op leaves history intact.
+  bool ReplaceTextRanges(std::span<const BlockTextRange> ranges, std::string_view text) const;
 
   /// @brief Reads command state for the current selection, typing marks, and history.
   /// Calls in composition observe changes so application controls can refresh.

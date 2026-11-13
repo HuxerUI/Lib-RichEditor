@@ -287,6 +287,103 @@ void Workflow() {
         "Markdown retains committed Chinese text and structure");
 }
 
+void ReplaceTextRanges() {
+  static const auto input = folio::DocumentMarkdown().Import(
+      "# 中文\n\n[**🙂词**](https://example.org \"Title\") plain 词 $x^2$\n\n"
+      "| 词 | Next |\n| --- | --- |\n| 词 | keep |\n\n~~~cpp extra\n// 词\n~~~\n");
+  Check(input.document.has_value(), "Import a document with styled text, an object, a table, and code");
+  const Application app([]() -> View {
+    const auto editor = UseRichEditor(*input.document);
+    const auto focus = UseViewHandle();
+    controller = editor;
+    return Column {
+      Button("Focus").OnClick([focus] { focus.RequestFocus(); }),
+      RichEditor(editor).With(focus, Grow()),
+    }.With(CrossAlign(CrossAxisAlignment::Stretch));
+  }, {.show_debug_overlay = false});
+  UiTest ui(app);
+  ui.Find(UiSelector::Text("Focus")).Tap();
+  const auto document = controller->Document();
+  const auto blocks = document.Blocks();
+  const auto& paragraph = blocks[1];
+  const auto& first_cell = blocks[2].Data().children[0].Data().children[0].Data().children[0];
+  const auto& body_cell = blocks[2].Data().children[1].Data().children[0].Data().children[0];
+  const std::array targets{
+      BlockTextRange{blocks[3], {3, 4}}, BlockTextRange{body_cell, {0, 1}},
+      BlockTextRange{paragraph, {10, 11}}, BlockTextRange{blocks[0], {0, 2}},
+      BlockTextRange{first_cell, {0, 1}}, BlockTextRange{paragraph, {0, 3}},
+  };
+  const TextSelection before{14, 3};
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = before}});
+  Accept(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "ni"}});
+  Check(controller->IsComposing() && !controller->ReplaceTextRanges(targets, "新🙂") &&
+            ui.ActiveTextInput()->composition.has_value(),
+        "A replacement leaves the editor's active composition alone");
+  Accept(ui, {{.kind = TextInputCommandKind::CancelComposition}});
+  Check(!controller->IsComposing() && ui.ActiveTextInput()->selection == before,
+        "Cancelling composition restores the reverse selection");
+  const auto object = paragraph.Data().inline_objects.front();
+  for (const auto& invalid : {BlockTextRange{paragraph, {1, 3}}, BlockTextRange{paragraph, {2, 4}},
+                             BlockTextRange{paragraph, {object.offset, object.offset + 1}},
+                             BlockTextRange{Block(paragraph.Data()), {0, 3}},
+                             BlockTextRange{paragraph, {50, 51}}}) {
+    const std::array rejected{targets.back(), invalid};
+    Check(!controller->ReplaceTextRanges(rejected, "x"), "Reject the entire invalid batch");
+  }
+  const std::array same_text{targets.back()};
+  Check(!controller->ReplaceTextRanges(targets, "\n") &&
+            !controller->ReplaceTextRanges(targets, std::string_view("x\0y", 3)) &&
+            !controller->ReplaceTextRanges(targets, "\xff") &&
+            !controller->ReplaceTextRanges(same_text, "🙂词") &&
+            !controller->GetCommandState(Undo{}).enabled && controller->Document() == document,
+        "Invalid and unchanged batches do not change the document or history");
+
+  Check(controller->ReplaceTextRanges(targets, "新🙂"), "Apply unordered ranges in one batch");
+  ui.Pump();
+  const auto changed = controller->Document();
+  const auto& text = changed.Blocks()[1].Data();
+  Check(changed.Blocks()[0].Data().text == "新🙂" && text.text == "新🙂 plain 新🙂 \xef\xbf\xbc" &&
+            text.marks == std::vector<MarkRange>{{{0, 3}, Mark::Bold}} &&
+            text.links == std::vector<LinkRange>{{{0, 3}, "https://example.org", "Title"}} &&
+            text.inline_objects.size() == 1 && text.inline_objects[0].offset == object.offset + 2 &&
+            text.inline_objects[0].data == object.data,
+        "Replace a full link and a nearby match while preserving marks and inline objects");
+  const auto& table = changed.Blocks()[2].Data();
+  Check(table.table_has_header && table.children[0].Data().children[0].Data().children[0].Data().text == "新🙂" &&
+            table.children[1].Data().children[0].Data().children[0].Data().text == "新🙂" &&
+            table.children[1].Data().children[1].Data().children[0].Data().text == "keep" &&
+            changed.Blocks()[3].Data().text.starts_with("// 新🙂") &&
+            changed.Blocks()[3].Data().fence_info == "cpp extra",
+        "Table structure and code language survive a replacement");
+  CheckDocumentIndex(changed);
+  Check(ui.ActiveTextInput()->selection == TextSelection{17, 4}, "The reverse selection remaps in UTF-16");
+  const std::array stale_batch{BlockTextRange{changed.Blocks()[0], {0, 1}}, targets.back()};
+  Check(!controller->ReplaceTextRanges(stale_batch, "x") && controller->Document() == changed,
+        "One stale target rejects the batch even when another target is current");
+  const auto equal_copy = RichDocument::Create({changed.Blocks().begin(), changed.Blocks().end()});
+  const std::array foreign_target{BlockTextRange{equal_copy.Blocks()[0], {0, 1}}};
+  Check(!controller->ReplaceTextRanges(foreign_target, "x"), "An equal block from another document is not a live target");
+  Check(controller->Execute(Undo{}), "Undo the whole batch");
+  ui.Pump();
+  Check(controller->Document() == document && ui.ActiveTextInput()->selection == before &&
+            !controller->GetCommandState(Undo{}).enabled,
+        "One undo restores both the document and reverse selection");
+  Check(controller->Execute(Redo{}) && controller->Document() == changed, "Redo restores the whole batch");
+  const std::array adjacent{BlockTextRange{changed.Blocks()[0], {1, 3}}, BlockTextRange{changed.Blocks()[0], {0, 1}}};
+  const std::array code_target{BlockTextRange{changed.Blocks()[3], {3, 6}}};
+  Check(controller->ReplaceTextRanges(adjacent, "") &&
+            controller->Document().Blocks()[0].Data().kind == BlockKind::Heading &&
+            controller->Document().Blocks()[0].Data().text.empty(),
+        "Empty replacement deletes adjacent ranges without removing the heading");
+  const auto shortened = controller->Document();
+  Check(controller->ReplaceTextRanges(code_target, "ok") &&
+            controller->Document().Blocks()[3].Data().text.starts_with("// ok") &&
+            controller->Document().Blocks()[0].Data().text.empty(),
+        "An edit to an earlier block does not invalidate the unchanged code block");
+  Check(controller->Execute(Undo{}) && controller->Document() == shortened,
+        "Undo preserves the unrelated edit that preceded the replacement");
+}
+
 void HeadingAndLinkEditing() {
   const LinkRange guide{{4, 9}, "https://example.com/guide", "Reference"};
   const auto initial = RichDocument::Create({
@@ -2534,6 +2631,8 @@ int main() {
   try {
     IncrementalDocumentIndex();
     Workflow();
+    controller.reset();
+    ReplaceTextRanges();
     controller.reset();
     HeadingAndLinkEditing();
     LinkActivation();

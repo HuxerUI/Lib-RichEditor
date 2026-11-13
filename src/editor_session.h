@@ -38,6 +38,7 @@ public:
   const RichDocument& VisibleDocument() const { return draft_.edit.document; }
   RichDocument Document() const;
   void ReplaceDocument(RichDocument document);
+  bool ReplaceTextRanges(std::span<const BlockTextRange> ranges, std::string_view text);
 
   TextSelection SelectionOffsets() const;
   std::optional<unsigned> OrderedListStart() const {

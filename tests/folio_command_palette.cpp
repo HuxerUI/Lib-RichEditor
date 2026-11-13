@@ -553,6 +553,100 @@ void CompactCodeTools(const char* package_path) {
   Check(style.Count() == 1, "A code block in a list has one compact text style picker");
 }
 
+void FindReplaceFlow(const char* package_path, Size viewport) {
+  const Application app(App, {.show_debug_overlay = false, .application_hooks = {folio::InstallFolio},
+                              .window_hooks = {folio::InstallWorkbench}});
+  UiTest ui(app, {.viewport = viewport, .resource_provider = std::make_shared<PackageResources>(package_path)});
+#if defined(__APPLE__)
+  const KeyModifiers primary{.meta = true};
+#else
+  const KeyModifiers primary{.control = true};
+#endif
+  const auto by_id = [&](const char* id) { return ui.FindSemantics(UiSemanticSelector::Identifier(id)); };
+  const auto by_label = [&](const char* label) { return ui.FindSemantics(UiSemanticSelector::Label(label)); };
+  const auto tap = [&](const UiSemanticQuery& target) {
+    const auto bounds = target.One().bounds;
+    ui.TapAt({bounds.x + bounds.width / 2.0F, bounds.y + bounds.height / 2.0F});
+  };
+  ui.PressKey(Key::N, primary);
+  const auto editor = ui.Find(UiSelector::Key("editor"));
+  const auto article = by_id("article-editor");
+  const auto find = by_id("find-query");
+  const auto replace = by_id("replace-text");
+  const auto single = by_label("Replace");
+  const auto all = by_label("Replace all");
+  const auto count = by_id("find-count");
+  const auto previous = by_label("Previous match");
+  const auto next = by_label("Next match");
+  editor.Tap();
+  editor.EnterText("词 词 🙂\n词");
+  editor.SetSelection({8, 1});
+  ui.PressKey(Key::R, primary);
+  WaitForFixture(ui, [&] { return find.Exists() && find.One().focused && replace.Exists(); });
+  Check(!replace.One().offscreen && replace.One().bounds.width >= 100.0F,
+        "The replacement field has enough visible width to enter text");
+  Check(!replace.One().focused, "The platform shortcut expands Replace and focuses the Find field");
+  Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "词"}});
+  WaitForFixture(ui, [&] { return all.One().enabled; });
+  tap(previous);
+  Check(count.One().label == "Match 3 of 3", "Previous match wraps to the final result");
+  tap(next);
+  Check(count.One().label == "Match 1 of 3", "Next match wraps to the first result");
+  if (viewport.width == 360.0F) {
+    const auto query_bounds = find.One().bounds;
+    const auto count_bounds = count.One().bounds;
+    const auto previous_bounds = previous.One().bounds;
+    const auto next_bounds = next.One().bounds;
+    Check(query_bounds.width >= 180.0F && count_bounds.y >= query_bounds.y &&
+              count_bounds.y + count_bounds.height <= query_bounds.y + query_bounds.height &&
+              previous_bounds.y == query_bounds.y && next_bounds.y == query_bounds.y &&
+              previous_bounds.width <= 32.0F && next_bounds.width <= 32.0F,
+          "On a narrow viewport, the match count and navigation share the query row and leave room for text");
+  }
+  tap(replace);
+  Send(ui, {{.kind = TextInputCommandKind::UpdateComposition, .text = "ci"}});
+  Check(!single.One().enabled && !all.One().enabled, "Replacement is unavailable during IME preedit");
+  ui.PressKey(Key::Enter);
+  Check(article.One().value == "词 词 🙂\n词", "Enter while composing does not modify the document");
+  Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "词词"}});
+  WaitForFixture(ui, [&] { return all.One().enabled; });
+  ui.PressKey(Key::Enter);
+  Check(article.One().value == "词 词 🙂\n词", "Enter in the replacement field does not apply an edit");
+  tap(single);
+  WaitForFixture(ui, [&] { return count.One().label == "Match 3 of 4"; });
+  Check(article.One().value == "词词 词 🙂\n词", "Replacing one match advances past its newly inserted matches");
+  tap(all);
+  WaitForFixture(ui, [&] { return article.One().value == "词词词词 词词 🙂\n词词" && all.One().enabled; });
+  tap(replace);
+  Send(ui, {{.kind = TextInputCommandKind::CommitText, .text = "新"}});
+  ui.PressKey(Key::Z, primary);
+  Check(replace.One().value == "词词" && article.One().value == "词词词词 词词 🙂\n词词",
+        "Undo in the replacement field leaves the editor's batch history alone");
+  tap(by_label("Close find"));
+  editor.Tap();
+  ui.PressKey(Key::Z, primary);
+  Check(article.One().value == "词词 词 🙂\n词", "One Undo reverts Replace all while keeping the earlier replacement");
+  auto shifted = primary;
+  shifted.shift = true;
+  ui.PressKey(Key::Z, shifted);
+  Check(article.One().value == "词词词词 词词 🙂\n词词", "One Redo reapplies all replacements");
+
+  ui.PressKey(Key::F, primary);
+  WaitForFixture(ui, [&] { return find.Exists() && find.One().focused; });
+  if (replace.Exists()) {
+    tap(by_id("toggle-replace"));
+  }
+  Check(!replace.Exists(), "The replacement controls can be collapsed");
+  tap(by_id("toggle-replace"));
+  Check(replace.Exists() && !replace.One().focused, "Expanding Replace does not focus the replacement field");
+  tap(replace);
+  ui.PressKey(Key::A, primary);
+  ui.PressKey(Key::Backspace);
+  WaitForFixture(ui, [&] { return all.One().enabled && replace.One().value.empty(); });
+  tap(all);
+  Check(article.One().value == "  🙂\n", "An empty replacement removes the matches");
+}
+
 void PaletteFlow(const char* package_path) {
   const Application app(App, {
       .show_debug_overlay = false,
@@ -957,6 +1051,8 @@ int main(int argc, char** argv) {
     LibraryDeleteFlow(directory.Child("library-delete"), argv[1]);
     ExternalHistoryFlow(directory.Child("external-history"), argv[1]);
     CompactCodeTools(argv[1]);
+    FindReplaceFlow(argv[1], {360, 640});
+    FindReplaceFlow(argv[1], {880, 640});
     PaletteFlow(argv[1]);
     OutlineFlow(argv[1]);
   } catch (const std::exception& error) {

@@ -36,6 +36,11 @@ constexpr std::array find{
     KeyCombination{Key::F, {.control = true}},
     KeyCombination{Key::F, {.control = true, .meta = true}},
 };
+#if defined(__EMSCRIPTEN__)
+constexpr std::array<KeyCombination, 0> find_replace{};
+#else
+constexpr auto find_replace = Primary(Key::R);
+#endif
 
 constexpr std::array punctuation{"Backquote", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash",
                                  "Semicolon", "Quote", "Comma", "Period", "Slash"};
@@ -152,6 +157,7 @@ std::span<const ShortcutCommand> ShortcutCommands() {
         {"folio.save", "Save", FolioCommand::Save, save, "保存"},
         {"folio.save-as", "Save as", FolioCommand::SaveAs, save_as, "另存为"},
         {"folio.find", "Find in document", FolioCommand::Find, find, "search|查找|搜索"},
+        {"folio.find-replace", "Find and replace", FolioCommand::FindReplace, find_replace, "replace|替换|查找替换"},
         {"folio.toggle-sidebar", "Toggle file sidebar", FolioCommand::ToggleSidebar, toggle_sidebar},
         {"folio.settings", "Open settings", FolioCommand::Settings, settings, "preferences|设置"},
         {"folio.command-palette", "Command palette", FolioCommand::OpenCommandPalette, command_palette},
@@ -175,6 +181,7 @@ StringVariant CommandLabel(const ShortcutCommand& command) {
       Label{"folio.save", l10n::save},
       Label{"folio.save-as", l10n::save_as},
       Label{"folio.find", l10n::find_in_document},
+      Label{"folio.find-replace", l10n::find_and_replace},
       Label{"folio.toggle-sidebar", l10n::toggle_sidebar},
       Label{"folio.settings", l10n::open_settings},
       Label{"folio.command-palette", l10n::command_palette},

@@ -316,6 +316,25 @@ void EditorSession::ReplaceDocument(RichDocument document) {
   }
 }
 
+bool EditorSession::ReplaceTextRanges(std::span<const BlockTextRange> ranges, std::string_view text) {
+  if (draft_.composition || ranges.empty()) {
+    return false;
+  }
+  auto next = draft_;
+  auto selection = Offsets(next.edit);
+  try {
+    auto document = ReplaceBlockTextRanges(next.edit.document, ranges, text, selection, next.changes);
+    if (DocumentAccess::Same(next.edit.document, document)) {
+      return false;
+    }
+    next.edit.document = std::move(document);
+    SetSelection(next.edit, selection, false);
+    return Publish(std::move(next), true);
+  } catch (const std::invalid_argument&) {
+    return false;
+  }
+}
+
 bool EditorSession::TextBlockChangesSince(std::uint64_t revision, std::vector<BlockId>& blocks) const {
   const auto current = CommittedRevision();
   if (revision > current || current - revision > block_changes_.size()) {

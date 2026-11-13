@@ -738,6 +738,7 @@ bool WorkbenchActions::CanExecute(FolioCommand command) const {
     return picker->CanOpenDirectories(true) || (exports && picker->CanSaveFiles());
   }
   case FolioCommand::Find:
+  case FolioCommand::FindReplace:
     return tab && !tab->unresolved.Get();
   case FolioCommand::OpenCommandPalette:
     return !workspace->palette_open;
@@ -770,8 +771,12 @@ void WorkbenchActions::Execute(FolioCommand command, bool keyboard) const {
     break;
   }
   case FolioCommand::Find:
-    workspace->Selected()->find.Update([](FindPanelState& find) {
+  case FolioCommand::FindReplace:
+    workspace->Selected()->find.Update([command](FindPanelState& find) {
       find.open = true;
+      if (command == FolioCommand::FindReplace) {
+        find.replace_open = true;
+      }
       ++find.focus_request;
     });
     break;
@@ -3897,8 +3902,8 @@ View Workbench(State<WorkbenchKeyHandler> dispatch) {
       return false;
     }
     const auto tab = actions.workspace->Selected();
-    // Let the search field handle its own editing history before a window command can claim the same key.
-    if (tab && tab->find->open && tab->find->field_focused &&
+    // The active find or replacement field owns its editing history.
+    if (tab && tab->find->open && tab->find->focused != FindField::None &&
         (event.key == Key::Z || (event.key == Key::Y && !event.modifiers.shift))) {
       return false;
     }

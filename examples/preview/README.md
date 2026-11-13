@@ -63,6 +63,12 @@ Draftspan follows the system language. Its interface supports English, Simplifie
 
 Draftspan's desktop **Keyboard** settings list the configurable grid commands.
 
+## Find and replace
+
+Open **Find** and expand **Find and replace**. The desktop shortcut is **Command+R** on macOS or **Ctrl+R** on Windows and Linux. On Android, **Ctrl+R** works with a physical keyboard. Use the find bar on the Web to leave the browser reload shortcut available.
+
+Search matches literal, case-sensitive text within each paragraph, heading, table cell, or code block. **Replace** advances to the next match. **Replace all** uses the matches found before the edit and can be undone in one step. Leave **Replace with** empty to delete matching text.
+
 ## Formulas
 
 Draftspan uses a custom block for standalone LaTeX and offers source editing and copying LaTeX from the formatting bar. RaTeX renders formulas locally on each supported preview platform. Unsupported expressions and builds with rendering disabled display editable source.

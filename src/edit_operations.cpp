@@ -87,6 +87,9 @@ struct LeafBuilder {
   }
 
   void AppendSlice(const Block& block, TextRange range, bool fresh_objects = false) {
+    if (range.IsCollapsed()) {
+      return;
+    }
     data.text += DocumentAccess::Body(block).TextInRange(range);
     const auto& objects = block.Data().inline_objects;
     auto object = std::ranges::lower_bound(objects, range.start, {}, &InlineObject::offset);
@@ -96,17 +99,17 @@ struct LeafBuilder {
       data.inline_objects.push_back(std::move(copy));
     }
     if (data.kind != BlockKind::CodeBlock) {
-      for (const auto& mark : block.Data().marks) {
-        const auto part = Clip(mark.range, range);
-        if (!part.IsCollapsed()) {
-          AddMark(data.marks, {length + part.start - range.start, length + part.end - range.start}, mark.marks);
-        }
+      const auto& marks = block.Data().marks;
+      auto mark = std::ranges::upper_bound(marks, range.start, {}, [](const MarkRange& run) { return run.range.end; });
+      for (; mark != marks.end() && mark->range.start < range.end; ++mark) {
+        const auto part = Clip(mark->range, range);
+        AddMark(data.marks, {length + part.start - range.start, length + part.end - range.start}, mark->marks);
       }
-      for (const auto& link : block.Data().links) {
-        const auto part = Clip(link.range, range);
-        if (!part.IsCollapsed()) {
-          AppendLink({length + part.start - range.start, length + part.end - range.start}, link);
-        }
+      const auto& links = block.Data().links;
+      auto link = std::ranges::upper_bound(links, range.start, {}, [](const LinkRange& run) { return run.range.end; });
+      for (; link != links.end() && link->range.start < range.end; ++link) {
+        const auto part = Clip(link->range, range);
+        AppendLink({length + part.start - range.start, length + part.end - range.start}, *link);
       }
     }
     length += range.Length();
@@ -125,12 +128,9 @@ struct LeafBuilder {
 };
 
 Mark MarkAt(const Block& block, TextOffset offset) {
-  for (const auto& run : block.Data().marks) {
-    if (run.range.start <= offset && offset < run.range.end) {
-      return run.marks;
-    }
-  }
-  return Mark::None;
+  const auto& marks = block.Data().marks;
+  const auto run = std::ranges::upper_bound(marks, offset, {}, [](const MarkRange& mark) { return mark.range.end; });
+  return run != marks.end() && run->range.start <= offset ? run->marks : Mark::None;
 }
 
 std::pair<std::size_t, std::size_t> TouchedLeaves(const RichDocument& document, TextRange range) {
@@ -193,15 +193,17 @@ std::vector<MarkRange> ChangeMarks(const Block& block, TextRange range, Mark mar
   return result;
 }
 
-const LinkRange* FindLink(const Leaf& leaf, TextRange range) {
-  const auto& links = leaf.block.Data().links;
-  const auto start = range.start - leaf.start;
-  const auto end = range.end - leaf.start;
-  const auto found = std::ranges::upper_bound(links, start, {}, [](const LinkRange& link) { return link.range.end; });
-  if (found != links.end() && found->range.start <= start && end <= found->range.end) {
+const LinkRange* FindLocalLink(const Block& block, TextRange range) {
+  const auto& links = block.Data().links;
+  const auto found = std::ranges::upper_bound(links, range.start, {}, [](const LinkRange& link) { return link.range.end; });
+  if (found != links.end() && found->range.start <= range.start && range.end <= found->range.end) {
     return &*found;
   }
   return nullptr;
+}
+
+const LinkRange* FindLink(const Leaf& leaf, TextRange range) {
+  return FindLocalLink(leaf.block, {range.start - leaf.start, range.end - leaf.start});
 }
 
 std::vector<LinkRange> ChangeLink(const Block& block, TextRange range, const SetLink& link) {
@@ -887,6 +889,76 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
     }
   }
   return {Rewrite(document, replacements, edit, std::move(child_changes)), range.start + inserted_length};
+}
+
+RichDocument ReplaceBlockTextRanges(const RichDocument& document, std::span<const BlockTextRange> ranges,
+                                    std::string_view text, TextSelection& selection, EditChanges& edit) {
+  if (text.find('\0') != text.npos || text.find_first_of("\r\n") != text.npos) {
+    throw std::invalid_argument("Replacement requires single-line text");
+  }
+  const AttributedText replacement{std::string(text)};
+  const auto length = replacement.Length();
+  const auto& index = DocumentAccess::Get(document).index;
+  struct BlockRanges {
+    const Block* block = nullptr;
+    std::vector<TextRange> ranges;
+  };
+  std::unordered_map<BlockId, BlockRanges> grouped;
+  for (const auto& target : ranges) {
+    const auto id = DocumentAccess::Id(target.block);
+    auto& group = grouped[id];
+    if (!group.block) {
+      group.block = FindTextBlock(index, id);
+    }
+    if (!group.block || !DocumentAccess::SameBlock(*group.block, target.block)) {
+      throw std::invalid_argument("Replacement targets a stale or non-text block");
+    }
+    group.ranges.push_back(target.range);
+  }
+
+  const auto selection_before = selection;
+  Replacements replacements;
+  for (auto& [id, group] : grouped) {
+    const auto& block = *group.block;
+    const auto& data = block.Data();
+    const auto& body = DocumentAccess::Body(block);
+    const auto start = index.StartOf(id);
+    std::ranges::sort(group.ranges, {}, &TextRange::start);
+    LeafBuilder builder;
+    builder.data.kind = data.kind;
+    builder.data.heading_level = data.heading_level;
+    builder.data.fence_info = data.fence_info;
+    TextOffset previous_end = 0;
+    TextOffset copied_to = 0;
+    for (const auto range : group.ranges) {
+      if (!ValidTextRange(block, range) || range.start < previous_end) {
+        throw std::invalid_argument("Replacement ranges must be valid and disjoint");
+      }
+      previous_end = range.end;
+      const auto object = std::ranges::lower_bound(data.inline_objects, range.start, {}, &InlineObject::offset);
+      if (object != data.inline_objects.end() && object->offset < range.end) {
+        throw std::invalid_argument("Replacement range covers an inline object");
+      }
+      if (body.TextInRange(range) == text) {
+        continue;
+      }
+      builder.AppendSlice(block, {copied_to, range.start});
+      builder.AppendText(text, length, MarkAt(block, range.start), FindLocalLink(block, range));
+      copied_to = range.end;
+      // Use the original offsets so the remapping is independent of block iteration order.
+      const auto shift = [&](TextOffset position) {
+        return position <= start + range.start ? 0 : length - (std::min(position - start, range.end) - range.start);
+      };
+      selection.anchor += shift(selection_before.anchor);
+      selection.active += shift(selection_before.active);
+    }
+    if (copied_to != 0) {
+      builder.AppendSlice(block, {copied_to, body.Length()});
+      edit.Touch(block);
+      replacements.emplace(id, std::vector{DocumentAccess::WithData(block, std::move(builder.data))});
+    }
+  }
+  return replacements.empty() ? document : Rewrite(document, replacements, edit);
 }
 
 bool CanInsertInlineObject(const RichDocument& document, TextRange range) {

@@ -16,6 +16,15 @@ RichDocument RichEditorController::Document() const { return session_->Document(
 
 void RichEditorController::ReplaceDocument(RichDocument document) const { session_->ReplaceDocument(std::move(document)); }
 
+bool RichEditorController::IsComposing() const {
+  (void)session_->Observe();
+  return session_->CompositionRange().has_value();
+}
+
+bool RichEditorController::ReplaceTextRanges(std::span<const BlockTextRange> ranges, std::string_view text) const {
+  return session_->ReplaceTextRanges(ranges, text);
+}
+
 CommandState RichEditorController::GetCommandState(const EditorCommand& command) const {
   (void)session_->Observe();
   return session_->CommandStatus(command);

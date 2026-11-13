@@ -23,6 +23,7 @@ using namespace huxerui;
 using namespace huxerui::richeditor;
 using folio::DialogActions;
 using folio::DialogPanel;
+using folio::FindField;
 using folio::FindPanelState;
 using folio::LatexBlock;
 using folio::LatexInline;
@@ -441,8 +442,7 @@ View FormulaDialog(DialogContext context, RichEditorController editor, FormulaRe
 
 struct FindMatch {
   std::size_t block_index;
-  Block block;
-  TextRange range;
+  BlockTextRange target;
 };
 
 struct FindResults {
@@ -451,16 +451,32 @@ struct FindResults {
   std::vector<FindMatch> matches;
 };
 
+/// Resumes single-match replacement at the end of the inserted text in the refreshed results.
+struct FindResume {
+  RichDocument document;
+  std::string query;
+  std::size_t block_index;
+  TextOffset offset;
+};
+
 std::vector<FindMatch> FindMatches(std::span<const DecorationBlock> blocks, std::string_view query) {
   std::vector<FindMatch> matches;
   const auto length = AttributedText(std::string(query)).Length();
   for (std::size_t index = 0; index < blocks.size(); ++index) {
-    const std::string_view text = blocks[index].block.Data().text;
+    const auto& block = blocks[index].block;
+    const std::string_view text = block.Data().text;
+    const auto& objects = block.Data().inline_objects;
+    auto object = objects.begin();
     std::size_t previous = 0;
     TextOffset offset = 0;
     for (auto match = text.find(query); match != text.npos; match = text.find(query, previous)) {
       offset += AttributedText(std::string(text.substr(previous, match - previous))).Length();
-      matches.push_back({index, blocks[index].block, {offset, offset + length}});
+      while (object != objects.end() && object->offset < offset) {
+        ++object;
+      }
+      if (object == objects.end() || object->offset >= offset + length) {
+        matches.push_back({index, {block, {offset, offset + length}}});
+      }
       offset += length;
       previous = match + query.size();
     }
@@ -475,33 +491,56 @@ struct FindNavigation {
   std::function<void(bool forward)> move;
 };
 
+struct FindReplacement {
+  State<TextEditingValue> value;
+  bool enabled;
+  std::function<void(bool all)> apply;
+};
+
+void SetFindFieldFocus(State<FindPanelState> find, FindField field, bool focused) {
+  find.Update([field, focused](FindPanelState& state) {
+    if (focused) {
+      state.focused = field;
+    } else if (state.focused == field) {
+      state.focused = FindField::None;
+    }
+  });
+}
+
 [[huxerui::composable]]
 View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelState> find, FindNavigation navigation,
-             std::function<void()> close) {
+             FindReplacement replacement, std::function<void()> close) {
   const auto& theme = UseTheme();
   const auto& colors = theme.colors;
   const bool compact = UseViewportClass() == ViewportClass::Compact;
   const bool touch = !UseApplication().SupportsMultipleWindows();
   const float size = touch ? 44.0F : 36.0F;
-  const Frame button_size{.width = size, .height = size};
+  const Frame button_size{.width = compact ? 32.0F : size, .height = size};
+  const Frame toggle_size{.width = compact ? 36.0F : size, .height = size};
   auto style = UseEnvironment<TextFieldStyle>();
   style.show_label = false;
+  style.text_style.font = style.text_style.font.WithSize(theme.typography.body_medium);
+  style.placeholder_style.font = style.placeholder_style.font.WithSize(theme.typography.body_medium);
   style.standard = {.border = Color::Transparent(), .hovered_border = Color::Transparent(),
                     .focused_border = Color::Transparent(), .minimum_height = size};
-  style.padding = EdgeInsets::Symmetric(9.0F, 5.0F);
+  style.padding = EdgeInsets::Symmetric(compact ? 7.0F : 9.0F, 5.0F);
   style.leading_icon_size = 15.0F;
   style.icon_spacing = 7.0F;
 
-  const auto field = TextField(query)
+  auto search = TextField(query);
+  if (!compact) {
+    search = std::move(search).LeadingIcon(app::images::search);
+  }
+  const auto field = std::move(search)
       .Label(l10n::find_in_document)
       .Placeholder(compact ? l10n::find_text : l10n::find_in_document)
-      .LeadingIcon(app::images::search)
       .Variant(TextFieldVariant::Standard)
+      .LineLimits(TextFieldLineLimits::SingleLine())
       .InputConfiguration({.action = TextInputAction::Search, .autocorrect = false})
       .OnChanged([query](const TextEditingValue& value) { query = value; })
       .OnSubmitted([move = navigation.move] { move(true); })
       .On<ViewEvents::FocusChanged>([find](bool value) {
-        find.Update([value](FindPanelState& state) { state.field_focused = value; });
+        SetFindFieldFocus(find, FindField::Query, value);
       })
       .On<ViewEvents::KeyIntercept>([move = navigation.move, query](const KeyEvent& event) {
         if (event.type != KeyEventType::Down || event.key != Key::Enter || !event.modifiers.shift ||
@@ -519,10 +558,11 @@ View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelSta
       count = "…";
       announcement = l10n::searching;
     } else if (navigation.selected && *navigation.selected < navigation.count) {
-      count = std::to_string(*navigation.selected + 1) + " / " + std::to_string(navigation.count);
+      count = std::to_string(*navigation.selected + 1) + (compact ? "/" : " / ") + std::to_string(navigation.count);
       announcement = StringVariant::Format(l10n::match_position, *navigation.selected + 1, navigation.count);
     } else {
-      count = navigation.count == 0 ? StringVariant{l10n::no_matches} : StringVariant{std::to_string(navigation.count)};
+      count = navigation.count == 0 && !compact
+          ? StringVariant{l10n::no_matches} : StringVariant{std::to_string(navigation.count)};
       announcement = StringVariant::Format(navigation.count == 1 ? l10n::match_count_one : l10n::match_count_many,
                                            navigation.count);
     }
@@ -533,28 +573,76 @@ View FindBar(State<TextEditingValue> query, ViewHandle focus, State<FindPanelSta
         .With(button_size, Focusable(!touch), Enabled(can_navigate), Tooltip(label));
   };
   const auto group = Row {
-    ProvideEnvironment(std::move(style), field),
-    Text(count, TextRole::Label).Align(TextAlign::Center).VerticalAlign(TextVerticalAlign::Center).With(
-        Frame{.height = 18.0F, .min_width = compact ? 57.0F : 72.0F}, FontSize(11.0F), ClipChildren(),
-        Foreground(colors.on_surface_variant),
-        Semantics{.label = announcement, .identifier = "find-count", .live_region = SemanticLiveRegion::Polite,
-                  .hidden = query->text.empty()}),
+    ProvideEnvironment(style, field),
+    Text(count, TextRole::Label).Align(TextAlign::Center).VerticalAlign(TextVerticalAlign::Center)
+        .LineLimit(1).Overflow(TextOverflow::Ellipsis)
+        .With(Frame{.height = 18.0F, .min_width = compact ? 24.0F : 72.0F,
+                    .max_width = compact ? std::optional{52.0F} : std::nullopt},
+              FontSize(11.0F), ClipChildren(), Foreground(colors.on_surface_variant),
+              Semantics{.label = announcement, .identifier = "find-count", .live_region = SemanticLiveRegion::Polite,
+                        .hidden = query->text.empty()}),
     arrow(app::images::chevron_up, l10n::previous_match, false),
     arrow(app::images::chevron_down, l10n::next_match, true),
   }.With(Grow(), CrossAlign(CrossAxisAlignment::Center), Background(colors.surface),
-         Border{find->field_focused ? colors.primary : colors.outline, 1.0F}, CornerRadius(theme.shapes.medium));
+         Border{find->focused == FindField::Query ? colors.primary : colors.outline, 1.0F},
+         CornerRadius(theme.shapes.medium));
+  const auto replace_open = find->replace_open;
+  const auto toggle_label = replace_open ? l10n::hide_replacement : l10n::find_and_replace;
+  View replace_controls;
+  if (replace_open) {
+    const auto replacement_field = Row {
+      ProvideEnvironment(style, TextField(replacement.value)
+          .Label(l10n::replacement_text)
+          .Placeholder(l10n::replacement_text)
+          .Variant(TextFieldVariant::Standard)
+          .LineLimits(TextFieldLineLimits::SingleLine())
+          .InputConfiguration({.autocorrect = false})
+          .OnChanged([value = replacement.value](const TextEditingValue& next) { value = next; })
+          .On<ViewEvents::FocusChanged>([find](bool value) { SetFindFieldFocus(find, FindField::Replacement, value); })
+          .With(Grow(), Semantics{.identifier = "replace-text"})),
+    }.With(Frame{.height = size}, Background(colors.surface),
+           Border{find->focused == FindField::Replacement ? colors.primary : colors.outline, 1.0F},
+           CornerRadius(theme.shapes.medium));
+    const auto action = [&](StringResource label, bool all) {
+      return Button(label).OnClick([apply = replacement.apply, all] { apply(all); })
+          .With(Frame{.min_height = size}, Enabled(replacement.enabled));
+    };
+    const auto buttons = Row {action(l10n::replace, false), action(l10n::replace_all, true)}
+        .With(Spacing(5.0F), MainAlign(compact ? MainAxisAlignment::End : MainAxisAlignment::Start),
+              CrossAlign(CrossAxisAlignment::Center));
+    replace_controls = compact
+        ? View(Column {replacement_field, buttons}.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+        : View(Row {View(replacement_field).With(Grow()), buttons}
+                   .With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center)));
+  }
   return Column {
     Row {
+      IconButton(replace_open ? app::images::chevron_down : app::images::chevron_right, toggle_label)
+          .OnClick([find, focus, touch] {
+            const bool restore_query = find->replace_open && find->focused == FindField::Replacement && !touch;
+            find.Update([](FindPanelState& state) {
+              state.replace_open = !state.replace_open;
+              if (!state.replace_open && state.focused == FindField::Replacement) {
+                state.focused = FindField::None;
+              }
+            });
+            if (restore_query) {
+              focus.RequestFocus();
+            }
+          }).With(toggle_size, Focusable(!touch), Tooltip(toggle_label),
+                  Semantics{.identifier = "toggle-replace", .expanded = replace_open}),
       group,
       IconButton(app::images::close, l10n::close_find).OnClick(close).With(button_size, Tooltip(l10n::close_find)),
-    }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center)),
-  }.On<ViewEvents::KeyIntercept>([close, query](const KeyEvent& event) {
-    if (event.type == KeyEventType::Down && event.key == Key::Escape && !query->composition) {
+    }.With(Spacing(compact ? 3.0F : 5.0F), CrossAlign(CrossAxisAlignment::Center)).Key("query-row"),
+    replace_controls ? std::move(replace_controls).Key("replace-controls") : View{},
+  }.On<ViewEvents::KeyIntercept>([close, query, value = replacement.value](const KeyEvent& event) {
+    if (event.type == KeyEventType::Down && event.key == Key::Escape && !query->composition && !value->composition) {
       close();
       return true;
     }
     return false;
   }).With(Padding(EdgeInsets::Symmetric(compact ? 8.0F : 14.0F, 6.0F)),
+          Spacing(5.0F),
           CrossAlign(CrossAxisAlignment::Stretch),
           Background(colors.surface_container));
 }
@@ -950,10 +1038,13 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
   const auto dialog = UseDialog();
   const auto toast = UseToast();
   const auto find_query = UseState(TextEditingValue{});
+  const auto replacement_text = UseState(TextEditingValue{});
   const auto find_provider = UseState(std::shared_ptr<const DecorationProvider>{});
   const auto active_provider = UseState(std::shared_ptr<const DecorationProvider>{});
   const auto find_results = UseState(std::shared_ptr<const FindResults>{});
   const auto active_match = UseState(std::optional<std::size_t>{});
+  const auto resume_match = UseState(std::optional<FindResume>{});
+  const auto tasks = UseTaskScope();
   const auto& theme = UseTheme();
   const auto settings = UseService<SettingsStore>();
   const auto& preferences = settings->Get().editor;
@@ -969,12 +1060,14 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
   }, finding, find->focus_request);
 
   const auto query = find_query->text;
+  const bool editor_composing = finding && find->replace_open && editor.IsComposing();
   const auto match_color = theme.colors.primary_container;
   Lifecycle([=] {
     if (!search_open || query.empty()) {
       find_provider = nullptr;
       find_results = nullptr;
       active_match = std::nullopt;
+      resume_match = std::nullopt;
       return;
     }
     find_provider = std::make_shared<const DecorationProvider>(DecorationProvider{
@@ -989,7 +1082,7 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
           std::vector<TextDecorationRange> marks;
           marks.reserve(matches.size());
           for (const auto& match : matches) {
-            marks.push_back({match.block_index, match.range, DecorationKind::Background, match_color});
+            marks.push_back({match.block_index, match.target.range, DecorationKind::Background, match_color});
           }
           const auto& previous = find_results.Get();
           if (!previous || previous->query != query || previous->document != *request.document) {
@@ -1008,12 +1101,34 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
   const auto selected = active_match.Get();
   const auto active_color = theme.colors.primary;
   Lifecycle([=] {
+    if (!finding || !ready || editor_composing || !resume_match.Get()) {
+      return;
+    }
+    tasks.Post([=] {
+      const auto& resume = resume_match.Get();
+      if (!resume || !find->open || find_results.Get() != results || find_query->text != results->query ||
+          editor.Document() != results->document) {
+        return;
+      }
+      if (resume->document == results->document && resume->query == results->query && !results->matches.empty()) {
+        const auto next = std::ranges::lower_bound(results->matches, std::pair{resume->block_index, resume->offset},
+            {}, [](const FindMatch& match) { return std::pair{match.block_index, match.target.range.start}; });
+        const auto match = next == results->matches.end() ? results->matches.begin() : next;
+        if (editor.RevealTextRange(match->target.block, match->target.range, ScrollAlignment::Center)) {
+          active_match = static_cast<std::size_t>(match - results->matches.begin());
+        }
+      }
+      resume_match = std::nullopt;
+    });
+  }, finding, ready, results, editor_composing);
+
+  Lifecycle([=] {
     if (!selected || *selected >= count) {
       active_provider = nullptr;
       return;
     }
     const auto& match = results->matches[*selected];
-    const auto mark = TextDecorationRange{match.block_index, match.range, DecorationKind::Outline, active_color};
+    const auto mark = TextDecorationRange{match.block_index, match.target.range, DecorationKind::Outline, active_color};
     active_provider = std::make_shared<const DecorationProvider>(DecorationProvider{
         .scope = DecorationScope::Document,
         .analyze = [document = results->document, mark](DecorationRequest request) -> Task<std::vector<TextDecorationRange>> {
@@ -1032,7 +1147,7 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
 
   View find_bar;
   if (finding) {
-    const auto navigate = [editor, results, count, active_match, find_query](bool forward) {
+    const auto navigate = [editor, results, count, active_match, find_query, resume_match](bool forward) {
       if (count == 0 || find_query->composition || find_query->text != results->query ||
           editor.Document() != results->document) {
         return;
@@ -1042,20 +1157,55 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
           ? (forward ? (*index + 1) % count : (*index + count - 1) % count)
           : (forward ? 0 : count - 1);
       const auto& match = results->matches[next];
-      if (editor.RevealTextRange(match.block, match.range, ScrollAlignment::Center)) {
+      if (editor.RevealTextRange(match.target.block, match.target.range, ScrollAlignment::Center)) {
+        resume_match = std::nullopt;
         active_match = next;
       }
     };
-    const bool desktop = UseApplication().SupportsMultipleWindows();
-    find_bar = FindBar(find_query, find_focus, find, {count, selected, ready, navigate}, [find, focus, desktop] {
-      find.Update([](FindPanelState& state) {
-        state.open = false;
-        state.field_focused = false;
-      });
-      if (desktop) {
-        focus.RequestFocus();
+    const bool can_replace = options.available && count != 0 && !find_query->composition &&
+        !replacement_text->composition && !editor_composing && query != replacement_text->text;
+    const auto replace = [editor, results, count, active_match, resume_match, find_query, replacement_text, find,
+                          find_results, toast, can_replace](bool all) {
+      if (!can_replace || !find->open || !find->replace_open || find_results.Get() != results ||
+          find_query->composition || replacement_text->composition ||
+          find_query->text != results->query || find_query->text == replacement_text->text ||
+          editor.Document() != results->document) {
+        return;
       }
-    });
+      const auto& text = replacement_text->text;
+      const auto index = active_match.Get().value_or(0);
+      const auto& match = results->matches[index < count ? index : 0];
+      std::vector<BlockTextRange> targets;
+      if (all) {
+        targets.reserve(count);
+        for (const auto& item : results->matches) {
+          targets.push_back(item.target);
+        }
+      }
+      const auto ranges = all ? std::span<const BlockTextRange>(targets) : std::span(&match.target, 1);
+      if (!editor.ReplaceTextRanges(ranges, text)) {
+        return;
+      }
+      active_match = std::nullopt;
+      if (all) {
+        resume_match = std::nullopt;
+        toast.Show(StringVariant::Format(count == 1 ? l10n::replaced_one : l10n::replaced_many, count));
+      } else {
+        const auto after = match.target.range.start + AttributedText(text).Length();
+        resume_match = FindResume{editor.Document(), results->query, match.block_index, after};
+      }
+    };
+    const bool desktop = UseApplication().SupportsMultipleWindows();
+    find_bar = FindBar(find_query, find_focus, find, {count, selected, ready, navigate},
+        {replacement_text, can_replace, replace}, [find, focus, desktop] {
+          find.Update([](FindPanelState& state) {
+            state.open = false;
+            state.focused = FindField::None;
+          });
+          if (desktop) {
+            focus.RequestFocus();
+          }
+        });
   }
 
   const auto editor_view = RichEditor(editor, {

@@ -10,9 +10,12 @@ namespace folio {
 
 class WorkspaceStore;
 
+enum class FindField { None, Query, Replacement };
+
 struct FindPanelState {
   bool open = false;
-  bool field_focused = false;
+  bool replace_open = false;
+  FindField focused = FindField::None;
   std::uint64_t focus_request = 0;
   bool operator==(const FindPanelState&) const = default;
 };

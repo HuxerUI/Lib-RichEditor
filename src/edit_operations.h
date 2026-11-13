@@ -30,6 +30,10 @@ struct EditResult {
 bool CanEditTextRange(const RichDocument& document, TextRange range);
 EditResult ReplaceText(const RichDocument& document, TextRange range, std::string_view text,
                        std::optional<Mark> marks, bool hard_break, EditChanges& edit);
+/// Applies block-local replacements against one snapshot and remaps the flattened selection.
+/// Throws std::invalid_argument for an invalid batch.
+RichDocument ReplaceBlockTextRanges(const RichDocument& document, std::span<const BlockTextRange> ranges,
+                                    std::string_view text, TextSelection& selection, EditChanges& edit);
 /// Checks that both endpoints belong to one paragraph or heading. Offsets use the flattened UTF-16 text.
 bool CanInsertInlineObject(const RichDocument& document, TextRange range);
 /// Replaces a range allowed by CanInsertInlineObject with a new character and annotation.

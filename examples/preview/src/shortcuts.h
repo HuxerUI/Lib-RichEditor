@@ -8,7 +8,7 @@
 
 namespace folio {
 
-enum class FolioCommand { NewDocument, OpenFile, Save, SaveAs, Find, ToggleSidebar, Settings, OpenCommandPalette };
+enum class FolioCommand { NewDocument, OpenFile, Save, SaveAs, Find, FindReplace, ToggleSidebar, Settings, OpenCommandPalette };
 
 /// Stable identity and default bindings for a Folio action or a RichEditor command.
 struct ShortcutCommand {
