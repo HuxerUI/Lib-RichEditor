@@ -29,7 +29,7 @@ struct EditResult {
 
 bool CanEditTextRange(const RichDocument& document, TextRange range);
 EditResult ReplaceText(const RichDocument& document, TextRange range, std::string_view text,
-                       std::optional<Mark> marks, bool hard_break, EditChanges& edit);
+                       std::optional<Mark> marks, bool hard_break, EditChanges& edit, bool inherit_link = true);
 /// Applies block-local replacements against one snapshot and remaps the flattened selection.
 /// Throws std::invalid_argument for an invalid batch.
 RichDocument ReplaceBlockTextRanges(const RichDocument& document, std::span<const BlockTextRange> ranges,

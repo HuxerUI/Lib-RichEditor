@@ -28,6 +28,8 @@ std::optional<DocumentFormat> FormatOf(std::string_view name);
 const huxerui::richeditor::DocumentCodec& Codec(DocumentFormat format);
 std::shared_ptr<const huxerui::richeditor::ImageResolver> AttachmentResolver(
     std::optional<huxerui::File> working_directory, std::vector<FileSource> directories);
+std::shared_ptr<const huxerui::richeditor::ClipboardAttachmentProvider> ClipboardAttachmentsFor(
+    std::optional<huxerui::File> working_directory, std::vector<FileSource> directories);
 huxerui::Task<huxerui::IoResult<std::string>> ImportImage(huxerui::File directory, huxerui::FileReference source);
 bool HasLocalAttachments(const huxerui::richeditor::RichDocument& document);
 bool NeedsAttachmentWrite(const FileSource& target,

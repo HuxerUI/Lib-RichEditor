@@ -436,6 +436,23 @@ bool EditorSession::Apply(std::span<const TextInputCommand> commands) {
   }
 }
 
+bool EditorSession::PasteText(TextRange range, std::string_view text, bool plain_only) {
+  if (IsReadOnly()) {
+    return false;
+  }
+  auto next = draft_;
+  try {
+    next.composition.reset();
+    const auto marks = plain_only ? std::optional{Mark::None} : next.edit.pending;
+    auto pasted = ReplaceText(next.edit.document, range, text, marks, false, next.changes, !plain_only);
+    next.edit.document = std::move(pasted.document);
+    SetSelection(next.edit, {pasted.caret, pasted.caret}, false);
+    return Publish(std::move(next), true);
+  } catch (const std::invalid_argument&) {
+    return false;
+  }
+}
+
 bool EditorSession::Select(TextSelection selection) {
   auto next = draft_;
   next.composition.reset();

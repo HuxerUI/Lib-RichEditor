@@ -25,6 +25,7 @@ struct FindPanelState {
 struct EditorPaneOptions {
   std::optional<huxerui::File> working_directory;
   std::shared_ptr<const huxerui::richeditor::ImageResolver> image_resolver;
+  std::shared_ptr<const huxerui::richeditor::ClipboardAttachmentProvider> clipboard_attachments;
   huxerui::State<FindPanelState> find;
   huxerui::ViewHandle focus;
   bool active;

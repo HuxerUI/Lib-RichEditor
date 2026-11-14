@@ -76,9 +76,11 @@ struct SavedDocument {
 struct AttachmentLocation {
   std::vector<FileSource> directories;
   std::shared_ptr<const ImageResolver> resolver;
+  std::shared_ptr<const ClipboardAttachmentProvider> clipboard_attachments;
 
   AttachmentLocation(const std::optional<File>& working_directory, std::vector<FileSource> directories)
-      : directories(std::move(directories)), resolver(AttachmentResolver(working_directory, this->directories)) {}
+      : directories(std::move(directories)), resolver(AttachmentResolver(working_directory, this->directories)),
+        clipboard_attachments(ClipboardAttachmentsFor(working_directory, this->directories)) {}
 };
 
 enum class Operation { Idle, PickImage, LocateAttachments, Save, Export, Delete };
@@ -3083,6 +3085,7 @@ View DocumentPage(WorkbenchActions actions, Tab tab, bool active) {
     EditorPane(editor, {
         .working_directory = tab->working_directory,
         .image_resolver = attachments.resolver,
+        .clipboard_attachments = attachments.clipboard_attachments,
         .find = tab->find,
         .focus = focus,
         .active = active,
@@ -3708,7 +3711,7 @@ View OutlineList(WorkbenchActions actions, Tab tab, bool desktop, float row_heig
         [actions, tab, block = heading.block, length = heading.length] {
           actions.JumpToHeading(tab, block, length);
         });
-    if (!heading.anchor.empty() && clipboard && clipboard->IsAvailable()) {
+    if (!heading.anchor.empty() && clipboard && clipboard->SupportsSynchronousText()) {
       const auto show_menu = [menu, clipboard, toast, link = "#" + heading.anchor](Point point) {
         menu.ShowAt(point, {MenuItem(l10n::copy_heading_link, [clipboard, toast, link] {
           toast.Show(clipboard->WriteText(link) ? l10n::link_copied : l10n::link_copy_failed);

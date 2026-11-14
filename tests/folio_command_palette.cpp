@@ -13,6 +13,7 @@
 #include "../examples/preview/src/web_url.h"
 #include "../examples/preview/src/workbench.h"
 #include "../examples/preview/src/workspace_store.h"
+#include "../src/editor_clipboard.h"
 #include "folio_test_resources.h"
 
 using namespace huxerui;
@@ -79,6 +80,72 @@ void WebUrls() {
   Check(remote.document && !folio::HasLocalAttachments(*remote.document) &&
             local.document && folio::HasLocalAttachments(*local.document),
         "Attachment discovery uses the same HTTP and HTTPS policy as browser links");
+}
+
+void ClipboardAttachmentFlow(const File& directory) {
+  using namespace huxerui::richeditor;
+  const auto source = directory.Child("source");
+  const auto target = directory.Child("target");
+  const auto destination = directory.Child("saved");
+  const auto photo_bytes = Bytes{std::byte{0x89}, std::byte{0x50}, std::byte{0x4e}, std::byte{0x47}};
+  const auto original_attachment = source.Child("attachments").Child("photo.png");
+  Check(original_attachment.Parent()->CreateDirectories() && original_attachment.WriteBytes(photo_bytes),
+        "Write clipboard attachment fixture");
+  const auto document = RichDocument::Create({
+      Block(BlockData{.kind = BlockKind::Image, .image = ImageBlockData{"attachments/photo.png", "Photo", ""}}),
+      Block(BlockData{.text = "\xef\xbf\xbc", .inline_objects = {{0,
+          InlineImage({"attachments/photo.png", "Inline photo", ""})}}}),
+  });
+  auto result = std::make_shared<std::string>();
+  const auto transfer = [=]() -> Task<void> {
+    try {
+      using huxerui::richeditor::detail::ClipboardAttachmentReferences;
+      using huxerui::richeditor::detail::RebaseClipboardFragment;
+      const auto from = folio::ClipboardAttachmentsFor({}, {folio::FileSource(source, FileType::Directory, false)});
+      const auto to = folio::ClipboardAttachmentsFor(target, {});
+      const auto references = ClipboardAttachmentReferences(document);
+      auto small = co_await from->read(references, photo_bytes.size() - 1);
+      Check(!small.Succeeded() && small.Error().code == IoErrorCode::TooLarge, "Enforce the attachment budget");
+      auto read = co_await from->read(references, photo_bytes.size());
+      Check(read.Succeeded() && read.Value().size() == 1 && read.Value().at("attachments/photo.png") == photo_bytes,
+            "Copy one attachment shared by a block image and an inline image from the source grant");
+      Check(co_await original_attachment.DeleteAsync(), "Remove the original before pasting");
+      auto invalid = co_await to->stage({{"../photo.png", photo_bytes}});
+      Check(!invalid.Succeeded(), "Reject invalid clipboard attachment references");
+      {
+        auto discarded = co_await to->stage(read.Value());
+        Check(discarded.Succeeded() && target.Child("attachments").ListChildren().Value().size() == 1,
+              "Stage bytes before inserting a fragment");
+      }
+      Check(target.Child("attachments").ListChildren().Value().empty(), "Clean up attachments after an abandoned paste");
+      auto pasted = co_await to->stage(std::move(read.Value()));
+      Check(pasted.Succeeded(), "Stage the data independently of the source file");
+      const auto fragment = RebaseClipboardFragment({document}, pasted.Value().DestinationReferences());
+      Check(fragment.has_value(), "Apply staged references to the clipboard fragment");
+      const auto& content = fragment->content;
+      const auto& reference = content.Blocks().front().Data().image->source;
+      Check(reference.starts_with("attachments/paste-") &&
+                content.Blocks()[1].Data().inline_objects.front().data.attachments.front().source == reference,
+            "Rebase block and inline attachments to the same collision-safe destination");
+      pasted.Value().Commit();
+      const auto encoded = folio::Codec(folio::DocumentFormat::Json).Export(content);
+      auto saved = co_await folio::WriteLibraryPackage(destination, *encoded.text, target, {}, content);
+      const auto name = reference.substr(std::string_view("attachments/").size());
+      Check(saved.Succeeded() && destination.Child("attachments").Child(name).ReadBytes().Value() == photo_bytes,
+            "Saving a document writes its pasted attachments with relative references");
+      *result = "passed";
+    } catch (const std::exception& error) {
+      *result = error.what();
+    }
+  };
+  const Application app([]() -> View { return {}; }, {
+      .application_hooks = {[transfer](ApplicationContext&) {
+        UseApplicationTaskScope().Launch(transfer);
+      }},
+  });
+  UiTest ui(app);
+  WaitForFixture(ui, [&] { return !result->empty(); });
+  Check(*result == "passed", result->c_str());
 }
 
 void DocumentLinks() {
@@ -1188,6 +1255,10 @@ void ReadingPositionFlow(const File& directory, const char* package_path) {
     return position.is_object() ? std::optional(ReadingPosition{position["block_index"].get<std::uint64_t>(),
         position["text_fingerprint"].get<std::uint64_t>()}) : std::nullopt;
   };
+  const auto wait_for_saved_position = [](UiTest& ui, const std::function<bool()>& saved) {
+    // Auto-save starts after the frame that captures the new reading position.
+    ui.PumpUntil(saved, {.timeout = 2s, .step = 32ms});
+  };
   const auto article_for = [](UiTest& ui) {
     return ui.FindSemantics(UiSemanticSelector::Identifier("article-editor"));
   };
@@ -1223,8 +1294,7 @@ void ReadingPositionFlow(const File& directory, const char* package_path) {
     const auto scroll = scroll_for(ui);
     first_offset = scroll.One().scroll->offset;
     Check(first_offset > 800, "The first tab has scrolled into its document");
-    ui.Pump(800ms);
-    WaitForFixtureWithMessage(ui, [&] { return reading(0).has_value(); }, "Save the first tab's reading position");
+    wait_for_saved_position(ui, [&] { return reading(0).has_value(); });
     select(ui, second.Name(), "Section 0");
     const auto second_scroll = scroll.One().scroll;
     Check(second_scroll && second_scroll->offset < 10.0F, "A new tab starts at its own position");
@@ -1251,11 +1321,11 @@ void ReadingPositionFlow(const File& directory, const char* package_path) {
     const auto scroll = scroll_for(ui);
     WaitForFixtureWithMessage(ui, [&] { return scroll.One().scroll->offset > 800; },
                               "Reopening restores the active tab near its previous paragraph");
-    WaitForFixtureWithMessage(ui, [&] {
+    wait_for_saved_position(ui, [&] {
       const auto current = reading(0);
       return current && current->block_index == saved_first->block_index + 2 &&
           current->text_fingerprint == saved_first->text_fingerprint;
-    }, "Restoration finds the same paragraph after blocks were inserted");
+    });
     Check(!ui.ActiveTextInput(), "Restoring a reading position leaves the editor unfocused");
 
     // The destination remains unopened in the viewport until this explicit link is activated.
@@ -1359,6 +1429,7 @@ int main(int argc, char** argv) {
     Check(argc == 2, "The Folio resource package path is required");
     WebUrls();
     DocumentLinks();
+    ClipboardAttachmentFlow(directory.Child("clipboard"));
     DocumentLinkFlow(directory.Child("document-links"), argv[1]);
     {
       const Application storage([] { return View{}; }, {

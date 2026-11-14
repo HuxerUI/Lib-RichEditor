@@ -73,6 +73,12 @@ Open **Find** and expand **Find and replace**. The desktop shortcut is **Command
 
 Search matches literal, case-sensitive text within each paragraph, heading, table cell, or code block. **Replace** advances to the next match. **Replace all** uses the matches found before the edit and can be undone in one step. Leave **Replace with** empty to delete matching text.
 
+## Copy and paste
+
+Copy from an editor selection and paste into another tab to keep the document structure, including formulas and full tables. On native apps, local attachments that fit in the clipboard item are copied with the text and saved alongside the destination document. If a cut cannot preserve the selected content, Draftspan keeps the selection and reports the reason. Browsers without support for the RichEditor format can still cut plain paragraphs and copy HTML or plain text.
+
+Rich text exchanged with other apps supports bold, italic, underline, strikethrough, links, and line breaks. Choose **Paste as plain text** in the formatting overflow menu, or press Ctrl+Shift+V or Command+Shift+V.
+
 ## Formulas
 
 Draftspan uses a custom block for standalone LaTeX and offers source editing and copying LaTeX from the formatting bar. RaTeX renders formulas locally on each supported preview platform. Unsupported expressions and builds with rendering disabled display editable source.

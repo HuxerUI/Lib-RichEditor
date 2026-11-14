@@ -2,10 +2,13 @@
 #include <huxerui/richeditor/extension.h>
 
 #include "../examples/preview/src/formula.h"
+#include "../src/editor_clipboard.h"
+#include "../src/edit_operations.h"
 
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <type_traits>
 
 using namespace huxerui;
 using namespace huxerui::richeditor;
@@ -38,6 +41,116 @@ const auto x = "```";
 
 ~~~
 )markdown";
+
+void ClipboardFragments() {
+  using namespace huxerui::richeditor::detail;
+  const auto source = *folio::DocumentMarkdown().Import(
+      "# Notes\n\n**A🙂** $x^2$ [link](https://example.org)\n\n- [x] Done\n\n"
+      "| Label | Value |\n| --- | --- |\n| One | Two |\n\n"
+      "![Photo](attachments/photo.png)").document;
+  const TextRange selection{0, DocumentAccess::Get(source).index.Length()};
+  const auto fragment = CopyFragment(source, selection);
+  Check(!fragment.leading_partial && !fragment.trailing_partial && fragment.content == source,
+        "A complete selection preserves headings, tasks, a table, a formula and an image");
+  const auto plain = PlainTextSlice(source, selection);
+  const auto item = ClipboardRepresentations(plain, fragment);
+  Check(item.text == plain && item.html.has_value(), "The public representations share the same text");
+  const auto styled = item.ToAttributedText();
+  Check(styled.Succeeded() && styled.Value().PlainText() == plain && styled.Value().LinkRanges().size() == 1,
+        "HTML retains text, line breaks and links around inline-object fallbacks");
+  const auto& style = styled.Value().StyleRanges().front();
+  Check(style.range == TextRange{6, 9} && style.style.font_weight == FontWeight::Bold,
+        "The public HTML uses UTF-16 ranges for styled emoji");
+
+  const ClipboardAttachments attachments{{"attachments/photo.png", {std::byte{0x82}, std::byte{0x00}}}};
+  auto payload = EncodeClipboardFragment(fragment);
+  const auto references = ClipboardAttachmentReferences(fragment.content);
+  Check(payload && references == std::vector<std::string>{"attachments/photo.png"} &&
+            HasAllClipboardAttachments(references, attachments) &&
+            ClipboardAttachmentBudget(fragment_clipboard_limit - 32, references) == 3,
+        "Reserve wire overhead separately from attachment bytes");
+  Check(!DecodeClipboardFragment(*payload) &&
+            !HasAllClipboardAttachments(references, {{"other.png", {}}}),
+        "Reject missing or unrelated attachment data");
+  auto unrelated = *payload;
+  Check(AppendClipboardAttachments(unrelated, {{"other.png", {}}}) && !DecodeClipboardFragment(unrelated),
+        "Reject bytes for unrelated references in a clipboard payload");
+  Check(AppendClipboardAttachments(*payload, attachments), "Encode the private clipboard item");
+  const auto decoded = DecodeClipboardFragment(*payload);
+  Check(decoded && decoded->fragment.content == source && decoded->attachments == attachments,
+        "Decode the document snapshot and its exact resource bytes");
+  auto truncated = *payload;
+  truncated.pop_back();
+  Check(!DecodeClipboardFragment(truncated), "Reject a truncated attachment");
+  auto invalid = *payload;
+  invalid.front() = std::byte{0xff};
+  Check(!DecodeClipboardFragment(invalid), "Reject unsupported clipboard versions");
+
+  const auto remote = RichDocument::Create({Block(BlockData{
+      .kind = BlockKind::Image, .image = ImageBlockData{"HTTPS://example.org/photo.png", "Photo", ""},
+  })});
+  const auto remote_clipboard = DecodeClipboardFragment(*EncodeClipboardFragment({remote}));
+  Check(remote_clipboard && remote_clipboard->fragment.content == remote && remote_clipboard->attachments.empty(),
+        "Absolute web image references survive without a storage provider");
+  Check(IsPlainClipboardSelection({RichDocument::Create({Block(BlockData{.text = "Plain 🙂"})})}) &&
+            !IsPlainClipboardSelection({RichDocument::Create({Block(BlockData{.text = "One\nTwo"})})}) &&
+            !IsPlainClipboardSelection(fragment),
+        "Only selections representable as plain paragraphs may cut without the private format");
+
+  static_assert(std::is_move_constructible_v<StagedClipboardAttachments> &&
+                !std::is_copy_constructible_v<StagedClipboardAttachments>);
+  unsigned rollbacks = 0;
+  {
+    StagedClipboardAttachments staged({{"attachments/photo.png", "attachments/pasted.png"}},
+                                      [&rollbacks]() noexcept { ++rollbacks; });
+    auto moved = std::move(staged);
+    auto rebased = RebaseClipboardFragment(decoded->fragment, moved.DestinationReferences());
+    Check(rebased && rebased->content.Blocks().back().Data().image->source == "attachments/pasted.png",
+          "The editor applies the provider's destination references");
+    Check(!RebaseClipboardFragment(decoded->fragment, {{"other.png", "attachments/pasted.png"}}) &&
+              !RebaseClipboardFragment(decoded->fragment, {{"attachments/photo.png", ""}}),
+          "Reject incomplete mappings and invalid destination references");
+    Check(rollbacks == 0, "Moving the staged attachments preserves their rollback");
+  }
+  Check(rollbacks == 1, "Destroying an abandoned paste runs rollback once");
+  {
+    StagedClipboardAttachments staged({}, [&rollbacks]() noexcept { ++rollbacks; });
+    staged = StagedClipboardAttachments({}, [&rollbacks]() noexcept { ++rollbacks; });
+    staged.Commit();
+  }
+  Check(rollbacks == 2, "Replacement rolls back the old resources and commit keeps the new ones");
+
+  const auto destination = RichDocument::Create({Block(BlockData{.text = "Before"}), Block(BlockData{.text = "After"})});
+  EditChanges receiving{DocumentAccess::Get(destination).max_id};
+  Check(CanInsertFragment(destination, {6, 7}, decoded->fragment), "Accept rich paste across top-level paragraphs");
+  const auto pasted = PasteFragment(destination, {6, 7}, decoded->fragment, receiving).document;
+  const auto blocks = pasted.Blocks();
+  Check(blocks.size() == source.Blocks().size() + 2 && blocks.front().Data().text == "Before" &&
+            blocks[1].Data().kind == BlockKind::Heading && blocks.back().Data().text == "After",
+        "Rich paste keeps structure and the unselected text on both sides");
+
+  const RichDocument empty;
+  EditChanges heading{DocumentAccess::Get(empty).max_id};
+  const auto heading_fragment = DocumentFragment{RichDocument::Create({source.Blocks().front()})};
+  Check(PasteFragment(empty, {0, 0}, heading_fragment, heading).document.Blocks().front().Data().kind == BlockKind::Heading,
+        "A complete single heading keeps its structure in a blank document");
+  const auto image = RichDocument::Create({source.Blocks().back()});
+  EditChanges replacing{DocumentAccess::Get(image).max_id};
+  Check(CanInsertFragment(image, {0, 1}, heading_fragment) &&
+            PasteFragment(image, {0, 1}, heading_fragment, replacing).document == heading_fragment.content,
+        "A selected atomic block can be replaced by a rich fragment");
+
+  const ClipboardItem html{.text = "fallback",
+      .html = "<b>A🙂</b><em>B</em><br><u><s>C</s></u><a href=\"https://example.org\">D</a>"};
+  const auto formatted = html.ToAttributedText();
+  Check(formatted.Succeeded(), "Decode public rich clipboard HTML");
+  const auto formatted_fragment = FragmentFromAttributedText(formatted.Value());
+  const auto& block = formatted_fragment.content.Blocks().front().Data();
+  Check(block.text == "A🙂B\nCD" && block.marks == std::vector<MarkRange>{
+            {{0, 3}, Mark::Bold}, {{3, 4}, Mark::Italic}, {{5, 6}, Mark::Underline | Mark::Strike}} &&
+            block.links == std::vector<LinkRange>{{{6, 7}, "https://example.org", ""}},
+        "Public paste imports supported formatting and safe link ranges");
+}
 
 void RoundTrip() {
   const auto& markdown = MarkdownCodec();
@@ -598,6 +711,7 @@ void MarkdownObjectMappings() {
 
 int main() {
   try {
+    ClipboardFragments();
     RoundTrip();
     InlineObjectCodecs();
     ValidateLoss();

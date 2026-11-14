@@ -832,6 +832,112 @@ void ReadOnlyEditing() {
         "The host can load another document while keeping read-only mode");
 }
 
+void ClipboardCommands() {
+  using Reason = ClipboardWriteFailureReason;
+  struct ClipboardFixture {
+    std::vector<ClipboardWriteFailure> failures;
+    std::optional<IoError> read_error;
+    unsigned reads = 0;
+  };
+  const auto fixture = std::make_shared<ClipboardFixture>();
+  const Application app([]() -> View {
+    const auto editor = UseRichEditor();
+    const auto focus = UseViewHandle();
+    const auto clipboard = UseApplication().Clipboard();
+    const auto fixture = UseService<ClipboardFixture>();
+    const auto provider = UseState(std::make_shared<const ClipboardAttachmentProvider>(ClipboardAttachmentProvider{
+        .read = [fixture](std::vector<std::string> references, std::size_t max_bytes)
+            -> Task<IoResult<ClipboardAttachments>> {
+          Check(references == std::vector<std::string>{"attachments/photo.png"} && max_bytes > 0,
+                "The provider receives one required reference and a data byte budget");
+          ++fixture->reads;
+          if (fixture->read_error) {
+            co_return IoResult<ClipboardAttachments>::Failure(*fixture->read_error);
+          }
+          co_return IoResult<ClipboardAttachments>::Success(ClipboardAttachments{});
+        },
+    }));
+    controller = editor;
+    return Column {
+      Button("Paste as plain text").OnClick([editor, clipboard, focus] {
+        Check(clipboard->WriteText("Plain🙂") && focus.RequestFocus() && editor.PastePlainText(),
+              "Start plain paste from the command without an intervening key event");
+      }),
+      RichEditor(editor, {.clipboard_attachments = provider.Get()})
+          .On<RichEditorEvents::ClipboardWriteFailed>([fixture](const ClipboardWriteFailure& failure) {
+            fixture->failures.push_back(failure);
+          })
+          .With(focus, Grow(), Semantics{.identifier = "paste-target"}),
+    }.With(CrossAlign(CrossAxisAlignment::Stretch));
+  }, {.show_debug_overlay = false, .application_hooks = {[fixture](ApplicationContext& context) {
+    context.Provide(fixture);
+  }}});
+  UiTest ui(app);
+  const auto target = ui.FindSemantics(UiSemanticSelector::Identifier("paste-target"));
+  const auto text = [&] { return controller->Document().Blocks().front().Data().text; };
+  ui.Find(UiSelector::Text("Paste as plain text")).Tap();
+  ui.Pump();
+  Check(text() == "Plain🙂", "The plain-paste command inserts clipboard text");
+
+  ui.PressKey(Key::A, {.control = true});
+  Check(controller->Execute(ToggleMark{Mark::Bold}) &&
+            controller->Execute(SetLink{"https://example.org"}),
+        "Style the destination for plain paste");
+  Accept(ui, {{.kind = TextInputCommandKind::SetSelection, .selection_after = TextSelection{1, 1}}});
+  ui.PressKey(Key::V, {.shift = true, .control = true});
+  const auto plain = controller->Document();
+  const auto& paragraph = plain.Blocks().front().Data();
+  Check(paragraph.text == "PPlain🙂lain🙂" &&
+            std::ranges::none_of(paragraph.marks, [](const MarkRange& mark) {
+              return mark.range.start < 8 && mark.range.end > 1;
+            }) &&
+            std::ranges::none_of(paragraph.links, [](const LinkRange& link) {
+              return link.range.start < 8 && link.range.end > 1;
+            }), "Plain paste inserts unformatted text even inside a styled link");
+  Check(controller->Execute(Undo{}) && text() == "Plain🙂", "One undo removes the plain paste");
+
+  ui.PressKey(Key::A, {.control = true});
+  ui.PressKey(Key::X, {.control = true});
+  const auto failure = [&](std::size_t count, Reason expected) {
+    return fixture->failures.size() == count && fixture->failures.back().action == TextEditingAction::Cut &&
+           fixture->failures.back().reason == expected;
+  };
+  Check(failure(1, Reason::PublicationRejected), "Cut reports a rejected rich publication");
+  Check(text() == "Plain🙂", "A rejected rich clipboard write leaves cut text in the document");
+  ui.PressKey(Key::C, {.control = true});
+  ui.Pump();
+  ui.PressKey(Key::End);
+  ui.PressKey(Key::V, {.shift = true, .control = true});
+  Check(text() == "Plain🙂Plain🙂", "The plain-paste shortcut uses the retained selection");
+  Check(controller->Execute(Undo{}) && text() == "Plain🙂", "One undo removes the pasted text");
+
+  ui.SendKey({.type = KeyEventType::Down, .key = Key::V, .modifiers = {.control = true}});
+  controller->ReplaceDocument(RichDocument::Create({Block(BlockData{.text = "New document"})}));
+  ui.Pump();
+  Check(text() == "New document" && target.Exists(), "A queued paste cannot modify a replacement document");
+
+  ui.PressKey(Key::A, {.control = true});
+  ui.PressKey(Key::X, {.control = true});
+  Check(text().empty() && failure(1, Reason::PublicationRejected),
+        "A text-only platform can cut an unformatted selection");
+  ui.PressKey(Key::V, {.control = true});
+  Check(text() == "New document", "Plain clipboard cut can be pasted");
+
+  const auto image = RichDocument::Create({Block(BlockData{
+      .kind = BlockKind::Image, .image = ImageBlockData{"attachments/photo.png", "Photo", ""},
+  })});
+  controller->ReplaceDocument(image);
+  ui.Pump();
+  ui.PressKey(Key::A, {.control = true});
+  ui.PressKey(Key::X, {.control = true});
+  Check(failure(2, Reason::AttachmentUnavailable) && fixture->reads == 1 && controller->Document() == image,
+        "Cut rejects an incomplete successful provider result");
+  fixture->read_error = IoError{IoErrorCode::TooLarge, "Attachment exceeds its byte budget"};
+  ui.PressKey(Key::X, {.control = true});
+  Check(failure(3, Reason::TooLarge) && fixture->reads == 2 && controller->Document() == image,
+        "An over-budget attachment reports a distinct failure and leaves the source intact");
+}
+
 void TaskCheckboxInteraction() {
   const Application app(App, {.show_debug_overlay = false});
   UiTest ui(app, {.viewport = {340.0F, 380.0F}});
@@ -2735,6 +2841,8 @@ int main() {
     Workflow();
     controller.reset();
     ReadOnlyEditing();
+    controller.reset();
+    ClipboardCommands();
     controller.reset();
     ReplaceTextRanges();
     controller.reset();

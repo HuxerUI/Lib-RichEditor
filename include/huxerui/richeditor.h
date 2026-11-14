@@ -21,6 +21,7 @@
 
 #include <huxerui/file.h>
 #include <huxerui/event.h>
+#include <huxerui/richeditor/clipboard.h>
 #include <huxerui/richeditor/document.h>
 #include <huxerui/richeditor/extension.h>
 #include <huxerui/richeditor/style.h>
@@ -265,11 +266,13 @@ struct DocumentFragment {
   bool trailing_partial = false;
 };
 
-/// @brief Inserts a rich fragment at the caret or replaces a selection within one paragraph or heading.
+/// @brief Inserts a rich fragment at the caret or replaces a selection in text blocks.
 ///
-/// A single paragraph or heading contributes its inline contents to the destination block. Other fragments
-/// require a top-level paragraph or heading as the destination. Paste assigns new identities to inserted
-/// objects and records one undo entry. The command is unavailable during IME preedit.
+/// A single paragraph or partial heading contributes its inline contents to the destination block.
+/// A complete heading keeps its level at the document root. Structural fragments and selections spanning
+/// several text blocks require top-level endpoints and respect protected table boundaries. A selected
+/// atomic block can be replaced. Paste assigns new identities to inserted objects and records one undo entry.
+/// The command is unavailable during IME preedit.
 struct InsertFragment {
   DocumentFragment fragment; ///< Rich clipboard value to insert.
 };
@@ -340,10 +343,16 @@ struct RichEditorOptions {
   /// or function key. Shift can participate. Text entry, navigation, clipboard, and contextual Enter keys
   /// retain their usual behavior. Changing the map keeps the document, selection, IME, and undo history.
   std::shared_ptr<const EditorKeymap> keymap{};
+  /// Transfers local attachments between document storage contexts when the platform supports it.
+  std::shared_ptr<const ClipboardAttachmentProvider> clipboard_attachments{};
 };
 
 /// @brief Typed events emitted by the mounted RichEditor view.
 struct RichEditorEvents {
+  /// Emitted when a requested copy or cut cannot be published to the system clipboard.
+  /// The failure is borrowed for the callback. Copy it to retain the action and reason.
+  struct ClipboardWriteFailed : Event<void(const ClipboardWriteFailure&)> {};
+
   /// @brief Requests navigation after a primary Control-click or Command-click on linked text.
   ///
   /// Subscribe with View::On() and return true to handle the click while preserving the editor selection.
@@ -485,6 +494,13 @@ public:
   /// paragraphs. Calls in composition observe selection and editing changes.
   /// @return A rich fragment, or an empty value for a collapsed selection or during IME preedit.
   std::optional<DocumentFragment> SelectedFragment() const;
+
+  /// @brief Starts an editable mounted view's plain-text paste from a user action.
+  /// Call on the application thread from a user action while the editor owns focus. If invoked from
+  /// a menu, restore the editor's focus first.
+  /// @return True when the clipboard read starts. Insertion is asynchronous and requires readable plain
+  /// text and the same focused, editable document and selection when the result arrives.
+  bool PastePlainText() const;
 
   /// @brief Resolves a vertical position against the mounted editor's committed layout.
   /// Calls in composition observe viewport movement, layout changes and explicitly aligned reveals.

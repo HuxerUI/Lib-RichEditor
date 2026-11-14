@@ -397,7 +397,7 @@ View LinkTool(RichEditorController editor, ViewHandle focus, bool available, boo
             MenuItem(l10n::copy_link, [clipboard, toast, target = current->target] {
               const bool copied = clipboard->WriteText(target);
               toast.Show(copied ? l10n::link_copied : l10n::link_copy_failed);
-            }).Enabled(clipboard && clipboard->IsAvailable() && !current->target.empty()),
+            }).Enabled(clipboard && clipboard->SupportsSynchronousText() && !current->target.empty()),
             MenuItem(l10n::remove_link, [editor, focus] {
               if (editor.Execute(SetLink{})) {
                 focus.RequestFocus();
@@ -842,8 +842,14 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
   const auto background = Background(theme.colors.surface);
   const auto more_tool = menu_tool(more, compact && image_selected ? l10n::image_actions : l10n::more_formatting,
                                   more_anchor, true, false, [=] {
+    auto paste_plain_text = MenuItem(l10n::paste_plain_text, [editor, focus] {
+      if (focus.RequestFocus()) {
+        editor.PastePlainText();
+      }
+    }).Enabled(available && !editor.IsReadOnly());
     if (compact && image_selected) {
-      menu.Show(more_anchor, {command_item(l10n::redo, Redo{}), MenuSection{}, command_item(l10n::delete_image, DeleteImage{})});
+      menu.Show(more_anchor, {command_item(l10n::redo, Redo{}), std::move(paste_plain_text), MenuSection{},
+                              command_item(l10n::delete_image, DeleteImage{})});
       return;
     }
     std::vector<MenuEntry> items;
@@ -856,6 +862,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     if (compact) {
       items.emplace_back(command_item(l10n::redo, Redo{}));
     }
+    items.emplace_back(std::move(paste_plain_text));
     if (!in_table && !in_code && editor.GetCommandState(continue_in_paragraph).enabled) {
       items.emplace_back(command_item(l10n::continue_in_plain_paragraph, continue_in_paragraph));
     }
@@ -921,7 +928,8 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     } else if (formula_selected) {
       context = "formula";
       actions.Add(text_tool(l10n::edit_formula, l10n::edit_formula, true, edit_formula));
-      actions.Add(text_tool(l10n::copy_latex, l10n::copy_latex, clipboard && clipboard->IsAvailable(), copy_formula));
+      actions.Add(text_tool(l10n::copy_latex, l10n::copy_latex,
+                            clipboard && clipboard->SupportsSynchronousText(), copy_formula));
     } else {
       if (continue_below) {
         actions.Add(continue_below);
@@ -1005,7 +1013,7 @@ View FormattingBar(RichEditorController editor, ViewHandle focus, bool available
     if (formula_selected) {
       menu.Show(formula_anchor, {
           MenuItem(l10n::edit_formula_menu, edit_formula),
-          MenuItem(l10n::copy_latex, copy_formula).Enabled(clipboard && clipboard->IsAvailable()),
+          MenuItem(l10n::copy_latex, copy_formula).Enabled(clipboard && clipboard->SupportsSynchronousText()),
       });
     } else {
       menu.Show(formula_anchor, {
@@ -1239,11 +1247,27 @@ View EditorPane(RichEditorController editor, EditorPaneOptions options) {
                      .custom_blocks = {{std::string(latex_type), FormulaRenderer()}},
                      .inline_objects = {InlineFormulaExtension()}},
       .keymap = settings->Bindings()->editor,
+      .clipboard_attachments = std::move(options.clipboard_attachments),
   }).On<RichEditorEvents::LinkActivated>([toast, open_document = options.open_document_link](const LinkRange& link) {
     return OpenLink(link.target, open_document, toast);
   }).On<RichEditorEvents::InlineObjectActivated>([=](const InlineObjectSelection& object) {
     if (!editor.IsReadOnly() && object.data.type == latex_type && object.data.version == 1) {
       dialog.Show(FormulaDialog, editor, FormulaRequest{.inline_math = true, .object = object});
+    }
+  }).On<RichEditorEvents::ClipboardWriteFailed>([toast](const ClipboardWriteFailure& failure) {
+    switch (failure.reason) {
+    case ClipboardWriteFailureReason::AttachmentUnavailable:
+      toast.Show(l10n::clipboard_attachment_unavailable);
+      break;
+    case ClipboardWriteFailureReason::TooLarge:
+      toast.Show(l10n::clipboard_selection_too_large);
+      break;
+    case ClipboardWriteFailureReason::UnsupportedFormat:
+      toast.Show(l10n::clipboard_cut_unsupported);
+      break;
+    case ClipboardWriteFailureReason::PublicationRejected:
+      toast.Show(failure.action == TextEditingAction::Cut ? l10n::clipboard_cut_failed : l10n::clipboard_write_failed);
+      break;
     }
   }).With(focus, Grow(), Enabled(options.available),
           Semantics{.label = l10n::document_editor, .identifier = "article-editor"}).Key("editor");

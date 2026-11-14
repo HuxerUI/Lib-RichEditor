@@ -68,6 +68,7 @@ public:
   std::uint64_t Observe() const { return changed_.Get(); }
 
   bool Apply(std::span<const TextInputCommand> commands);
+  bool PasteText(TextRange range, std::string_view text, bool plain_only);
   bool Select(TextSelection selection);
   bool BreakLine(bool hard_break);
   /// Reports whether a structural Backspace action consumed the key at the start of the block.

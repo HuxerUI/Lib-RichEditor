@@ -780,7 +780,7 @@ EditResult InsertParagraphAtAtomicBlock(const RichDocument& document, TextOffset
 }
 
 EditResult ReplaceText(const RichDocument& document, TextRange range, std::string_view input,
-                       std::optional<Mark> marks, bool hard_break, EditChanges& edit) {
+                       std::optional<Mark> marks, bool hard_break, EditChanges& edit, bool inherit_link) {
   if (!range.IsValid() || input.find('\0') != input.npos) {
     throw std::invalid_argument("Invalid text replacement");
   }
@@ -806,7 +806,7 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
       return {document, range.start};
     }
     auto opened = InsertParagraphAtAtomicBlock(document, range.start, edit);
-    auto result = ReplaceText(opened.document, {opened.caret, opened.caret}, text, marks, hard_break, edit);
+    auto result = ReplaceText(opened.document, {opened.caret, opened.caret}, text, marks, hard_break, edit, inherit_link);
     result.leading_separator = opened.leading_separator;
     result.trailing_separator = opened.trailing_separator;
     return result;
@@ -818,7 +818,8 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
             range.start + leading, leading, has_next ? -1 : 0};
   }
 
-  if (!head_atomic && first == last && DocumentAccess::Body(head).TextInRange({start.offset, finish.offset}) == text &&
+  if (inherit_link && !head_atomic && first == last &&
+      DocumentAccess::Body(head).TextInRange({start.offset, finish.offset}) == text &&
       std::ranges::none_of(head.Data().inline_objects, [&](const InlineObject& object) {
         return object.offset >= start.offset && object.offset < finish.offset;
       })) {
@@ -840,7 +841,7 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
 
   const Mark inserted_marks = marks.value_or(range.IsCollapsed() ? MarksAt(document, range.start) : MarkAt(head, start.offset));
   const LinkRange* link = nullptr;
-  if (first == last) {
+  if (inherit_link && first == last) {
     for (const auto& candidate : head.Data().links) {
       if (candidate.range.start < start.offset && finish.offset < candidate.range.end) {
         link = &candidate;
@@ -872,6 +873,9 @@ EditResult ReplaceText(const RichDocument& document, TextRange range, std::strin
   }
   blocks.push_back(blocks.empty() ? DocumentAccess::WithData(head, std::move(builder.data))
                                  : Block(std::move(builder.data)));
+  if (!inherit_link && first == last && blocks.size() == 1 && blocks.front().Data() == head.Data()) {
+    return {document, range.start + inserted_length};
+  }
 
   edit.Touch(head);
   Replacements replacements{{start.block, std::move(blocks)}};
@@ -1080,6 +1084,16 @@ void AppendFreshText(LeafBuilder& builder, const Block& block) {
   builder.AppendSlice(block, {0, DocumentAccess::Body(block).Length()}, true);
 }
 
+bool PasteInline(const DocumentFragment& fragment, const Leaf& destination) {
+  const auto blocks = fragment.content.Blocks();
+  if (blocks.size() != 1) {
+    return false;
+  }
+  const auto kind = blocks.front().Data().kind;
+  return kind == BlockKind::Paragraph || (kind == BlockKind::Heading &&
+      (fragment.leading_partial || fragment.trailing_partial || destination.path.size() > 1));
+}
+
 } // namespace
 
 DocumentFragment CopyFragment(const RichDocument& document, TextRange range) {
@@ -1093,71 +1107,98 @@ DocumentFragment CopyFragment(const RichDocument& document, TextRange range) {
 }
 
 bool CanInsertFragment(const RichDocument& document, TextRange range, const DocumentFragment& fragment) {
-  if (!CanInsertInlineObject(document, range)) {
+  const auto& index = DocumentAccess::Get(document).index;
+  const auto first = index.AtOffset(range.start).ordinal;
+  const auto last = index.AtOffset(range.end).ordinal;
+  const auto start = index.At(first);
+  const auto end = index.At(last);
+  if (first == last && IsAtomicBlock(start.block.Data().kind)) {
+    return start.path.size() == 1 || PasteInline(fragment, start);
+  }
+  if (!InlineText(start.block.Data().kind) || !InlineText(end.block.Data().kind)) {
     return false;
   }
-  const auto blocks = fragment.content.Blocks();
-  if (blocks.size() == 1 && InlineText(blocks.front().Data().kind)) {
-    const auto target = DocumentAccess::Get(document).index.AtOffset(range.start);
-    return target.block.Data().kind != BlockKind::Heading || blocks.front().Data().text.find('\n') == std::string::npos;
+  const bool top_level = start.path.size() == 1 && end.path.size() == 1;
+  if (first != last && (!top_level || !CanEditTextRange(document, range))) {
+    return false;
   }
-  return DocumentAccess::Get(document).index.At(LeafIndex(document, range.start)).path.size() == 1;
+  if (PasteInline(fragment, start)) {
+    return true;
+  }
+  return top_level;
 }
 
 EditResult PasteFragment(const RichDocument& document, TextRange range, const DocumentFragment& fragment,
                          EditChanges& edit) {
-  const auto leaf = DocumentAccess::Get(document).index.At(LeafIndex(document, range.start));
-  const auto local = LocalRange(leaf, range);
-  const auto length = DocumentAccess::Body(leaf.block).Length();
+  const auto& index = DocumentAccess::Get(document).index;
+  const auto head = index.At(index.AtOffset(range.start).ordinal);
+  const auto tail = index.At(index.AtOffset(range.end).ordinal);
+  const TextRange remaining{range.end - tail.start, DocumentAccess::Body(tail.block).Length()};
   const auto content = fragment.content.Blocks();
+  auto slot = ParentSlot(head.path);
+  slot.last = tail.path.back();
+  const bool atomic = IsAtomicBlock(head.block.Data().kind);
+  auto prefix = atomic ? LeafBuilder{} : ForTextBlock(head.block);
+  if (!atomic) {
+    prefix.AppendSlice(head.block, {0, range.start - head.start});
+  }
+
+  if (!atomic && PasteInline(fragment, head)) {
+    const auto& text = content.front().Data().text;
+    if (prefix.data.kind == BlockKind::Heading && (text.find('\n') != text.npos ||
+        DocumentAccess::Body(tail.block).TextInRange(remaining).find('\n') != std::string::npos)) {
+      prefix.data.kind = BlockKind::Paragraph;
+      prefix.data.heading_level = 0;
+    }
+    AppendFreshText(prefix, content.front());
+    const auto caret = head.start + prefix.length;
+    prefix.AppendSlice(tail.block, remaining);
+    if (slot.first == slot.last && prefix.data == head.block.Data()) {
+      return {document, caret};
+    }
+    auto block = DocumentAccess::WithData(head.block, std::move(prefix.data));
+    return {Splice(document, slot, {std::move(block)}, edit), caret};
+  }
+
   std::vector<Block> incoming;
   incoming.reserve(content.size());
   for (const auto& block : content) {
     incoming.push_back(FreshFragmentBlock(block));
   }
-  auto prefix = ForTextBlock(leaf.block);
-  prefix.AppendSlice(leaf.block, {0, local.start});
-  if (incoming.size() == 1 && InlineText(incoming.front().Data().kind)) {
-    AppendFreshText(prefix, content.front());
-    const auto caret = leaf.start + prefix.length;
-    prefix.AppendSlice(leaf.block, {local.end, length});
-    if (prefix.data == leaf.block.Data()) {
-      return {document, caret};
-    }
-    auto block = DocumentAccess::WithData(leaf.block, std::move(prefix.data));
-    return {Splice(document, ParentSlot(leaf.path), {std::move(block)}, edit), caret};
-  }
-
-  const auto root = leaf.path.front();
   std::vector<Block> replacement;
-  if (fragment.leading_partial && InlineText(incoming.front().Data().kind) &&
+  if (!atomic && fragment.leading_partial && InlineText(incoming.front().Data().kind) &&
       (prefix.data.kind != BlockKind::Heading || incoming.front().Data().text.find('\n') == std::string::npos)) {
     AppendFreshText(prefix, content.front());
-    incoming.front() = DocumentAccess::WithData(leaf.block, std::move(prefix.data));
+    incoming.front() = DocumentAccess::WithData(head.block, std::move(prefix.data));
+  } else if (atomic && range.IsCollapsed() && range.start != head.start) {
+    replacement.push_back(head.block);
   } else if (prefix.length != 0) {
-    replacement.push_back(DocumentAccess::WithData(leaf.block, std::move(prefix.data)));
+    replacement.push_back(DocumentAccess::WithData(head.block, std::move(prefix.data)));
   }
-  const auto inserted_end = root + replacement.size() + incoming.size() - 1;
+  const auto inserted_end = slot.first + replacement.size() + incoming.size() - 1;
   replacement.insert(replacement.end(), std::make_move_iterator(incoming.begin()), std::make_move_iterator(incoming.end()));
   TextOffset suffix_length = 0;
-  if (local.end < length) {
+  if (atomic && range.IsCollapsed() && range.start == head.start) {
+    replacement.push_back(head.block);
+  } else if (!atomic && !remaining.IsCollapsed()) {
     if (fragment.trailing_partial && InlineText(replacement.back().Data().kind) &&
         (replacement.back().Data().kind != BlockKind::Heading ||
-         DocumentAccess::Body(leaf.block).TextInRange({local.end, length}).find('\n') == std::string::npos)) {
+         DocumentAccess::Body(tail.block).TextInRange(remaining).find('\n') == std::string::npos)) {
       auto suffix = ForTextBlock(replacement.back());
       AppendFreshText(suffix, content.back());
-      suffix.AppendSlice(leaf.block, {local.end, length});
+      suffix.AppendSlice(tail.block, remaining);
       replacement.back() = Block(std::move(suffix.data));
-      suffix_length = length - local.end;
+      suffix_length = remaining.Length();
     } else {
-      auto suffix = ForTextBlock(leaf.block);
-      suffix.AppendSlice(leaf.block, {local.end, length});
+      auto suffix = ForTextBlock(tail.block);
+      suffix.AppendSlice(tail.block, remaining);
       replacement.emplace_back(std::move(suffix.data));
     }
   }
-  auto next = Splice(document, ParentSlot(leaf.path), std::move(replacement), edit);
+  auto next = Splice(document, slot, std::move(replacement), edit);
   Selection caret;
-  SelectBlock(caret, next.Blocks()[inserted_end], true);
+  SelectBlock(caret, slot.parent.empty() ? next.Blocks()[inserted_end]
+                                       : BlockAt(next, slot.parent).Data().children[inserted_end], true);
   return {next, Absolute(next, caret.active) - suffix_length};
 }
 

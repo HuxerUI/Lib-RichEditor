@@ -24,6 +24,7 @@ struct EditorViewport {
   using PointerInputHandler = std::function<void(const PointerEvent&)>;
   using RevealTextHandler = std::function<bool(const RichDocument&, TextRange, std::optional<ScrollAlignment>)>;
   using ViewportLocationHandler = std::function<std::optional<EditorViewportLocation>(const RichDocument&, float)>;
+  using PastePlainTextHandler = std::function<bool()>;
 
   struct Geometry {
     ScrollMetrics scroll;
@@ -59,6 +60,9 @@ struct EditorViewport {
   std::weak_ptr<RevealTextHandler> reveal_text;
   State<Geometry> geometry{Geometry{}};
   std::weak_ptr<ViewportLocationHandler> viewport_location;
+  std::weak_ptr<PastePlainTextHandler> paste_plain_text;
+  std::shared_ptr<Clipboard> clipboard;
+  TaskScope clipboard_tasks;
 };
 
 } // namespace huxerui::richeditor::detail

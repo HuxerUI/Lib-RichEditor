@@ -4,6 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include <huxerui/app.h>
 #include <huxerui/clipboard.h>
 #include <huxerui/gesture.h>
 #include <huxerui/lifecycle.h>
@@ -14,6 +15,7 @@
 
 #include "code_highlighting.h"
 #include "decoration_analysis.h"
+#include "editor_clipboard.h"
 #include "editor_layout.h"
 #include "editor_session.h"
 #include "editor_view_internal.h"
@@ -70,14 +72,24 @@ bool LinkActivationModifier(KeyModifiers modifiers) {
   return (modifiers.control || modifiers.meta) && !modifiers.shift && !modifiers.alt;
 }
 
-class EditorClient final : public TextInputClient, public TextSelectionClient {
+class EditorClient final : public TextInputClient, public TextSelectionClient,
+                           public std::enable_shared_from_this<EditorClient> {
 public:
-  EditorClient(std::shared_ptr<EditorSession> editor, ScrollController scroll,
-               std::shared_ptr<const EditorKeymap> keymap)
-      : editor_(std::move(editor)), scroll_(std::move(scroll)), keymap_(std::move(keymap)),
-        generation_(editor_->Generation()) {}
+  EditorClient(ViewNode& node, std::shared_ptr<EditorSession> editor, const std::shared_ptr<EditorViewport>& viewport,
+               std::shared_ptr<const EditorKeymap> keymap,
+               std::function<void(const ClipboardWriteFailure&)> clipboard_write_failed)
+      : editor_(std::move(editor)), scroll_(viewport->scroll), keymap_(std::move(keymap)),
+        generation_(editor_->Generation()), node_(&node), viewport_(viewport),
+        clipboard_write_failed_(std::move(clipboard_write_failed)) {}
 
   void SetKeymap(std::shared_ptr<const EditorKeymap> keymap) { keymap_ = std::move(keymap); }
+  void SetClipboardAttachments(std::shared_ptr<const ClipboardAttachmentProvider> provider) {
+    if (clipboard_attachments_ != provider) {
+      clipboard_attachments_ = std::move(provider);
+      InvalidateClipboardRequest();
+    }
+  }
+  void InvalidateClipboardRequest() { ++clipboard_request_; }
   EditorSession& Editor() const { return *editor_; }
   bool Current() const { return generation_ == editor_->Generation(); }
   bool HasGeometry() const { return Current() && layout_.IsCurrent(editor_->VisibleDocument()); }
@@ -89,7 +101,10 @@ public:
       GeometryChanged();
     }
   }
-  void Detach() { layout_ = {}; }
+  void Detach() {
+    node_ = nullptr;
+    layout_ = {};
+  }
   void SetBlockControlActive(bool active) {
     if (active) {
       block_control_ = BlockControl{editor_->SelectionOffsets(), editor_->ContentRevision()};
@@ -133,6 +148,7 @@ public:
 
   void EndTextInput(TextInputSessionId id, TextInputEndReason) override {
     if (id == session_) {
+      InvalidateClipboardRequest();
       if (Current()) {
         editor_->FinishComposition();
       }
@@ -266,53 +282,26 @@ public:
     return DocumentAccess::Get(document).index.At(ordinal).start + found->offset;
   }
 
-  bool CanPerformTextEditingAction(TextEditingAction action, PlatformClipboard* clipboard) const override {
+  TextEditingActionStatus GetTextEditingActionStatus(TextEditingAction action, const Clipboard&) const override {
     if (!Current()) {
-      return false;
+      return TextEditingActionStatus::Disabled;
+    }
+    if (action == TextEditingAction::SelectAll) {
+      return editor_->CommandStatus(SelectAll{}).enabled ? TextEditingActionStatus::Handle
+                                                         : TextEditingActionStatus::Disabled;
     }
     const auto range = editor_->SelectionOffsets().Range();
-    if (action == TextEditingAction::SelectAll) {
-      return editor_->CommandStatus(SelectAll{}).enabled;
+    if ((action != TextEditingAction::Paste && range.IsCollapsed()) ||
+        (action != TextEditingAction::Copy && editor_->IsReadOnly()) ||
+        (action == TextEditingAction::Cut && editor_->CompositionRange()) ||
+        (action != TextEditingAction::Copy && !CanEditTextRange(editor_->VisibleDocument(), range))) {
+      return TextEditingActionStatus::Disabled;
     }
-    if (!clipboard) {
-      return false;
-    }
-    if (action == TextEditingAction::Copy) {
-      return !range.IsCollapsed();
-    }
-    if (editor_->IsReadOnly() || !CanEditTextRange(editor_->VisibleDocument(), range)) {
-      return false;
-    }
-    return action == TextEditingAction::Paste || !range.IsCollapsed();
+    return TextEditingActionStatus::Handle;
   }
 
-  bool PerformTextEditingAction(TextEditingAction action, PlatformClipboard* clipboard) override {
-    if (!CanPerformTextEditingAction(action, clipboard)) {
-      return false;
-    }
-    if (action == TextEditingAction::SelectAll) {
-      return editor_->Execute(SelectAll{});
-    }
-    const auto selected = editor_->SelectionOffsets().Range();
-    std::string text;
-    if (action == TextEditingAction::Paste) {
-      auto source = clipboard->ReadText();
-      if (!source) {
-        return false;
-      }
-      text = std::move(*source);
-    } else {
-      if (!clipboard->WriteText(PlainTextSlice(editor_->VisibleDocument(), selected))) {
-        return false;
-      }
-      if (action == TextEditingAction::Copy) {
-        return true;
-      }
-    }
-    editor_->FinishComposition();
-    const TextInputCommand command{.kind = TextInputCommandKind::CommitText, .target = selected, .text = std::move(text)};
-    return editor_->Apply(std::span(&command, 1));
-  }
+  void PerformTextEditingAction(TextEditingAction action, const Clipboard&) override;
+  bool PasteFromClipboard(bool plain_only);
 
   bool ClearSelection() override {
     // Dismiss the window's touch overlay while keeping the logical range available to an external toolbar.
@@ -324,6 +313,13 @@ public:
       return false;
     }
     const auto hit = Hit(point);
+    const auto& document = editor_->VisibleDocument();
+    const auto leaf = DocumentAccess::Get(document).index.AtOffset(hit.offset);
+    const auto* atomic = layout_.Rows()[leaf.ordinal].AtomicBounds();
+    if (atomic && atomic->Contains(ContentPoint(point))) {
+      editor_->Select({leaf.start, leaf.start + 1, hit.affinity});
+      return true;
+    }
     const auto object = InlineAt(point);
     const auto range = object ? TextRange{*object, *object + 1} : WordAt(hit.offset);
     editor_->Select({range.start, range.end, hit.affinity});
@@ -353,7 +349,7 @@ public:
     if (!Current()) {
       return std::nullopt;
     }
-    if (!HasGeometry() || editor_->SelectedAtomicBlock()) {
+    if (!HasGeometry()) {
       return TextSelectionGeometry{};
     }
     const auto& document = editor_->VisibleDocument();
@@ -369,6 +365,10 @@ public:
       }
       return std::nullopt;
     };
+    if (const auto selected = editor_->SelectedAtomicBlock()) {
+      const auto* bounds = layout_.Rows()[*selected].AtomicBounds();
+      return TextSelectionGeometry{.toolbar_anchor = bounds ? visible(*bounds) : std::nullopt};
+    }
     const auto caret = [&](TextPosition position) -> std::optional<Rect> {
       const auto rect = layout_.Caret(document, position);
       const auto& row = layout_.Rows()[LeafIndex(document, position.offset)];
@@ -397,6 +397,37 @@ public:
   TextInputKeyResult HandleTextKey(const KeyEvent& event) override;
 
 private:
+  struct ClipboardEdit {
+    std::uint64_t request;
+    std::uint64_t revision;
+    TextRange range;
+    TextEditingAction action;
+  };
+
+  ClipboardEdit BeginClipboardEdit(TextEditingAction action) {
+    return {++clipboard_request_, editor_->Revision(), editor_->SelectionOffsets().Range(), action};
+  }
+  bool Active() const { return node_ && node_->IsEnabled() && node_->IsFocused() && Current(); }
+  bool ClipboardRequestCurrent(const ClipboardEdit& edit) const {
+    return node_ && clipboard_request_ == edit.request;
+  }
+  bool ClipboardEditCurrent(const ClipboardEdit& edit) const {
+    return Active() && ClipboardRequestCurrent(edit) && editor_->Revision() == edit.revision;
+  }
+  bool ClipboardWriteCurrent(const ClipboardEdit& edit) const {
+    return edit.action == TextEditingAction::Cut ? ClipboardEditCurrent(edit) && !editor_->IsReadOnly()
+                                                 : ClipboardRequestCurrent(edit);
+  }
+  void ReplaceClipboardSelection(TextRange range, std::string text, bool plain_only = false);
+  void StartClipboardWrite(TextEditingAction action);
+  static Task<void> WriteWithAttachments(std::shared_ptr<EditorClient> self, std::shared_ptr<Clipboard> clipboard,
+                                         ClipboardEdit edit, std::vector<std::string> references,
+                                         std::size_t byte_budget, ClipboardItem item, Bytes payload);
+  static Task<void> FinishClipboardWrite(std::shared_ptr<EditorClient> self, std::shared_ptr<Clipboard> clipboard,
+                                         ClipboardEdit edit, ClipboardItem fallback, Task<bool> operation);
+  static Task<void> FinishClipboardPaste(std::shared_ptr<EditorClient> self, ClipboardEdit edit, bool plain_only,
+                                         Task<IoResult<ClipboardItem>> operation);
+
   // Language changes and popup focus restoration leave this editing position intact.
   struct BlockControl {
     TextSelection selection;
@@ -429,12 +460,239 @@ private:
   std::uint64_t generation_;
   std::uint64_t geometry_revision_ = 0;
   TextInputSessionId session_ = 0;
+  ViewNode* node_;
+  std::weak_ptr<EditorViewport> viewport_;
+  std::shared_ptr<const ClipboardAttachmentProvider> clipboard_attachments_;
+  std::function<void(const ClipboardWriteFailure&)> clipboard_write_failed_;
+  std::uint64_t clipboard_request_ = 0;
   std::optional<float> preferred_x_;
   bool wait_for_body_press_ = false;
   Point viewport_origin_{};
   std::optional<BlockControl> block_control_;
   EditorLayout layout_;
 };
+
+void EditorClient::PerformTextEditingAction(TextEditingAction action, const Clipboard& clipboard) {
+  if (!Active() || GetTextEditingActionStatus(action, clipboard) != TextEditingActionStatus::Handle) {
+    return;
+  }
+  switch (action) {
+    case TextEditingAction::SelectAll:
+      InvalidateClipboardRequest();
+      editor_->Execute(SelectAll{});
+      break;
+    case TextEditingAction::Cut:
+    case TextEditingAction::Copy:
+      StartClipboardWrite(action);
+      break;
+    case TextEditingAction::Paste:
+      PasteFromClipboard(false);
+      break;
+  }
+}
+
+void EditorClient::ReplaceClipboardSelection(TextRange range, std::string text, bool plain_only) {
+  preferred_x_.reset();
+  editor_->PasteText(range, text, plain_only);
+}
+
+void EditorClient::StartClipboardWrite(TextEditingAction action) {
+  using Reason = ClipboardWriteFailureReason;
+  const auto viewport = viewport_.lock();
+  if (!viewport || !viewport->clipboard) {
+    return;
+  }
+  const auto& clipboard = viewport->clipboard;
+  const auto& tasks = viewport->clipboard_tasks;
+  const auto edit = BeginClipboardEdit(action);
+  const auto fragment = editor_->SelectedFragment();
+  auto plain = PlainTextSlice(editor_->VisibleDocument(), edit.range);
+  const bool plain_cut = action == TextEditingAction::Cut && fragment && IsPlainClipboardSelection(*fragment);
+  const bool can_write_fragment = SupportsClipboardFragmentWrite();
+  const bool oversized_text = plain.size() > clipboard_text_limit;
+  ClipboardItem item;
+  if (!oversized_text) {
+    item = plain_cut && !can_write_fragment ? ClipboardItem{.text = std::move(plain)}
+                                           : ClipboardRepresentations(std::move(plain), fragment);
+  }
+  auto failure = oversized_text ? Reason::TooLarge : Reason::UnsupportedFormat;
+  if (fragment && can_write_fragment) {
+    failure = Reason::TooLarge;
+    if (auto payload = EncodeClipboardFragment(*fragment)) {
+      auto references = ClipboardAttachmentReferences(fragment->content);
+      if (references.empty()) {
+        auto publication = item;
+        publication.custom_formats.emplace(fragment_clipboard_type, std::move(*payload));
+        auto operation = clipboard->WriteItemAsync(std::move(publication));
+        if (action == TextEditingAction::Cut) {
+          item.html.reset();
+          if (!plain_cut) {
+            item.text.reset();
+          }
+        }
+        tasks.Launch(FinishClipboardWrite(shared_from_this(), clipboard, edit, std::move(item), std::move(operation)));
+        return;
+      }
+#if !defined(__EMSCRIPTEN__)
+      if (const auto budget = ClipboardAttachmentBudget(payload->size(), references)) {
+        failure = Reason::AttachmentUnavailable;
+        if (clipboard_attachments_ && clipboard_attachments_->read) {
+          tasks.Launch(WriteWithAttachments(shared_from_this(), clipboard, edit, std::move(references),
+                                            *budget, std::move(item), std::move(*payload)));
+          return;
+        }
+      }
+#else
+      failure = Reason::UnsupportedFormat;
+#endif
+    }
+  }
+  if (!item.text || (action == TextEditingAction::Cut && !plain_cut)) {
+    clipboard_write_failed_({action, failure});
+    return;
+  }
+  if (plain_cut) {
+    item.html.reset();
+  }
+  ClipboardItem fallback{.text = item.html ? item.text : std::nullopt};
+  auto operation = clipboard->WriteItemAsync(std::move(item));
+  tasks.Launch(FinishClipboardWrite(shared_from_this(), clipboard, edit, std::move(fallback), std::move(operation)));
+}
+
+Task<void> EditorClient::WriteWithAttachments(std::shared_ptr<EditorClient> self, std::shared_ptr<Clipboard> clipboard,
+                                             ClipboardEdit edit, std::vector<std::string> references,
+                                             std::size_t byte_budget,
+                                             ClipboardItem item, Bytes payload) {
+  using Reason = ClipboardWriteFailureReason;
+  const bool cut = edit.action == TextEditingAction::Cut;
+  if (!self->ClipboardWriteCurrent(edit)) {
+    co_return;
+  }
+  const auto provider = self->clipboard_attachments_;
+  auto attachments = co_await provider->read(references, byte_budget);
+  if (!self->ClipboardWriteCurrent(edit)) {
+    co_return;
+  }
+  std::optional<Reason> failure;
+  if (!attachments.Succeeded()) {
+    failure = attachments.Error().code == IoErrorCode::TooLarge ? Reason::TooLarge : Reason::AttachmentUnavailable;
+  } else if (!HasAllClipboardAttachments(references, attachments.Value())) {
+    failure = Reason::AttachmentUnavailable;
+  } else if (!AppendClipboardAttachments(payload, attachments.Value())) {
+    failure = Reason::TooLarge;
+  }
+
+  if (failure) {
+    if (cut || !item.text) {
+      self->clipboard_write_failed_({edit.action, *failure});
+      co_return;
+    }
+    ClipboardItem fallback{.text = item.html ? item.text : std::nullopt};
+    auto operation = clipboard->WriteItemAsync(std::move(item));
+    co_await FinishClipboardWrite(self, clipboard, edit, std::move(fallback), std::move(operation));
+    co_return;
+  }
+
+  auto publication = item;
+  publication.custom_formats.emplace(fragment_clipboard_type, std::move(payload));
+  auto operation = clipboard->WriteItemAsync(std::move(publication));
+  co_await FinishClipboardWrite(self, clipboard, edit, cut ? ClipboardItem{} : std::move(item), std::move(operation));
+}
+
+Task<void> EditorClient::FinishClipboardWrite(std::shared_ptr<EditorClient> self, std::shared_ptr<Clipboard> clipboard,
+                                             ClipboardEdit edit, ClipboardItem fallback, Task<bool> operation) {
+  const bool cut = edit.action == TextEditingAction::Cut;
+  bool published = co_await std::move(operation);
+  if (!published && fallback.html && self->ClipboardWriteCurrent(edit)) {
+    ClipboardItem plain{.text = fallback.text};
+    published = co_await clipboard->WriteItemAsync(std::move(fallback));
+    fallback = std::move(plain);
+  }
+  if (!published && fallback.text && self->ClipboardWriteCurrent(edit)) {
+    published = co_await clipboard->WriteItemAsync(std::move(fallback));
+  }
+  if (!self->ClipboardWriteCurrent(edit)) {
+    co_return;
+  }
+  if (!published) {
+    self->clipboard_write_failed_({edit.action, ClipboardWriteFailureReason::PublicationRejected});
+  } else if (cut) {
+    self->ReplaceClipboardSelection(edit.range, {});
+  }
+}
+
+bool EditorClient::PasteFromClipboard(bool plain_only) {
+  const auto viewport = viewport_.lock();
+  if (!Active() || !viewport || !viewport->clipboard ||
+      GetTextEditingActionStatus(TextEditingAction::Paste, *viewport->clipboard) != TextEditingActionStatus::Handle) {
+    return false;
+  }
+  const auto edit = BeginClipboardEdit(TextEditingAction::Paste);
+  ClipboardReadOptions options{.html = !plain_only};
+  if (!plain_only) {
+    options.custom_mime_types.emplace_back(fragment_clipboard_type);
+  }
+  auto operation = viewport->clipboard->ReadItemAsync(std::move(options));
+  viewport->clipboard_tasks.Launch(FinishClipboardPaste(shared_from_this(), edit, plain_only, std::move(operation)));
+  return true;
+}
+
+Task<void> EditorClient::FinishClipboardPaste(std::shared_ptr<EditorClient> self, ClipboardEdit edit, bool plain_only,
+                                             Task<IoResult<ClipboardItem>> operation) {
+  auto clipboard = co_await std::move(operation);
+  if (!clipboard.Succeeded() || !self->ClipboardEditCurrent(edit) || self->editor_->IsReadOnly()) {
+    co_return;
+  }
+  auto& editor = *self->editor_;
+  auto& item = clipboard.Value();
+  if (!plain_only && !editor.CompositionRange()) {
+    const auto custom = item.custom_formats.find(fragment_clipboard_type);
+    if (custom != item.custom_formats.end()) {
+      if (auto decoded = DecodeClipboardFragment(custom->second);
+          decoded && CanInsertFragment(editor.VisibleDocument(), edit.range, decoded->fragment)) {
+        if (decoded->attachments.empty()) {
+          if (editor.Execute(InsertFragment{std::move(decoded->fragment)})) {
+            co_return;
+          }
+        } else if (const auto provider = self->clipboard_attachments_; provider && provider->stage) {
+          auto staged = co_await provider->stage(std::move(decoded->attachments));
+          if (!self->ClipboardEditCurrent(edit) || editor.IsReadOnly()) {
+            co_return;
+          }
+          if (staged.Succeeded()) {
+            auto fragment = RebaseClipboardFragment(std::move(decoded->fragment), staged.Value().DestinationReferences());
+            if (fragment && editor.Execute(InsertFragment{std::move(*fragment)})) {
+              staged.Value().Commit();
+              co_return;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!plain_only && item.html) {
+    auto styled = item.ToAttributedText();
+    if (styled.Succeeded() && styled.Value().Length() != 0) {
+      const bool has_formatting = !styled.Value().StyleRanges().empty() || !styled.Value().LinkRanges().empty();
+      if (!editor.CompositionRange() && has_formatting) {
+        try {
+          if (editor.Execute(InsertFragment{FragmentFromAttributedText(styled.Value())})) {
+            co_return;
+          }
+        } catch (const std::invalid_argument&) {
+          // The plain representation can still be used if the attributed value cannot form a document.
+        }
+      }
+      if (!has_formatting || !item.text || item.text->empty()) {
+        self->ReplaceClipboardSelection(edit.range, styled.Value().PlainText());
+        co_return;
+      }
+    }
+  }
+  if (item.text && !item.text->empty()) {
+    self->ReplaceClipboardSelection(edit.range, std::move(*item.text), plain_only);
+  }
+}
 
 TextOffset EditorClient::Adjacent(TextOffset offset, bool forward) const {
   const auto& document = editor_->VisibleDocument();
@@ -703,6 +961,7 @@ public:
     const bool read_only = editor_->IsReadOnly();
     const bool mode_changed = read_only != std::exchange(observed_read_only_, read_only);
     if (mode_changed) {
+      client_->InvalidateClipboardRequest();
       if (read_only) {
         resize_.reset();
         client_->WaitForBodyPress();
@@ -806,6 +1065,7 @@ public:
     blink_start_.reset();
     caret_visible_ = true;
     if (!focused) {
+      client_->InvalidateClipboardRequest();
       SetLinkHover(hover_pointer_, false);
     }
     InvalidatePaint();
@@ -870,6 +1130,8 @@ private:
   std::shared_ptr<EditorSession> editor_;
   std::shared_ptr<EditorViewport> viewport_;
   std::shared_ptr<const EditorKeymap> keymap_;
+  std::shared_ptr<const ClipboardAttachmentProvider> clipboard_attachments_;
+  std::shared_ptr<EditorViewport::PastePlainTextHandler> paste_plain_text_;
   std::shared_ptr<EditorViewport::ScrollInputHandler> scroll_input_;
   std::shared_ptr<EditorViewport::PointerInputHandler> pointer_input_;
   std::shared_ptr<EditorViewport::RevealTextHandler> reveal_text_;
@@ -904,13 +1166,16 @@ struct Surface {
   std::shared_ptr<EditorSession> editor;
   std::shared_ptr<EditorViewport> viewport;
   std::shared_ptr<const EditorKeymap> keymap;
+  std::shared_ptr<const ClipboardAttachmentProvider> clipboard_attachments;
   bool operator==(const Surface&) const = default;
 };
 
 void EditorExtension::Update(ViewNode& node, const Surface& surface) {
   keymap_ = surface.keymap;
+  clipboard_attachments_ = surface.clipboard_attachments;
   if (editor_ == surface.editor && viewport_ == surface.viewport) {
     client_->SetKeymap(keymap_);
+    client_->SetClipboardAttachments(clipboard_attachments_);
     return;
   }
   editor_ = surface.editor;
@@ -950,7 +1215,14 @@ void EditorExtension::ResetClient() {
   if (client_) {
     client_->Detach();
   }
-  client_ = std::make_shared<EditorClient>(editor_, viewport_->scroll, keymap_);
+  client_ = std::make_shared<EditorClient>(node_, editor_, viewport_, keymap_,
+      [this](const ClipboardWriteFailure& failure) { EmitEvent<RichEditorEvents::ClipboardWriteFailed>(failure); });
+  client_->SetClipboardAttachments(clipboard_attachments_);
+  paste_plain_text_ = std::make_shared<EditorViewport::PastePlainTextHandler>([client = std::weak_ptr(client_)] {
+    const auto editor = client.lock();
+    return editor && editor->PasteFromClipboard(true);
+  });
+  viewport_->paste_plain_text = paste_plain_text_;
   if (observed_read_only_ || editor_->IsReadOnly()) {
     client_->WaitForBodyPress();
   }
@@ -1843,6 +2115,8 @@ View EditorContent(std::shared_ptr<EditorSession> editor, std::shared_ptr<Editor
   const auto code_language_anchor = UseViewHandle();
   viewport->code_language_anchor = code_language_anchor;
   const auto tasks = UseTaskScope();
+  viewport->clipboard = UseApplication().Clipboard();
+  viewport->clipboard_tasks = tasks;
   ScheduleDecorations(editor, viewport, tasks, options.extensions.decorations);
   ScheduleInlineObjects(editor, viewport, tasks, options.document_directory);
   const auto generation = editor->Generation();
@@ -1918,6 +2192,7 @@ View EditorView(std::shared_ptr<EditorSession> editor, std::shared_ptr<EditorVie
                 RichEditorOptions options) {
   // Keep the text input owner outside the scroll node so the editor can reveal the caret only when needed.
   auto keymap = std::move(options.keymap);
+  auto clipboard_attachments = std::move(options.clipboard_attachments);
   const auto content = ScrollView(EditorContent(editor, viewport, std::move(options)))
       .Controller(viewport->scroll)
       .On<ViewEvents::ScrollInput>([viewport](const ScrollInputEvent& event) {
@@ -1930,10 +2205,20 @@ View EditorView(std::shared_ptr<EditorSession> editor, std::shared_ptr<EditorVie
         }
       })
       .With(ScrollBar(), Grow());
+  auto surface = Surface{std::move(editor), viewport, std::move(keymap), std::move(clipboard_attachments)};
   return Column {
     content,
-  }.With(CrossAlign(CrossAxisAlignment::Stretch), Focusable{},
-         Surface{std::move(editor), std::move(viewport), std::move(keymap)});
+  }.On<ViewEvents::KeyIntercept>([viewport = std::move(viewport)](const KeyEvent& event) {
+    const auto modifiers = event.modifiers;
+    if (event.type != KeyEventType::Down || event.key != Key::V || !modifiers.shift || modifiers.alt ||
+        !(modifiers.control || modifiers.meta)) {
+      return false;
+    }
+    if (const auto paste = viewport->paste_plain_text.lock(); paste && !event.repeat) {
+      (*paste)();
+    }
+    return true;
+  }).With(CrossAlign(CrossAxisAlignment::Stretch), Focusable{}, std::move(surface));
 }
 
 } // namespace

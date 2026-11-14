@@ -152,7 +152,11 @@ Use `InsertInlineObject` with application-defined object data or the result of `
 
 Register an `InlineObjectExtension` per type for custom async rendering. The renderer supplies an image or vector with baseline dimensions. A missing or unresolved renderer shows fallback text. The built-in inline image presentation uses the same resolver and document directory as image blocks.
 
-`SelectedFragment()` and `InsertFragment` provide rich clipboard primitives for application bridges. Copying part of a table returns the selected cell text as paragraphs. Pasting inline text preserves its marks, links and objects in a text block. Rich block fragments can be inserted in a top-level text block. The SDK's system clipboard service carries plain text.
+## Clipboard
+
+The focused editor handles copy, cut, and paste from keyboard shortcuts and the SDK's selection menu. A copy can carry plain text, HTML, and a RichEditor fragment in one system clipboard item. RichEditor tries the fragment first, then HTML, then plain text. HTML exchanges bold, italic, underline, strikethrough, links, and line breaks. Use Ctrl+Shift+V, Command+Shift+V, or `RichEditorController::PastePlainText()` to paste the plain representation.
+
+`SelectedFragment()` and `InsertFragment` are also available to applications. A complete table keeps its grid and a partial table selection contributes cell text as paragraphs. RichEditor records a paste as one undo entry. Supply a `ClipboardAttachmentProvider` in `RichEditorOptions::clipboard_attachments` to read the requested resources and stage their bytes in the destination. RichEditor applies the returned references, then commits the staged resources once insertion succeeds. A cut removes the selection only after a format that preserves its content has been published. `RichEditorEvents::ClipboardWriteFailed` reports the action and the reason for a failed publication.
 
 ## Formats
 
@@ -162,7 +166,7 @@ Text is UTF-8 with LF line endings. Mark and link ranges use half-open UTF-16 of
 
 Markdown import converts the Lib-Markdown syntax tree to editable content. The supported subset uses CommonMark paragraphs, headings, lists, quotes, code, thematic breaks, emphasis and links plus GFM strikethrough, task items, and top-level tables with column alignment. A standalone image in a top-level paragraph preserves its reference, alternative text, and title. GFM pads short data rows with empty cells and ignores extra cells beyond the header width. Ordinary source line breaks become spaces and explicit hard breaks remain line breaks. Raw HTML is literal text. Recognized unsupported content includes nested tables and common leading YAML front matter with simple or quoted keys between `---` fences.
 
-Markdown export checks semantic round trips with the same parser. Both import and export default to `LossPolicy::Strict`. Use `LossPolicy::AllowLoss` to receive a conversion with reported losses such as omitted underline or highlight, a synthesized header row, or cell line breaks replaced by spaces. Each issue carries a code and a zero-based tree path, with a block-local range when available. Plain clipboard actions use text fallback. Application clipboard bridges can preserve structure with document fragments.
+Markdown export checks semantic round trips with the same parser. Both import and export default to `LossPolicy::Strict`. Use `LossPolicy::AllowLoss` to receive a conversion with reported losses such as omitted underline or highlight, a synthesized header row, or cell line breaks replaced by spaces. Each issue carries a code and a zero-based tree path, with a block-local range when available.
 
 Enable `MarkdownOptions::inline_images` to import and export images embedded in text. Standalone Markdown images remain image blocks.
 

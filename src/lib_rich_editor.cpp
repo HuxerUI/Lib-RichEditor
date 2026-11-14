@@ -85,6 +85,11 @@ std::optional<DocumentFragment> RichEditorController::SelectedFragment() const {
   return session_->SelectedFragment();
 }
 
+bool RichEditorController::PastePlainText() const {
+  const auto paste = viewport_->paste_plain_text.lock();
+  return paste && (*paste)();
+}
+
 std::optional<EditorViewportLocation> RichEditorController::ViewportLocation(float y) const {
   if (!std::isfinite(y)) {
     return std::nullopt;

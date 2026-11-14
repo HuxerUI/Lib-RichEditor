@@ -151,6 +151,110 @@ Task<IoResult<FileSource>> ResolveAttachment(std::optional<File> working_directo
       {IoErrorCode::NotFound, directories.empty() ? "Choose the attachment folder" : "Attachment is missing"});
 }
 
+Task<IoResult<ClipboardAttachments>> ReadClipboardAttachments(
+    std::optional<File> working_directory, std::vector<FileSource> directories, std::vector<std::string> references,
+    std::size_t budget) {
+  ClipboardAttachments result;
+  for (const auto& reference : references) {
+    const auto path = RelativePath(reference);
+    if (!path) {
+      co_return IoResult<ClipboardAttachments>::Failure({IoErrorCode::Unsupported, "Invalid attachment reference"});
+    }
+    auto source = co_await ResolveAttachment(working_directory, directories, *path);
+    if (!source.Succeeded()) {
+      co_return IoResult<ClipboardAttachments>::Failure(source.Error());
+    }
+    const auto& file = source.Value();
+    const auto local = file.AsFile();
+    if (working_directory && local && *local == ChildFile(*working_directory, *path) &&
+        !(co_await RunWorker(WithinDirectory, *working_directory, *local))) {
+      co_return IoResult<ClipboardAttachments>::Failure({IoErrorCode::Unsupported, "Attachment leaves its folder"});
+    }
+    auto stream = co_await (file.Reference() ? file.Reference()->OpenReadAsync() : local->OpenReadAsync());
+    if (!stream.Succeeded()) {
+      co_return IoResult<ClipboardAttachments>::Failure(stream.Error());
+    }
+    Bytes bytes;
+    while (true) {
+      auto chunk = co_await stream.Value().ReadAsync(std::min<std::size_t>(budget, 64 * 1024 - 1) + 1);
+      if (!chunk.Succeeded()) {
+        co_return IoResult<ClipboardAttachments>::Failure(chunk.Error());
+      }
+      if (chunk.Value().empty()) {
+        break;
+      }
+      if (chunk.Value().size() > budget) {
+        co_return IoResult<ClipboardAttachments>::Failure({IoErrorCode::TooLarge, "Clipboard attachments are too large"});
+      }
+      budget -= chunk.Value().size();
+      bytes.insert(bytes.end(), chunk.Value().begin(), chunk.Value().end());
+    }
+    result.emplace(reference, std::move(bytes));
+  }
+  co_return IoResult<ClipboardAttachments>::Success(std::move(result));
+}
+
+std::string AttachmentExtension(std::string_view name) {
+  const auto dot = name.rfind('.');
+  if (dot == name.npos || dot + 1 == name.size() || name.size() - dot > 12) {
+    return {};
+  }
+  auto extension = name.substr(dot);
+  return std::ranges::all_of(extension.substr(1), [](char ch) {
+    return (ch >= '0' && ch <= '9') || (LowerAscii(ch) >= 'a' && LowerAscii(ch) <= 'z');
+  }) ? std::string(extension) : std::string{};
+}
+
+IoResult<StagedClipboardAttachments> StageClipboardAttachments(std::optional<File> working_directory,
+                                                               ClipboardAttachments bytes) {
+  using Result = IoResult<StagedClipboardAttachments>;
+  if (bytes.empty()) {
+    return Result::Success(StagedClipboardAttachments({}));
+  }
+  if (!working_directory) {
+    return Result::Failure({IoErrorCode::Unsupported, "No attachment working directory"});
+  }
+  StagedClipboardAttachments::References references;
+  auto staged_files = std::make_shared<std::vector<File>>();
+  staged_files->reserve(bytes.size());
+  const auto rollback = [staged_files]() noexcept {
+    for (const auto& file : *staged_files) {
+      (void)file.Delete();
+    }
+  };
+  StagedClipboardAttachments pending({}, rollback);
+  const auto directory = working_directory->Child("attachments");
+  if (!directory.CreateDirectories() || !WithinDirectory(*working_directory, directory)) {
+    return Result::Failure({IoErrorCode::Io, "Could not create the clipboard attachments folder"});
+  }
+  for (const auto& [source, contents] : bytes) {
+    const auto path = RelativePath(source);
+    if (!path) {
+      return Result::Failure({IoErrorCode::InvalidEncoding, "Invalid clipboard attachment reference"});
+    }
+    const auto name = UniqueName("paste-") + AttachmentExtension(path->back());
+    auto file = directory.Child(name);
+    auto opened = file.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew);
+    if (!opened.Succeeded()) {
+      return Result::Failure(opened.Error());
+    }
+    staged_files->push_back(std::move(file));
+    auto& stream = opened.Value();
+    const auto written = stream.WriteAt(0, contents);
+    if (!written.Succeeded()) {
+      return Result::Failure(written.Error());
+    }
+    const auto closed = stream.Close();
+    if (!closed.Succeeded()) {
+      return Result::Failure(closed.Error());
+    }
+    references.emplace(source, "attachments/" + name);
+  }
+  StagedClipboardAttachments staged(std::move(references), rollback);
+  pending.Commit();
+  return Result::Success(std::move(staged));
+}
+
 struct AttachmentCopy {
   std::string reference;
   std::vector<std::string> path;
@@ -369,6 +473,19 @@ std::shared_ptr<const ImageResolver> AttachmentResolver(std::optional<File> work
           co_return IoResult<ImageAsset>::Failure({IoErrorCode::InvalidEncoding, "Image must be PNG or JPEG"});
         }
       });
+}
+
+std::shared_ptr<const ClipboardAttachmentProvider> ClipboardAttachmentsFor(
+    std::optional<File> working_directory, std::vector<FileSource> directories) {
+  return std::make_shared<const ClipboardAttachmentProvider>(ClipboardAttachmentProvider{
+      .read = [working_directory, directories = std::move(directories)](std::vector<std::string> references,
+                                                                       std::size_t budget) {
+        return ReadClipboardAttachments(working_directory, directories, std::move(references), budget);
+      },
+      .stage = [working_directory](ClipboardAttachments bytes) -> Task<IoResult<StagedClipboardAttachments>> {
+        co_return co_await RunWorker(StageClipboardAttachments, working_directory, std::move(bytes));
+      },
+  });
 }
 
 Task<IoResult<std::string>> ImportImage(File directory, FileReference source) {
