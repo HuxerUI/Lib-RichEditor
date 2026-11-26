@@ -1,0 +1,124 @@
+import std;
+import mcpp;
+import huxerui.rules;
+
+namespace {
+
+struct SyntaxProfileSpec {
+    const char* id;
+    const char* label;
+    const char* filename;
+};
+
+constexpr SyntaxProfileSpec kProfiles[] = {
+    {"c", "C", "c.json"},
+    {"cpp", "C++", "cpp.json"},
+    {"csharp", "C#", "csharp.json"},
+    {"css", "CSS", "css.json"},
+    {"go", "Go", "go.json"},
+    {"html", "HTML", "html.json"},
+    {"java", "Java", "java.json"},
+    {"javascript", "JavaScript", "javascript.json"},
+    {"json", "JSON", "json-sweetline.json"},
+    {"kotlin", "Kotlin", "kotlin.json"},
+    {"python", "Python", "python.json"},
+    {"rust", "Rust", "rust.json"},
+    {"shell", "Shell", "shell.json"},
+    {"sql", "SQL", "sql.json"},
+    {"swift", "Swift", "swift.json"},
+    {"typescript", "TypeScript", "typescript.json"},
+    {"yaml", "YAML", "yaml.json"},
+};
+
+std::filesystem::path FindSweetLineSyntaxesDir() {
+    const char* raw_dep = mcpp::dep_dir("sweetline");
+    if (!raw_dep || !*raw_dep) {
+        std::cerr << "Lib-RichEditor: mcpp::dep_dir(\"sweetline\") is empty; compat.sweetline is required.\n";
+        return {};
+    }
+    const std::filesystem::path root(raw_dep);
+    if (std::filesystem::is_directory(root / "syntaxes")) {
+        return root / "syntaxes";
+    }
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (entry.is_directory(ec) && std::filesystem::is_directory(entry.path() / "syntaxes", ec)) {
+            return entry.path() / "syntaxes";
+        }
+    }
+    std::cerr << "Lib-RichEditor: could not locate SweetLine syntaxes/ under '" << root.string() << "'.\n";
+    return {};
+}
+
+bool GenerateSyntaxProfiles() {
+    const auto syntaxes_dir = FindSweetLineSyntaxesDir();
+    if (syntaxes_dir.empty()) {
+        return false;
+    }
+
+    std::string generated;
+    generated.reserve(256 * 1024);
+    for (const auto& spec : kProfiles) {
+        const auto json_path = syntaxes_dir / spec.filename;
+        std::ifstream in(json_path, std::ios::binary);
+        if (!in) {
+            std::cerr << "Lib-RichEditor: missing syntax profile '" << json_path.string() << "'.\n";
+            return false;
+        }
+        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        generated += "{{\"";
+        generated += spec.id;
+        generated += "\", \"";
+        generated += spec.label;
+        generated += "\"}, R\"sl_profile(";
+        generated += content;
+        generated += ")sl_profile\"},\n";
+    }
+
+    const char* raw_out = mcpp::out_dir();
+    if (!raw_out || !*raw_out) {
+        std::cerr << "Lib-RichEditor: mcpp::out_dir() is empty.\n";
+        return false;
+    }
+    const std::filesystem::path inc_dir = std::filesystem::path(raw_out) / "sweetline-include";
+    std::error_code ec;
+    std::filesystem::create_directories(inc_dir, ec);
+    if (ec) {
+        std::cerr << "Lib-RichEditor: failed to create '" << inc_dir.string() << "': " << ec.message() << "\n";
+        return false;
+    }
+
+    const auto out_file = inc_dir / "richeditor_syntax_profiles.inc";
+    bool same = false;
+    if (std::ifstream existing(out_file, std::ios::binary); existing) {
+        std::string cur((std::istreambuf_iterator<char>(existing)), std::istreambuf_iterator<char>());
+        same = (cur == generated);
+    }
+    if (!same) {
+        std::ofstream out(out_file, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            std::cerr << "Lib-RichEditor: failed to write '" << out_file.string() << "'.\n";
+            return false;
+        }
+        out.write(generated.data(), static_cast<std::streamsize>(generated.size()));
+        if (!out.good()) {
+            std::cerr << "Lib-RichEditor: write error on '" << out_file.string() << "'.\n";
+            return false;
+        }
+    }
+
+    mcpp::include_dir(inc_dir.string().c_str());
+    return true;
+}
+
+} // namespace
+
+int main() {
+    if (!GenerateSyntaxProfiles()) {
+        return 1;
+    }
+    return huxerui::rules::configure({
+        .resources = "resources",
+        .resource_namespace = "huxerui_richeditor",
+    }) ? 0 : 1;
+}

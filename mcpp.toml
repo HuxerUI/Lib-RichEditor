@@ -1,0 +1,30 @@
+[package]
+namespace   = "huxerui"
+name        = "richeditor"
+version     = "0.1.0"
+standard    = "c++23"
+license     = "MIT"
+repo        = "https://github.com/HuxerUI/Lib-RichEditor"
+description = "Cross-platform rich-text document model, codecs, and editor view for HuxerUI"
+
+[package.metadata.huxerui]
+library   = "HuxerUI::RichEditor"
+namespace = "huxerui::richeditor"
+id        = "org.huxerui.lib.richeditor"
+resources = "resources"
+
+[dependencies]
+huxerui.huxerui  = "0.5.5"
+huxerui.markdown = "0.3.1"
+nlohmann.json    = "3.12.0"
+compat.sweetline = "1.3.2"
+
+[targets.richeditor]
+kind = "lib"
+
+[lib]
+path = "modules/richeditor.cppm"
+
+[build]
+sources      = []
+include_dirs = ["include"]
