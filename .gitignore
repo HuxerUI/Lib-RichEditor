@@ -1,6 +1,9 @@
 /.huxerui/
 /dist/
 /build/
+/target/
+/.mcpp/
+mcpp.lock
 /cmake-build-*/
 /.cache/
 
